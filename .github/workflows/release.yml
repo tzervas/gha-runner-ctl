@@ -1,0 +1,45 @@
+name: release
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to rebuild/upload (e.g. v0.1.1)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  dist-linux-x64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@1.96
+
+      - name: Build dist tarball
+        run: bash scripts/dist.sh
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          VER="${TAG#v}"
+          ARCHIVE="dist/gha-runner-ctl-${VER}-x86_64-unknown-linux-gnu.tar.gz"
+          SUMS="dist/SHA256SUMS-${VER}.txt"
+          test -f "$ARCHIVE" && test -f "$SUMS"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "gha-runner-ctl ${TAG}" --generate-notes
+          fi
+          gh release upload "$TAG" "$ARCHIVE" "$SUMS" --clobber

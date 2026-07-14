@@ -9,6 +9,8 @@
 - Wake server requires `GHA_WAKE_TOKEN`; constant-time compare
 - Entrypoint validates `https://github.com/…` only; never logs tokens
 - SECURITY.md operator checklist
+- **Distributed release assets**: Linux x86_64 tarball + SHA256SUMS via
+  `scripts/dist.sh` and tag workflow (required for host updates without cargo)
 
 ## 0.1.0
 

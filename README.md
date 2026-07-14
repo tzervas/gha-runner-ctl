@@ -25,7 +25,26 @@ Not a fleet. Not 140 processes. One listener on your workstation, shared by ever
 
 Personal GitHub **user** accounts only get **repo-scoped** runners. For one runner across many repos, use a **GitHub Organization** and `--scope org`.
 
-## Install
+## Install (release binary — preferred)
+
+```bash
+VER=0.1.1
+TARGET=x86_64-unknown-linux-gnu
+BASE="https://github.com/tzervas/gha-runner-ctl/releases/download/v${VER}"
+
+curl -fsSL -o gha-runner-ctl.tar.gz \
+  "${BASE}/gha-runner-ctl-${VER}-${TARGET}.tar.gz"
+curl -fsSL -o SHA256SUMS.txt \
+  "${BASE}/SHA256SUMS-${VER}.txt"
+sha256sum -c SHA256SUMS.txt --ignore-missing
+tar xzf gha-runner-ctl.tar.gz
+cd "gha-runner-ctl-${VER}-${TARGET}"
+bash install.sh
+export PATH="$HOME/.local/bin:$PATH"
+gha-runner-ctl --help
+```
+
+From source (dev):
 
 ```bash
 git clone https://github.com/tzervas/gha-runner-ctl.git
