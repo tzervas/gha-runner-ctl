@@ -93,6 +93,16 @@ See [docs/CONSUMERS.md](docs/CONSUMERS.md).
 gha-runner-ctl --mode retain up
 ```
 
+## Hardening (summary)
+
+- Identity allowlists (no shell metacharacters into Podman/API)
+- Short-lived registration tokens; scrubbed logs; private env file shredded after start
+- `no-new-privileges`, `--pull=never` on run path; resource caps
+- One controller instance via flock; wake endpoint needs `GHA_WAKE_TOKEN`
+- Prefer **private** repos on self-hosted runners  
+
+Details: [docs/SECURITY.md](docs/SECURITY.md).
+
 ## What `config.sh` is
 
 That script ships **inside** the official runner package. This tool runs it for you in the container. You do not install the runner by hand or paste UI tokens.

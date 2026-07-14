@@ -1,6 +1,6 @@
 #!/bin/bash
-# Single-runner entrypoint: seed snapshot if needed, register, run.
-# Tokens are only accepted from env (injected by gha-runner-ctl); never logged.
+# Single-runner entrypoint: seed snapshot, register, run.
+# Tokens only from env (controller); never logged. Fail closed on bad identity.
 set -euo pipefail
 
 SEED="${RUNNER_SEED:-/opt/actions-runner-seed}"
@@ -8,10 +8,38 @@ HOME_DIR="${RUNNER_HOME:-/opt/actions-runner}"
 
 log() { printf 'runner: %s\n' "$*" >&2; }
 
+# Reject shell metacharacters / traversal in controller-supplied identity fields.
+safe_ident() {
+    local s="${1:-}"
+    [[ -n "$s" ]] || return 1
+    [[ ${#s} -le 128 ]] || return 1
+    case "$s" in
+        *..* | *[!A-Za-z0-9._-]* ) return 1 ;;
+    esac
+    return 0
+}
+
+safe_url() {
+    # Only github.com over HTTPS (repo or org path).
+    local u="${1:-}"
+    case "$u" in
+        https://github.com/*)
+            local path="${u#https://github.com/}"
+            [[ -n "$path" ]] || return 1
+            case "$path" in
+                *..* | *[!A-Za-z0-9._/-]* | /* | */) return 1 ;;
+            esac
+            return 0
+            ;;
+        *) return 1 ;;
+    esac
+}
+
 if [[ ! -x "${HOME_DIR}/run.sh" ]]; then
     if [[ -x "${SEED}/run.sh" ]]; then
         log "seeding runner binaries from image snapshot"
         cp -a "${SEED}/." "${HOME_DIR}/"
+        chmod -R go-w "${HOME_DIR}" 2>/dev/null || true
     else
         log "ERROR: runner binaries missing"
         exit 1
@@ -22,22 +50,44 @@ cd "$HOME_DIR"
 
 REPO_URL="${REPO_URL:-}"
 RUNNER_TOKEN="${RUNNER_TOKEN:-}"
-RUNNER_NAME="${RUNNER_NAME:-tg-agent-relay-podman}"
+RUNNER_NAME="${RUNNER_NAME:-shared-podman-1}"
 RUNNER_LABELS="${RUNNER_LABELS:-self-hosted,linux,x64,podman}"
 RUNNER_GROUP="${RUNNER_GROUP:-Default}"
 WORK_DIR="${RUNNER_WORK_DIR:-_work}"
 RUNNER_EPHEMERAL="${RUNNER_EPHEMERAL:-true}"
 RUNNER_RETAIN="${RUNNER_RETAIN:-false}"
 
-if [[ -z "$REPO_URL" ]]; then
-    log "ERROR: REPO_URL required"
+if ! safe_url "$REPO_URL"; then
+    log "ERROR: REPO_URL must be https://github.com/<owner>[/<repo>] with safe charset"
+    exit 1
+fi
+if ! safe_ident "$RUNNER_NAME"; then
+    log "ERROR: invalid RUNNER_NAME"
+    exit 1
+fi
+# Labels: comma-separated safe idents
+IFS=',' read -r -a _labs <<<"$RUNNER_LABELS"
+for lab in "${_labs[@]}"; do
+    lab="${lab// /}"
+    [[ -z "$lab" ]] && continue
+    if ! safe_ident "$lab"; then
+        log "ERROR: invalid label"
+        exit 1
+    fi
+done
+if ! safe_ident "$RUNNER_GROUP"; then
+    log "ERROR: invalid RUNNER_GROUP"
+    exit 1
+fi
+if ! safe_ident "$WORK_DIR"; then
+    # work dir is relative under runner home
+    log "ERROR: invalid WORK_DIR"
     exit 1
 fi
 
 need_register=0
 if [[ "$RUNNER_EPHEMERAL" == "true" || "$RUNNER_EPHEMERAL" == "1" ]]; then
     need_register=1
-    # Ephemeral: never reuse stale registration files
     rm -f .runner .credentials .credentials_rsaparams 2>/dev/null || true
 elif [[ ! -f .runner ]]; then
     need_register=1
@@ -47,9 +97,11 @@ fi
 
 if (( need_register == 1 )); then
     if [[ -z "$RUNNER_TOKEN" ]]; then
-        log "ERROR: RUNNER_TOKEN required to register (controller injects a short-lived token)"
+        log "ERROR: RUNNER_TOKEN required to register"
         exit 1
     fi
+    # Never print token or length that could leak into shared logs.
+    log "registering runner name=${RUNNER_NAME} ephemeral=${RUNNER_EPHEMERAL}"
     config_args=(
         --unattended
         --url "$REPO_URL"
@@ -62,12 +114,10 @@ if (( need_register == 1 )); then
     )
     if [[ "$RUNNER_EPHEMERAL" == "true" || "$RUNNER_EPHEMERAL" == "1" ]]; then
         config_args+=(--ephemeral)
-        log "registering ephemeral runner name=${RUNNER_NAME}"
-    else
-        log "registering retained runner name=${RUNNER_NAME}"
     fi
     ./config.sh "${config_args[@]}"
-    # Drop token from environment for child processes
+    # Best-effort wipe of token from this shell
+    RUNNER_TOKEN="$(head -c 64 /dev/urandom | base64 2>/dev/null || true)"
     unset RUNNER_TOKEN
 else
     log "using retained registration on snapshot volume"

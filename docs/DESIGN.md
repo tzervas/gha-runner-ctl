@@ -26,6 +26,17 @@ Token is written to a `0600` env file, passed to Podman, then deleted.
 | Embed UI registration token in git | Secret leak; short-lived tokens exist for a reason |
 | Full ARC / Kubernetes | Overkill for a single workstation |
 
+## Decision: fail-closed identity validation
+
+Anything that reaches Podman argv or GitHub URLs (owner, repo, labels, names,
+image ref) must match a tight allowlist. Reject `..`, whitespace, and shell
+metacharacters rather than trying to escape them.
+
+## Decision: authenticated loopback wake only
+
+Optional `POST /wake` is useful for local automation but must not be an open
+power switch. Binding stays on `127.0.0.1`; requests require `GHA_WAKE_TOKEN`.
+
 ## Attribution
 
 Controller and packaging: original work, MIT.  

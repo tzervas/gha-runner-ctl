@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.1
+
+- Fail-closed validation for repo/owner/labels/names/image/cpus/memory
+- Secret redaction on errors; registration env file overwrite+unlink
+- HTTP timeouts; single-instance flock on `up` / `listen`
+- Podman: `no-new-privileges`, `--pull=never` on hot path
+- Wake server requires `GHA_WAKE_TOKEN`; constant-time compare
+- Entrypoint validates `https://github.com/…` only; never logs tokens
+- SECURITY.md operator checklist
+
 ## 0.1.0
 
 - Initial release: one Podman runner, snapshot `prepare`, auto-registration, `listen` up/down
