@@ -1,0 +1,21 @@
+gha-runner-ctl
+Copyright (c) 2026 Tyler Zervas
+SPDX-License-Identifier: MIT
+
+Third-party software (not redistributed in this repository's source tree;
+downloaded at image-build time into the Podman image):
+
+---------------------------------------------------------------------------
+GitHub Actions Runner (actions/runner)
+https://github.com/actions/runner
+Copyright (c) GitHub, Inc. and contributors
+License: MIT
+  See https://github.com/actions/runner/blob/main/LICENSE
+
+The packaging/Containerfile downloads a release tarball of the official
+runner (pinned version + sha256) solely to build a local container image.
+That binary is subject to the actions/runner MIT license.
+---------------------------------------------------------------------------
+
+Ubuntu base image (docker.io/library/ubuntu) used only as a container base;
+see Canonical / Ubuntu licensing for the base OS.

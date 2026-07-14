@@ -1,0 +1,28 @@
+[package]
+name = "gha_runner_ctl"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.96"
+license = "MIT"
+description = "One Podman-backed GitHub Actions self-hosted runner: snapshot, auto-register, on-demand up/down"
+repository = "https://github.com/tzervas/gha-runner-ctl"
+readme = "README.md"
+keywords = ["github-actions", "self-hosted", "podman", "runner"]
+categories = ["command-line-utilities", "development-tools"]
+publish = false
+
+[[bin]]
+name = "gha-runner-ctl"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive", "env"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+ureq = { version = "2.12", default-features = true, features = ["json"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

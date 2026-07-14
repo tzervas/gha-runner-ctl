@@ -1,0 +1,39 @@
+# GitHub Actions self-hosted runner image (Podman) for gha-runner-ctl.
+# Official runner tarball (MIT — see NOTICE) — registration injected at start.
+# Pin: https://github.com/actions/runner/releases/tag/v2.335.1
+FROM docker.io/library/ubuntu:24.04
+
+ARG RUNNER_VERSION=2.335.1
+ARG TARGETARCH=x64
+# sha256 from GitHub release notes for actions-runner-linux-x64-2.335.1.tar.gz
+ARG RUNNER_SHA256=4ef2f25285f0ae4477f1fe1e346db76d2f3ebf03824e2ddd1973a2819bf6c8cf
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    RUNNER_HOME=/opt/actions-runner \
+    RUNNER_ALLOW_RUNASROOT=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl git jq tar gzip libicu74 libssl3 \
+        python3 python3-venv bash build-essential coreutils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Tooling used by local-ci jobs (baked so cold start stays fast)
+RUN curl -fsSL https://astral.sh/uv/install.sh | sh \
+    && ln -sf /root/.local/bin/uv /usr/local/bin/uv
+
+# Seed dir holds extracted runner; snapshot volume mounts over RUNNER_HOME at runtime.
+RUN mkdir -p /opt/actions-runner-seed \
+    && cd /opt/actions-runner-seed \
+    && curl -fsSL -o actions-runner.tar.gz \
+      "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-${TARGETARCH}-${RUNNER_VERSION}.tar.gz" \
+    && echo "${RUNNER_SHA256}  actions-runner.tar.gz" | sha256sum -c - \
+    && tar xzf actions-runner.tar.gz \
+    && rm actions-runner.tar.gz \
+    && ./bin/installdependencies.sh \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p "${RUNNER_HOME}"
+
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
