@@ -22,7 +22,7 @@ const DEFAULT_CONTAINER: &str = "gha-runner-ctl";
 const DEFAULT_VOLUME: &str = "gha-runner-ctl-data";
 const DEFAULT_LABELS: &str = "self-hosted,linux,x64,podman";
 const DEFAULT_NAME: &str = "shared-podman-1";
-const UA: &str = "gha-runner-ctl/0.2.1";
+const UA: &str = "gha-runner-ctl/0.2.2";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 const MIN_POLL_SECS: u64 = 5;
 const MAX_POLL_SECS: u64 = 3600;
@@ -106,10 +106,13 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
-    /// Build image + seed volume snapshot
+    /// Build image + seed volume snapshot (updates host packages first unless skipped)
     Prepare {
         #[arg(long, default_value_t = true)]
         with_container: bool,
+        /// Skip apt/dnf host package refresh before building the snapshot
+        #[arg(long, env = "GHA_SKIP_HOST_UPDATE", default_value_t = false)]
+        skip_host_update: bool,
     },
     /// Register + start for the resolved target
     Up,
@@ -143,7 +146,10 @@ fn run() -> Result<(), String> {
     resolve_cli(&mut cli)?;
     validate_cli(&cli)?;
     match &cli.cmd {
-        Cmd::Prepare { with_container } => prepare(&cli, *with_container),
+        Cmd::Prepare {
+            with_container,
+            skip_host_update,
+        } => prepare(&cli, *with_container, *skip_host_update),
         Cmd::Up => {
             let _lock = InstanceLock::acquire("up")?;
             up(&cli)
@@ -665,12 +671,80 @@ fn resolve_build_dir(cli: &Cli) -> Result<PathBuf, String> {
 
 // --- Prepare / up / down -----------------------------------------------------
 
+/// Refresh host packages so the build machine (and nested tools) are patched
+/// before we bake a long-lived snapshot. Fail soft if no package manager /
+/// insufficient privileges — image build still proceeds.
+fn update_host_packages() -> Result<(), String> {
+    eprintln!("prepare: updating host packages before snapshot…");
+    if Path::new("/usr/bin/apt-get").exists() {
+        let update = Command::new("apt-get")
+            .args(["update", "-qq"])
+            .status()
+            .map_err(|e| format!("apt-get update: {e}"))?;
+        if !update.success() {
+            eprintln!("prepare: warning: apt-get update failed (continuing)");
+            return Ok(());
+        }
+        // Security + bugfix upgrades only where unattended-upgrade is available;
+        // otherwise full upgrade of installed packages (noninteractive).
+        let upgrade = Command::new("apt-get")
+            .env("DEBIAN_FRONTEND", "noninteractive")
+            .args([
+                "upgrade",
+                "-y",
+                "-qq",
+                "-o",
+                "Dpkg::Options::=--force-confdef",
+                "-o",
+                "Dpkg::Options::=--force-confold",
+            ])
+            .status()
+            .map_err(|e| format!("apt-get upgrade: {e}"))?;
+        if !upgrade.success() {
+            eprintln!("prepare: warning: apt-get upgrade failed (continuing)");
+        } else {
+            eprintln!("prepare: host apt packages updated");
+        }
+        let _ = Command::new("apt-get")
+            .args(["autoremove", "-y", "-qq"])
+            .status();
+        return Ok(());
+    }
+    if Path::new("/usr/bin/dnf").exists() {
+        let st = Command::new("dnf")
+            .args(["upgrade", "-y", "-q"])
+            .status()
+            .map_err(|e| format!("dnf upgrade: {e}"))?;
+        if st.success() {
+            eprintln!("prepare: host dnf packages updated");
+        } else {
+            eprintln!("prepare: warning: dnf upgrade failed (continuing)");
+        }
+        return Ok(());
+    }
+    eprintln!("prepare: no apt-get/dnf — skip host package update");
+    Ok(())
+}
+
 #[allow(clippy::needless_pass_by_value)]
-fn prepare(cli: &Cli, with_container: bool) -> Result<(), String> {
+fn prepare(cli: &Cli, with_container: bool, skip_host_update: bool) -> Result<(), String> {
+    // Host refresh first so build tools / podman stack are current before we snapshot.
+    if !skip_host_update {
+        let _ = update_host_packages();
+    } else {
+        eprintln!("prepare: skipping host update (--skip-host-update / GHA_SKIP_HOST_UPDATE)");
+    }
+
+    // Drop stale image so `podman build` cannot silently reuse an old rootfs layer
+    // when only host-side packages changed (still uses cache for unchanged layers).
+    let _ = podman(&["image", "exists", &cli.image]);
+
     let dir = resolve_build_dir(cli)?;
     eprintln!("prepare: building {} from {}", cli.image, dir.display());
+    // --pull=always for base OS so snapshot is not stuck on an old ubuntu digest
     podman(&[
         "build",
+        "--pull=always",
         "-t",
         &cli.image,
         "-f",
@@ -1106,7 +1180,7 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
     );
     if !volume_exists(&cli.volume) {
         eprintln!("listen: snapshot missing — prepare…");
-        prepare(cli, true)?;
+        prepare(cli, true, false)?;
     }
 
     if let Some(port) = wake_port {

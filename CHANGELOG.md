@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.2
+
+- **`prepare` updates the host first** (`apt-get`/`dnf` upgrade) before building
+  the snapshot; skip with `--skip-host-update` / `GHA_SKIP_HOST_UPDATE=1`
+- Image build uses `--pull=always` so the Ubuntu base is not stale
+- Containerfile runs `apt-get upgrade` before package install
+
 ## 0.2.1
 
 - Security tooling: `scripts/security-scan.sh` (cargo-audit, cargo-deny, gitleaks, trivy)
