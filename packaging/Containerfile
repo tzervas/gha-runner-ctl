@@ -1,28 +1,33 @@
 # GitHub Actions self-hosted runner image (Podman) for gha-runner-ctl.
 # Official runner tarball (MIT — see NOTICE) — registration injected at start.
 # Pin: https://github.com/actions/runner/releases/tag/v2.335.1
+#
+# Runs as non-root UID 1001 (trivy DS-0002). Snapshot volume must be owned by 1001.
 FROM docker.io/library/ubuntu:24.04
 
 ARG RUNNER_VERSION=2.335.1
 ARG TARGETARCH=x64
-# sha256 from GitHub release notes for actions-runner-linux-x64-2.335.1.tar.gz
 ARG RUNNER_SHA256=4ef2f25285f0ae4477f1fe1e346db76d2f3ebf03824e2ddd1973a2819bf6c8cf
+ARG RUNNER_UID=1001
 
 ENV DEBIAN_FRONTEND=noninteractive \
     RUNNER_HOME=/opt/actions-runner \
-    RUNNER_ALLOW_RUNASROOT=1
+    RUNNER_USER=runner
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl git jq tar gzip libicu74 libssl3 \
         python3 python3-venv bash build-essential coreutils \
-    && rm -rf /var/lib/apt/lists/*
+        sudo \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -m -u "${RUNNER_UID}" -s /bin/bash "${RUNNER_USER}"
 
-# Tooling used by local-ci jobs (baked so cold start stays fast)
+# uv on PATH for all users (local-ci jobs)
 RUN curl -fsSL https://astral.sh/uv/install.sh | sh \
-    && ln -sf /root/.local/bin/uv /usr/local/bin/uv
+    && install -m 755 /root/.local/bin/uv /usr/local/bin/uv \
+    && rm -rf /root/.local
 
 # Seed dir holds extracted runner; snapshot volume mounts over RUNNER_HOME at runtime.
-RUN mkdir -p /opt/actions-runner-seed \
+RUN mkdir -p /opt/actions-runner-seed "${RUNNER_HOME}" \
     && cd /opt/actions-runner-seed \
     && curl -fsSL -o actions-runner.tar.gz \
       "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-${TARGETARCH}-${RUNNER_VERSION}.tar.gz" \
@@ -31,9 +36,12 @@ RUN mkdir -p /opt/actions-runner-seed \
     && rm actions-runner.tar.gz \
     && ./bin/installdependencies.sh \
     && rm -rf /var/lib/apt/lists/* \
-    && mkdir -p "${RUNNER_HOME}"
+    && chown -R "${RUNNER_USER}:${RUNNER_USER}" /opt/actions-runner-seed "${RUNNER_HOME}"
 
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+RUN chmod 755 /entrypoint.sh && chown "${RUNNER_USER}:${RUNNER_USER}" /entrypoint.sh
+
+USER runner
+WORKDIR /opt/actions-runner
 
 ENTRYPOINT ["/entrypoint.sh"]

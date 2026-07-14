@@ -27,6 +27,17 @@ staying outside the org. See README.
 - [ ] Prefer **private** repos on self-hosted compute  
 - [ ] Do not commit registration tokens or `GHA_WAKE_TOKEN`  
 - [ ] Keep `gha-runner-ctl` and the image pin current (runner sha256 in Containerfile)  
+- [ ] Run `bash scripts/security-scan.sh` before each release  
+
+## Local scanners
+
+```bash
+bash scripts/security-scan.sh
+# cargo audit          — RustSec CVEs in Cargo.lock
+# cargo deny check     — advisories + licenses + sources
+# gitleaks detect      — secrets in tree
+# trivy fs             — vulns/secrets/misconfig (Containerfile, etc.)
+```
 
 ## Reporting
 

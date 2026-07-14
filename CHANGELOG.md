@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.1
+
+- Security tooling: `scripts/security-scan.sh` (cargo-audit, cargo-deny, gitleaks, trivy)
+- `deny.toml` license/advisory policy for MIT-compatible deps
+- Container runs as non-root UID **1001** (trivy DS-0002); prepare seeds volume ownership
+- No RustSec CVEs in lockfile at release time
+
 ## 0.2.0
 
 - **`--auto`**: detect `owner/repo` from cwd (`gh repo view` / `git remote`)

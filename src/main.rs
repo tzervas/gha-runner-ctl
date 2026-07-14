@@ -22,7 +22,7 @@ const DEFAULT_CONTAINER: &str = "gha-runner-ctl";
 const DEFAULT_VOLUME: &str = "gha-runner-ctl-data";
 const DEFAULT_LABELS: &str = "self-hosted,linux,x64,podman";
 const DEFAULT_NAME: &str = "shared-podman-1";
-const UA: &str = "gha-runner-ctl/0.2.0";
+const UA: &str = "gha-runner-ctl/0.2.1";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 const MIN_POLL_SECS: u64 = 5;
 const MAX_POLL_SECS: u64 = 3600;
@@ -700,8 +700,11 @@ set -euo pipefail
 if [[ ! -x /opt/actions-runner/run.sh ]]; then
   cp -a /opt/actions-runner-seed/. /opt/actions-runner/
 fi
+# Match image non-root user (UID 1001)
+chown -R 1001:1001 /opt/actions-runner 2>/dev/null || true
 chmod -R go-w /opt/actions-runner 2>/dev/null || true
 date -u +%Y-%m-%dT%H:%M:%SZ > /opt/actions-runner/.snapshot-baseline
+chown 1001:1001 /opt/actions-runner/.snapshot-baseline 2>/dev/null || true
 echo ok
 ",
     ])?;
@@ -842,6 +845,8 @@ fn up(cli: &Cli) -> Result<(), String> {
         "no-new-privileges",
         "--pull",
         "never",
+        "--user",
+        "1001:1001",
         "--env-file",
         env_path_str.as_str(),
         "-e",
