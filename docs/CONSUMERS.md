@@ -47,14 +47,16 @@ jobs:
 
 Match labels exactly (order does not matter; all listed labels must be present on the runner).
 
-## Org vs repo registration
+## Registration modes
 
 | Scope | Flag / env | Who can use the runner |
 |---|---|---|
-| Organization | `--scope org --owner my-org` | All repos in that org (subject to org runner policies) |
-| Repository | `--scope repo --repo owner/name` | Only that repository |
+| Organization | `--scope org --owner my-org` | All **org** repos (one registration; GitHub dispatches) |
+| Repository | `--scope repo --repo owner/name` or `--auto` | That repository only |
+| User batch | `--scope user --user tzervas` | Any **owned** personal repo: controller re-registers ephemerally to the repo that has demand (still one process) |
 
-Personal accounts cannot attach a single runner to all personal repos; use an org for true sharing.
+Personal accounts cannot use a single org-level registration for `user/*` repos
+outside the org. Use **user batch** (re-target) or move CI-heavy repos into the org.
 
 ## Checklist for a new consumer repo
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.0
+
+- **`--auto`**: detect `owner/repo` from cwd (`gh repo view` / `git remote`)
+- **`scope=user`**: batch poll all personal owned repos; ephemeral re-register
+  to whichever has self-hosted demand (one process, not one per repo)
+- **`detect`** command and **`scripts/auto-listen.sh`** (`--batch` / `--org` / default auto)
+- Distributed release still via `scripts/dist.sh --upload` (local build)
+
 ## 0.1.1
 
 - Fail-closed validation for repo/owner/labels/names/image/cpus/memory

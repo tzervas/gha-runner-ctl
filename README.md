@@ -28,16 +28,16 @@ Personal GitHub **user** accounts only get **repo-scoped** runners. For one runn
 ## Install (release binary — preferred)
 
 ```bash
-VER=0.1.1
+VER=0.2.0
 TARGET=x86_64-unknown-linux-gnu
 BASE="https://github.com/tzervas/gha-runner-ctl/releases/download/v${VER}"
 
-curl -fsSL -o gha-runner-ctl.tar.gz \
+curl -fsSL -o "gha-runner-ctl-${VER}-${TARGET}.tar.gz" \
   "${BASE}/gha-runner-ctl-${VER}-${TARGET}.tar.gz"
-curl -fsSL -o SHA256SUMS.txt \
+curl -fsSL -o "SHA256SUMS-${VER}.txt" \
   "${BASE}/SHA256SUMS-${VER}.txt"
-sha256sum -c SHA256SUMS.txt --ignore-missing
-tar xzf gha-runner-ctl.tar.gz
+sha256sum -c "SHA256SUMS-${VER}.txt"
+tar xzf "gha-runner-ctl-${VER}-${TARGET}.tar.gz"
 cd "gha-runner-ctl-${VER}-${TARGET}"
 bash install.sh
 export PATH="$HOME/.local/bin:$PATH"
@@ -53,33 +53,48 @@ bash packaging/install-ctl.sh
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-## Quick start (one shared org runner)
+## Quick start
 
 ```bash
-# Once
+# Once per machine
 gha-runner-ctl prepare
-
-# Org-wide (recommended for many repos under one org)
-export GHA_SCOPE=org
-export GHA_OWNER=your-org          # e.g. tzervas-labs
-export GHA_RUNNER_NAME=shared-podman-1
-export GHA_LABELS=self-hosted,linux,x64,podman
-
-gha-runner-ctl listen --interval 30 --idle-secs 180
 ```
 
-Repo-only (single repository):
+### Current repo (auto-detect from checkout)
 
 ```bash
-export GHA_SCOPE=repo
-export GHA_REPO=tzervas/tg-agent-relay
-gha-runner-ctl listen --interval 30 --idle-secs 180
+cd ~/work/tg-agent-relay
+gha-runner-ctl --scope repo --auto listen --interval 30 --idle-secs 180
+# or: bash scripts/auto-listen.sh
 ```
 
-Manual:
+### Batch all personal repos (tzervas)
+
+One runner process. When a self-hosted job is queued on any **owned** personal
+repo, the controller ephemerally re-registers to **that** repo, runs the job,
+then can retarget the next. GitHub still queues; you do not run 140 processes.
 
 ```bash
-gha-runner-ctl up
+gha-runner-ctl --scope user --user tzervas listen --interval 30 --idle-secs 180
+# or: bash scripts/auto-listen.sh --batch --user tzervas
+```
+
+### Organization (true multi-repo, one registration)
+
+Repos must live under the org. Personal `tzervas/*` cannot use an org runner
+while remaining outside that org.
+
+```bash
+gha-runner-ctl --scope org --owner vectorweighttechnologies \
+  listen --interval 30 --idle-secs 180
+# or: bash scripts/auto-listen.sh --org vectorweighttechnologies
+```
+
+### Manual
+
+```bash
+gha-runner-ctl --scope repo --auto detect
+gha-runner-ctl --scope repo --repo tzervas/tg-agent-relay up
 gha-runner-ctl status
 gha-runner-ctl down
 ```

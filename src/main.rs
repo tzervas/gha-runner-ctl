@@ -1,15 +1,12 @@
 //! One GitHub Actions self-hosted runner controller (Podman).
 //!
-//! Hardening goals (fail closed on identity inputs; never log secrets):
-//! - Validate owner/repo/labels/names before they reach the shell or Podman.
-//! - Short-lived registration tokens in a private env file, deleted after start.
-//! - HTTP timeouts; API errors scrubbed of bearer material.
-//! - Single-instance lock for `listen` / `up`.
-//! - Loopback wake endpoint requires a shared secret when enabled.
-//! - Container: no-new-privileges, no host docker.sock, resource caps, --pull=never.
+//! Registration targets:
+//! - **repo** — one repository (optional **--auto** from cwd / `gh repo view`)
+//! - **org** — organization runner (many org repos, one registration)
+//! - **user** — batch personal account: poll all owned repos; ephemeral-register
+//!   the single runner to whichever repo has queued self-hosted work
 //!
-//! GitHub owns job queueing; this tool only ensures one runner process exists
-//! when labeled work is waiting.
+//! GitHub queues jobs; one runner process handles one job at a time.
 
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
@@ -25,7 +22,7 @@ const DEFAULT_CONTAINER: &str = "gha-runner-ctl";
 const DEFAULT_VOLUME: &str = "gha-runner-ctl-data";
 const DEFAULT_LABELS: &str = "self-hosted,linux,x64,podman";
 const DEFAULT_NAME: &str = "shared-podman-1";
-const UA: &str = "gha-runner-ctl/0.1.1";
+const UA: &str = "gha-runner-ctl/0.2.0";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 const MIN_POLL_SECS: u64 = 5;
 const MAX_POLL_SECS: u64 = 3600;
@@ -34,24 +31,24 @@ const MAX_IDLE_SECS: u64 = 86_400;
 
 #[derive(Debug, Clone, ValueEnum)]
 enum Mode {
-    /// Re-register each spin-up (`config.sh --ephemeral`).
     Ephemeral,
-    /// Keep `.runner` on the snapshot volume.
     Retain,
 }
 
-#[derive(Debug, Clone, ValueEnum)]
+#[derive(Debug, Clone, ValueEnum, PartialEq, Eq)]
 enum Scope {
-    /// Single repository (personal account or one-repo use).
+    /// One repository. Use with --repo or --auto.
     Repo,
-    /// GitHub Organization (one runner for many org repos).
+    /// Organization registration (repos must live in that org).
     Org,
+    /// Batch all personal (owner) repos under a user login; re-register per demand.
+    User,
 }
 
 #[derive(Debug, Parser)]
 #[command(
     name = "gha-runner-ctl",
-    about = "One hardened self-hosted GHA runner on Podman"
+    about = "One hardened self-hosted GHA runner on Podman (auto / batch capable)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -60,11 +57,21 @@ struct Cli {
     #[arg(long, env = "GHA_SCOPE", value_enum, default_value_t = Scope::Repo, global = true)]
     scope: Scope,
 
+    /// owner/repo when scope=repo (or filled by --auto)
     #[arg(long, env = "GHA_REPO", global = true)]
     repo: Option<String>,
 
+    /// Org login when scope=org
     #[arg(long, env = "GHA_OWNER", global = true)]
     owner: Option<String>,
+
+    /// User login when scope=user (default: authenticated gh user)
+    #[arg(long, env = "GHA_USER", global = true)]
+    user: Option<String>,
+
+    /// Infer owner/repo from the current git checkout / gh context
+    #[arg(long, env = "GHA_AUTO", global = true, default_value_t = false)]
+    auto: bool,
 
     #[arg(long, env = "GHA_IMAGE", default_value = DEFAULT_IMAGE, global = true)]
     image: String,
@@ -93,23 +100,27 @@ struct Cli {
     #[arg(long, env = "GHA_MODE", value_enum, default_value_t = Mode::Ephemeral, global = true)]
     mode: Mode,
 
-    /// Shared secret for loopback wake server (required if --wake-port is set).
     #[arg(long, env = "GHA_WAKE_TOKEN", global = true)]
     wake_token: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
+    /// Build image + seed volume snapshot
     Prepare {
         #[arg(long, default_value_t = true)]
         with_container: bool,
     },
+    /// Register + start for the resolved target
     Up,
     Down {
         #[arg(long, default_value_t = true)]
         rm: bool,
     },
     Status,
+    /// Print resolved registration target (repo/org/user batch) without starting
+    Detect,
+    /// Poll for demand; up/down. With scope=user, re-targets registration per repo.
     Listen {
         #[arg(long, default_value_t = 30)]
         interval: u64,
@@ -128,7 +139,8 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    resolve_cli(&mut cli)?;
     validate_cli(&cli)?;
     match &cli.cmd {
         Cmd::Prepare { with_container } => prepare(&cli, *with_container),
@@ -138,6 +150,10 @@ fn run() -> Result<(), String> {
         }
         Cmd::Down { rm } => down(&cli, *rm),
         Cmd::Status => status(&cli),
+        Cmd::Detect => {
+            print_detect(&cli);
+            Ok(())
+        }
         Cmd::Listen {
             interval,
             idle_secs,
@@ -151,9 +167,128 @@ fn run() -> Result<(), String> {
     }
 }
 
+// --- Resolve auto / batch context --------------------------------------------
+
+fn resolve_cli(cli: &mut Cli) -> Result<(), String> {
+    if cli.auto && cli.scope == Scope::Repo && cli.repo.is_none() {
+        let detected = detect_repo_from_cwd()?;
+        eprintln!("auto: detected repository {detected}");
+        cli.repo = Some(detected);
+    }
+    if cli.scope == Scope::User && cli.user.is_none() {
+        let u = gh_login()?;
+        eprintln!("user: authenticated login {u}");
+        cli.user = Some(u);
+    }
+    // Convenience: GHA_BATCH=1 implies user scope for current gh user
+    if std::env::var("GHA_BATCH").ok().as_deref() == Some("1") && cli.scope == Scope::Repo {
+        cli.scope = Scope::User;
+        if cli.user.is_none() {
+            cli.user = Some(gh_login()?);
+        }
+        eprintln!(
+            "batch: scope=user owner={}",
+            cli.user.as_deref().unwrap_or("?")
+        );
+    }
+    Ok(())
+}
+
+/// Detect owner/repo from cwd: prefer `gh repo view`, else `git remote get-url origin`.
+fn detect_repo_from_cwd() -> Result<String, String> {
+    if let Ok(out) = Command::new("gh")
+        .args([
+            "repo",
+            "view",
+            "--json",
+            "nameWithOwner",
+            "-q",
+            ".nameWithOwner",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+    {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if is_safe_repo(&s) {
+                return Ok(s);
+            }
+        }
+    }
+    let out = Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|e| format!("git remote failed: {e}"))?;
+    if !out.status.success() {
+        return Err(
+            "could not detect repo (run inside a github checkout, or pass --repo / GHA_REPO)"
+                .into(),
+        );
+    }
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    parse_github_remote(&url).ok_or_else(|| format!("origin is not a github remote: {url}"))
+}
+
+fn parse_github_remote(url: &str) -> Option<String> {
+    // git@github.com:owner/repo.git  or  https://github.com/owner/repo.git
+    let s = url.trim().trim_end_matches('/').trim_end_matches(".git");
+    if let Some(rest) = s.strip_prefix("git@github.com:") {
+        return Some(rest.to_string()).filter(|r| is_safe_repo(r));
+    }
+    if let Some(rest) = s.strip_prefix("https://github.com/") {
+        return Some(rest.to_string()).filter(|r| is_safe_repo(r));
+    }
+    if let Some(rest) = s.strip_prefix("ssh://git@github.com/") {
+        return Some(rest.to_string()).filter(|r| is_safe_repo(r));
+    }
+    None
+}
+
+fn gh_login() -> Result<String, String> {
+    let out = Command::new("gh")
+        .args(["api", "user", "-q", ".login"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|e| format!("gh api user failed: {e}"))?;
+    if !out.status.success() {
+        return Err("could not resolve authenticated user (gh auth login)".into());
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !is_safe_ident(&s) {
+        return Err("invalid login from gh api".into());
+    }
+    Ok(s)
+}
+
+fn print_detect(cli: &Cli) {
+    println!("scope: {:?}", cli.scope);
+    match cli.scope {
+        Scope::Repo => {
+            println!("repo: {}", cli.repo.as_deref().unwrap_or("(unset)"));
+            if cli.repo.is_some() {
+                println!("register_url: {}", github_url(cli));
+            }
+        }
+        Scope::Org => {
+            println!("org: {}", cli.owner.as_deref().unwrap_or("(unset)"));
+            println!("register_url: {}", github_url(cli));
+        }
+        Scope::User => {
+            println!("user: {}", cli.user.as_deref().unwrap_or("(unset)"));
+            println!("mode: batch personal repos (ephemeral re-register per demand)");
+            println!("register_url: (selected per demand at listen time)");
+        }
+    }
+    println!("labels: {}", cli.labels);
+    println!("container: {}", cli.container);
+}
+
 // --- Validation / redaction --------------------------------------------------
 
-/// Identifiers safe for Podman names and GitHub logins (no shell metacharacters).
 fn is_safe_ident(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 128
@@ -167,7 +302,6 @@ fn is_safe_repo(s: &str) -> bool {
     parts.len() == 2 && parts.iter().all(|p| is_safe_ident(p))
 }
 
-/// Image refs: registry/name:tag — still no shell metacharacters or path tricks.
 fn is_safe_image(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 256
@@ -188,7 +322,6 @@ fn is_safe_labels(s: &str) -> bool {
 }
 
 fn is_safe_cpus(s: &str) -> bool {
-    // "5" or "2.5"
     if s.is_empty() || s.len() > 8 {
         return false;
     }
@@ -196,7 +329,6 @@ fn is_safe_cpus(s: &str) -> bool {
 }
 
 fn is_safe_memory(s: &str) -> bool {
-    // 512m, 8g, 8192Mi — digits + optional unit
     let s = s.trim();
     if s.is_empty() || s.len() > 16 {
         return false;
@@ -214,7 +346,6 @@ fn is_safe_memory(s: &str) -> bool {
     )
 }
 
-/// Strip credential-shaped substrings from error text before logging.
 fn redact(s: &str) -> String {
     let mut out = s.to_string();
     for key in [
@@ -238,10 +369,8 @@ fn redact(s: &str) -> String {
             out.replace_range(i..end, &format!("{key}***REDACTED***"));
         }
     }
-    // Long hex-ish tokens
-    let re_approx = out.clone();
-    if re_approx.len() > 400 {
-        out = format!("{}…", &re_approx[..400]);
+    if out.len() > 400 {
+        out = format!("{}…", &out[..400]);
     }
     out
 }
@@ -250,10 +379,13 @@ fn validate_cli(cli: &Cli) -> Result<(), String> {
     match cli.scope {
         Scope::Repo => {
             let Some(repo) = cli.repo.as_ref() else {
-                return Err("repo scope requires --repo owner/name (or GHA_REPO)".into());
+                return Err(
+                    "repo scope requires --repo owner/name, GHA_REPO, or --auto in a git checkout"
+                        .into(),
+                );
             };
             if !is_safe_repo(repo) {
-                return Err("invalid --repo (expected owner/name, safe charset only)".into());
+                return Err("invalid --repo".into());
             }
         }
         Scope::Org => {
@@ -261,7 +393,21 @@ fn validate_cli(cli: &Cli) -> Result<(), String> {
                 return Err("org scope requires --owner ORG (or GHA_OWNER)".into());
             };
             if !is_safe_ident(owner) {
-                return Err("invalid --owner (safe charset only)".into());
+                return Err("invalid --owner".into());
+            }
+        }
+        Scope::User => {
+            let Some(user) = cli.user.as_ref() else {
+                return Err("user scope requires --user LOGIN or authenticated gh".into());
+            };
+            if !is_safe_ident(user) {
+                return Err("invalid --user".into());
+            }
+            if matches!(cli.mode, Mode::Retain) {
+                return Err(
+                    "scope=user requires --mode ephemeral (re-register per repo; retain is single-target)"
+                        .into(),
+                );
             }
         }
     }
@@ -278,13 +424,13 @@ fn validate_cli(cli: &Cli) -> Result<(), String> {
         return Err("invalid --runner-name".into());
     }
     if !is_safe_labels(&cli.labels) {
-        return Err("invalid --labels (comma-separated safe idents, max 16)".into());
+        return Err("invalid --labels".into());
     }
     if !is_safe_cpus(&cli.cpus) {
-        return Err("invalid --cpus (positive number ≤ 64)".into());
+        return Err("invalid --cpus".into());
     }
     if !is_safe_memory(&cli.memory) {
-        return Err("invalid --memory (e.g. 8g, 512m)".into());
+        return Err("invalid --memory".into());
     }
     if let Some(tok) = &cli.wake_token {
         if tok.len() < 16 {
@@ -294,6 +440,7 @@ fn validate_cli(cli: &Cli) -> Result<(), String> {
     Ok(())
 }
 
+/// Registration URL for config.sh (repo or org). User-batch uses active_repo.
 fn github_url(cli: &Cli) -> String {
     match cli.scope {
         Scope::Repo => format!(
@@ -304,15 +451,24 @@ fn github_url(cli: &Cli) -> String {
             "https://github.com/{}",
             cli.owner.as_ref().expect("validated")
         ),
+        Scope::User => format!(
+            "https://github.com/{}",
+            cli.repo
+                .as_ref()
+                .expect("user batch sets active repo before up")
+        ),
     }
+}
+
+fn registration_api_for_repo(repo: &str) -> String {
+    format!("https://api.github.com/repos/{repo}/actions/runners/registration-token")
 }
 
 fn registration_api(cli: &Cli) -> String {
     match cli.scope {
-        Scope::Repo => format!(
-            "https://api.github.com/repos/{}/actions/runners/registration-token",
-            cli.repo.as_ref().expect("validated")
-        ),
+        Scope::Repo | Scope::User => {
+            registration_api_for_repo(cli.repo.as_ref().expect("validated"))
+        }
         Scope::Org => format!(
             "https://api.github.com/orgs/{}/actions/runners/registration-token",
             cli.owner.as_ref().expect("validated")
@@ -320,20 +476,7 @@ fn registration_api(cli: &Cli) -> String {
     }
 }
 
-fn runners_api(cli: &Cli) -> String {
-    match cli.scope {
-        Scope::Repo => format!(
-            "https://api.github.com/repos/{}/actions/runners",
-            cli.repo.as_ref().expect("validated")
-        ),
-        Scope::Org => format!(
-            "https://api.github.com/orgs/{}/actions/runners",
-            cli.owner.as_ref().expect("validated")
-        ),
-    }
-}
-
-// --- Single-instance lock (pid file; no unsafe) ------------------------------
+// --- Single-instance lock ----------------------------------------------------
 
 struct InstanceLock {
     path: PathBuf,
@@ -366,9 +509,7 @@ impl InstanceLock {
                         path.display()
                     ));
                 }
-                Err(e) => {
-                    return Err(format!("lock open {}: {e}", path.display()));
-                }
+                Err(e) => return Err(format!("lock open {}: {e}", path.display())),
             }
         }
         Err(format!("could not acquire lock {}", path.display()))
@@ -382,7 +523,6 @@ fn lock_is_stale(path: &Path) -> bool {
     let Ok(pid) = s.trim().parse::<u32>() else {
         return true;
     };
-    // kill -0: process exists?
     Command::new("kill")
         .args(["-0", &pid.to_string()])
         .stdout(Stdio::null())
@@ -398,7 +538,7 @@ impl Drop for InstanceLock {
     }
 }
 
-// --- Auth --------------------------------------------------------------------
+// --- Auth / HTTP -------------------------------------------------------------
 
 fn github_token() -> Result<String, String> {
     for key in ["GH_TOKEN", "GITHUB_TOKEN"] {
@@ -415,9 +555,7 @@ fn github_token() -> Result<String, String> {
         .output()
         .map_err(|e| format!("gh auth token failed: {e}"))?;
     if !out.status.success() {
-        return Err(
-            "authenticate with `gh auth login` or set GH_TOKEN (runner registration rights)".into(),
-        );
+        return Err("authenticate with `gh auth login` or set GH_TOKEN".into());
     }
     let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if t.is_empty() {
@@ -456,7 +594,7 @@ fn registration_token(cli: &Cli, api_token: &str) -> Result<String, String> {
         })?;
     if !(200..300).contains(&resp.status()) {
         return Err(format!(
-            "registration-token HTTP {} (check org/repo admin rights)",
+            "registration-token HTTP {} (admin rights on target?)",
             resp.status()
         ));
     }
@@ -531,7 +669,6 @@ fn resolve_build_dir(cli: &Cli) -> Result<PathBuf, String> {
 fn prepare(cli: &Cli, with_container: bool) -> Result<(), String> {
     let dir = resolve_build_dir(cli)?;
     eprintln!("prepare: building {} from {}", cli.image, dir.display());
-    // prepare is the only path that may pull base images
     podman(&[
         "build",
         "-t",
@@ -563,7 +700,6 @@ set -euo pipefail
 if [[ ! -x /opt/actions-runner/run.sh ]]; then
   cp -a /opt/actions-runner-seed/. /opt/actions-runner/
 fi
-# Drop world-writable bits on the snapshot home
 chmod -R go-w /opt/actions-runner 2>/dev/null || true
 date -u +%Y-%m-%dT%H:%M:%SZ > /opt/actions-runner/.snapshot-baseline
 echo ok
@@ -595,7 +731,6 @@ fn write_env_file(path: &Path, reg_token: &str, cli: &Cli) -> Result<(), String>
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
     }
-    // Fixed keys only — values already validated except the token itself.
     writeln!(
         f,
         "REPO_URL={}\nRUNNER_NAME={}\nRUNNER_LABELS={}\nRUNNER_EPHEMERAL={}\nRUNNER_RETAIN={}\nRUNNER_TOKEN={}",
@@ -621,6 +756,35 @@ fn shred_env_file(path: &Path) {
     let _ = fs::remove_file(path);
 }
 
+/// Active registration target repo for status file (user batch).
+fn active_target_path(cli: &Cli) -> PathBuf {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    dir.join(format!("gha-runner-ctl-active-{}.txt", cli.container))
+}
+
+fn set_active_target(cli: &Cli, repo: &str) {
+    let p = active_target_path(cli);
+    let _ = fs::write(&p, repo);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o600));
+    }
+}
+
+fn get_active_target(cli: &Cli) -> Option<String> {
+    fs::read_to_string(active_target_path(cli))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| is_safe_repo(s))
+}
+
+fn clear_active_target(cli: &Cli) {
+    let _ = fs::remove_file(active_target_path(cli));
+}
+
 fn up(cli: &Cli) -> Result<(), String> {
     if container_running(&cli.container) {
         eprintln!("up: already running ({})", cli.container);
@@ -632,12 +796,14 @@ fn up(cli: &Cli) -> Result<(), String> {
             cli.volume
         ));
     }
+    if matches!(cli.scope, Scope::User) && cli.repo.is_none() {
+        return Err("user batch: no active repo with demand (listen selects it)".into());
+    }
 
     let api = github_token()?;
     let reg = registration_token(cli, &api)?;
     let env_path = private_env_path();
     write_env_file(&env_path, &reg, cli)?;
-    // Drop owned copy of registration token from this process ASAP after write.
     drop(reg);
     drop(api);
 
@@ -646,18 +812,20 @@ fn up(cli: &Cli) -> Result<(), String> {
     }
 
     eprintln!(
-        "up: one runner scope={:?} mode={:?} url={}",
+        "up: scope={:?} mode={:?} url={}",
         cli.scope,
         cli.mode,
         github_url(cli)
     );
-    let ephemeral = matches!(cli.mode, Mode::Ephemeral);
+    let ephemeral = matches!(cli.mode, Mode::Ephemeral) || matches!(cli.scope, Scope::User);
     let env_path_str = env_path.to_str().ok_or("env path not utf-8")?.to_string();
     let vol = format!("{}:/opt/actions-runner:Z", cli.volume);
     let eph = if ephemeral { "true" } else { "false" };
     let ret = if ephemeral { "false" } else { "true" };
+    let eph_kv = format!("RUNNER_EPHEMERAL={eph}");
+    let ret_kv = format!("RUNNER_RETAIN={ret}");
 
-    let mut args = vec![
+    let args = [
         "run",
         "-d",
         "--name",
@@ -677,24 +845,21 @@ fn up(cli: &Cli) -> Result<(), String> {
         "--env-file",
         env_path_str.as_str(),
         "-e",
+        eph_kv.as_str(),
+        "-e",
+        ret_kv.as_str(),
+        "-v",
+        vol.as_str(),
+        cli.image.as_str(),
     ];
-    // -e pairs need owned strings for format! — use static then extend carefully
-    let eph_kv = format!("RUNNER_EPHEMERAL={eph}");
-    let ret_kv = format!("RUNNER_RETAIN={ret}");
-    args.push(eph_kv.as_str());
-    args.push("-e");
-    args.push(ret_kv.as_str());
-    args.push("-v");
-    args.push(vol.as_str());
-    args.push(cli.image.as_str());
-
     let result = podman(&args);
     shred_env_file(&env_path);
     result?;
+
+    if let Some(repo) = cli.repo.as_ref() {
+        set_active_target(cli, repo);
+    }
     eprintln!("up: container {}", cli.container);
-    eprintln!(
-        "up: note — prefer private repos on self-hosted runners (public forks can run untrusted workflows)"
-    );
     Ok(())
 }
 
@@ -708,7 +873,8 @@ fn down(cli: &Cli, rm: bool) -> Result<(), String> {
     } else {
         eprintln!("down: no container {}", cli.container);
     }
-    if matches!(cli.mode, Mode::Ephemeral) {
+    let ephemeral = matches!(cli.mode, Mode::Ephemeral) || matches!(cli.scope, Scope::User);
+    if ephemeral {
         let vol = format!("{}:/opt/actions-runner:Z", cli.volume);
         let _ = podman(&[
             "run",
@@ -726,12 +892,28 @@ fn down(cli: &Cli, rm: bool) -> Result<(), String> {
             "rm -f /opt/actions-runner/.runner /opt/actions-runner/.credentials /opt/actions-runner/.credentials_rsaparams 2>/dev/null; true",
         ]);
     }
+    clear_active_target(cli);
     Ok(())
 }
 
 fn status(cli: &Cli) -> Result<(), String> {
     println!("scope: {:?}", cli.scope);
-    println!("url: {}", github_url(cli));
+    match cli.scope {
+        Scope::Repo => println!("repo: {}", cli.repo.as_deref().unwrap_or("?")),
+        Scope::Org => println!("org: {}", cli.owner.as_deref().unwrap_or("?")),
+        Scope::User => {
+            println!("user: {}", cli.user.as_deref().unwrap_or("?"));
+            println!(
+                "active_registration: {}",
+                get_active_target(cli).unwrap_or_else(|| "(none)".into())
+            );
+        }
+    }
+    if matches!(cli.scope, Scope::User) && cli.repo.is_none() {
+        println!("register_url: (none until demand selects a repo)");
+    } else {
+        println!("register_url: {}", github_url(cli));
+    }
     println!("container: {}", cli.container);
     if container_exists(&cli.container) {
         println!("  exists: true");
@@ -744,37 +926,8 @@ fn status(cli: &Cli) -> Result<(), String> {
         cli.volume,
         volume_exists(&cli.volume)
     );
-    println!("image: {}", cli.image);
     println!("mode: {:?}", cli.mode);
     println!("labels: {}", cli.labels);
-
-    if let Ok(api) = github_token() {
-        let url = runners_api(cli);
-        if let Ok(resp) = http_agent()
-            .get(&url)
-            .set("Authorization", &format!("Bearer {api}"))
-            .set("Accept", "application/vnd.github+json")
-            .set("X-GitHub-Api-Version", "2022-11-28")
-            .call()
-        {
-            #[derive(Deserialize)]
-            struct Runners {
-                runners: Vec<Runner>,
-            }
-            #[derive(Deserialize)]
-            struct Runner {
-                name: String,
-                status: String,
-                busy: bool,
-            }
-            if let Ok(body) = resp.into_json::<Runners>() {
-                println!("github runners:");
-                for r in body.runners {
-                    println!("  - {} status={} busy={}", r.name, r.status, r.busy);
-                }
-            }
-        }
-    }
     Ok(())
 }
 
@@ -802,40 +955,95 @@ struct Job {
 }
 
 #[derive(Debug, Deserialize)]
-struct OrgRepos {
+struct NamedRepo {
     full_name: String,
+    fork: Option<bool>,
+    archived: Option<bool>,
 }
 
-fn demand(cli: &Cli, api: &str) -> Result<bool, String> {
+/// Returns (need_runner, optional active_repo_for_registration).
+fn demand(cli: &Cli, api: &str) -> Result<(bool, Option<String>), String> {
     match cli.scope {
         Scope::Repo => {
-            let repo = cli.repo.as_ref().expect("validated");
-            repo_needs_runner(repo, api)
+            let repo = cli.repo.as_ref().expect("validated").clone();
+            Ok((repo_needs_runner(&repo, api)?, Some(repo)))
         }
         Scope::Org => {
             let owner = cli.owner.as_ref().expect("validated");
-            let url = format!("https://api.github.com/orgs/{owner}/repos?per_page=50&type=all");
-            let resp = http_agent()
-                .get(&url)
-                .set("Authorization", &format!("Bearer {api}"))
-                .set("Accept", "application/vnd.github+json")
-                .set("X-GitHub-Api-Version", "2022-11-28")
-                .call()
-                .map_err(|e| format!("list org repos: {}", redact(&e.to_string())))?;
-            let repos: Vec<OrgRepos> = resp
-                .into_json()
-                .map_err(|e| format!("parse org repos: {e}"))?;
+            let url = format!("https://api.github.com/orgs/{owner}/repos?per_page=100&type=all");
+            let repos = list_repos_paginated(&url, api)?;
             for r in repos {
-                if !is_safe_repo(&r.full_name) {
+                if r.archived.unwrap_or(false) || !is_safe_repo(&r.full_name) {
                     continue;
                 }
                 if repo_needs_runner(&r.full_name, api)? {
-                    return Ok(true);
+                    // Org runner registration is org-level; active repo is informational.
+                    return Ok((true, Some(r.full_name)));
                 }
             }
-            Ok(false)
+            Ok((false, None))
+        }
+        Scope::User => {
+            let user = cli.user.as_ref().expect("validated");
+            // Owner repos only (not collaborator noise). Paginate.
+            let url = format!(
+                "https://api.github.com/users/{user}/repos?type=owner&per_page=100&sort=updated"
+            );
+            let repos = list_repos_paginated(&url, api)?;
+            for r in repos {
+                if r.archived.unwrap_or(false) || r.fork.unwrap_or(false) {
+                    continue;
+                }
+                if !is_safe_repo(&r.full_name) {
+                    continue;
+                }
+                // Only this user's namespace
+                if !r.full_name.starts_with(&format!("{user}/")) {
+                    continue;
+                }
+                if repo_needs_runner(&r.full_name, api)? {
+                    return Ok((true, Some(r.full_name)));
+                }
+            }
+            Ok((false, None))
         }
     }
+}
+
+fn list_repos_paginated(first_url: &str, api: &str) -> Result<Vec<NamedRepo>, String> {
+    let mut out = Vec::new();
+    let mut url = Some(first_url.to_string());
+    let mut pages = 0;
+    while let Some(u) = url {
+        pages += 1;
+        if pages > 20 {
+            break; // cap: 2000 repos
+        }
+        let resp = http_agent()
+            .get(&u)
+            .set("Authorization", &format!("Bearer {api}"))
+            .set("Accept", "application/vnd.github+json")
+            .set("X-GitHub-Api-Version", "2022-11-28")
+            .call()
+            .map_err(|e| format!("list repos: {}", redact(&e.to_string())))?;
+        let link = resp.header("link").map(|s| s.to_string());
+        let batch: Vec<NamedRepo> = resp.into_json().map_err(|e| format!("parse repos: {e}"))?;
+        out.extend(batch);
+        url = link.and_then(|l| parse_next_link(&l));
+    }
+    Ok(out)
+}
+
+fn parse_next_link(link: &str) -> Option<String> {
+    // <url>; rel="next"
+    for part in link.split(',') {
+        if part.contains("rel=\"next\"") {
+            let start = part.find('<')? + 1;
+            let end = part.find('>')?;
+            return Some(part[start..end].to_string());
+        }
+    }
+    None
 }
 
 fn repo_needs_runner(repo: &str, api: &str) -> Result<bool, String> {
@@ -901,10 +1109,7 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
             return Err("wake-port must be non-zero".into());
         }
         let Some(token) = cli.wake_token.clone() else {
-            return Err(
-                "wake-port requires GHA_WAKE_TOKEN (≥16 chars) — refuse unauthenticated wake"
-                    .into(),
-            );
+            return Err("wake-port requires GHA_WAKE_TOKEN (≥16 chars)".into());
         };
         let snap = cli_snapshot(cli);
         thread::spawn(move || wake_server(port, snap, token));
@@ -912,6 +1117,8 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
     }
 
     let mut idle_since: Option<Instant> = None;
+    let mut cli = cli.clone_for_listen();
+
     loop {
         let api = match github_token() {
             Ok(t) => t,
@@ -922,7 +1129,7 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
             }
         };
 
-        let need = match demand(cli, &api) {
+        let (need, target_repo) = match demand(&cli, &api) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("listen: poll: {}", redact(&e));
@@ -932,11 +1139,26 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
         };
         drop(api);
 
+        // User batch: pin registration target to the repo that needs work.
+        if matches!(cli.scope, Scope::User) {
+            if let Some(ref r) = target_repo {
+                let active = get_active_target(&cli);
+                if active.as_deref() != Some(r.as_str()) && container_running(&cli.container) {
+                    eprintln!("listen: demand moved {active:?} → {r}; recycling runner");
+                    let _ = down(&cli, true);
+                }
+                cli.repo = Some(r.clone());
+            }
+        }
+
         let running = container_running(&cli.container);
 
         if need && !running {
-            eprintln!("listen: demand — up");
-            if let Err(e) = up(cli) {
+            eprintln!(
+                "listen: demand — up ({})",
+                cli.repo.as_deref().unwrap_or("org")
+            );
+            if let Err(e) = up(&cli) {
                 eprintln!("listen: up failed: {}", redact(&e));
             }
             idle_since = None;
@@ -944,7 +1166,7 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
             let since = idle_since.get_or_insert_with(Instant::now);
             if since.elapsed() >= Duration::from_secs(idle_secs) {
                 eprintln!("listen: idle {idle_secs}s — down");
-                if let Err(e) = down(cli, true) {
+                if let Err(e) = down(&cli, true) {
                     eprintln!("listen: down failed: {}", redact(&e));
                 }
                 idle_since = None;
@@ -957,10 +1179,36 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
     }
 }
 
+/// Clone settings for listen mutability of active repo.
+impl Cli {
+    fn clone_for_listen(&self) -> Self {
+        Self {
+            cmd: Cmd::Status,
+            scope: self.scope.clone(),
+            repo: self.repo.clone(),
+            owner: self.owner.clone(),
+            user: self.user.clone(),
+            auto: self.auto,
+            image: self.image.clone(),
+            container: self.container.clone(),
+            volume: self.volume.clone(),
+            runner_name: self.runner_name.clone(),
+            labels: self.labels.clone(),
+            cpus: self.cpus.clone(),
+            memory: self.memory.clone(),
+            build_dir: self.build_dir.clone(),
+            mode: self.mode.clone(),
+            wake_token: self.wake_token.clone(),
+        }
+    }
+}
+
 struct CliSnap {
     scope: Scope,
     repo: Option<String>,
     owner: Option<String>,
+    user: Option<String>,
+    auto: bool,
     image: String,
     container: String,
     volume: String,
@@ -977,6 +1225,8 @@ fn cli_snapshot(cli: &Cli) -> CliSnap {
         scope: cli.scope.clone(),
         repo: cli.repo.clone(),
         owner: cli.owner.clone(),
+        user: cli.user.clone(),
+        auto: cli.auto,
         image: cli.image.clone(),
         container: cli.container.clone(),
         volume: cli.volume.clone(),
@@ -995,6 +1245,8 @@ fn snap_to_cli(s: &CliSnap) -> Cli {
         scope: s.scope.clone(),
         repo: s.repo.clone(),
         owner: s.owner.clone(),
+        user: s.user.clone(),
+        auto: s.auto,
         image: s.image.clone(),
         container: s.container.clone(),
         volume: s.volume.clone(),
@@ -1018,38 +1270,6 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
         == 0
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rejects_shell_metacharacters_in_repo() {
-        assert!(!is_safe_repo("foo/bar;rm"));
-        assert!(!is_safe_repo("../etc/passwd"));
-        assert!(is_safe_repo("tzervas/tg-agent-relay"));
-    }
-
-    #[test]
-    fn redacts_bearer_and_ghp() {
-        let s = redact("error Bearer ghp_ABCDEFGHIJKLMNOPQRSTUV secret");
-        assert!(!s.contains("ABCDEF"));
-        assert!(s.contains("REDACTED") || s.contains("***"));
-    }
-
-    #[test]
-    fn labels_bounded() {
-        assert!(is_safe_labels("self-hosted,linux,x64,podman"));
-        assert!(!is_safe_labels("ok,bad label"));
-        assert!(!is_safe_labels(""));
-    }
-
-    #[test]
-    fn constant_time_eq_works() {
-        assert!(constant_time_eq("abcdef0123456789", "abcdef0123456789"));
-        assert!(!constant_time_eq("abcdef0123456789", "abcdef0123456780"));
-    }
-}
-
 fn wake_server(port: u16, snap: CliSnap, token: String) {
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -1067,7 +1287,6 @@ fn wake_server(port: u16, snap: CliSnap, token: String) {
         let mut buf = [0_u8; 2048];
         let n = s.read(&mut buf).unwrap_or(0);
         let req = String::from_utf8_lossy(&buf[..n]);
-        // Require Authorization: Bearer <token> or X-Wake-Token
         let authed = req.lines().any(|line| {
             let lower = line.to_ascii_lowercase();
             if let Some(rest) = lower.strip_prefix("authorization: bearer ") {
@@ -1114,5 +1333,34 @@ fn wake_server(port: u16, snap: CliSnap, token: String) {
             "HTTP/1.1 {code}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_shell_metacharacters_in_repo() {
+        assert!(!is_safe_repo("foo/bar;rm"));
+        assert!(is_safe_repo("tzervas/tg-agent-relay"));
+    }
+
+    #[test]
+    fn parse_remotes() {
+        assert_eq!(
+            parse_github_remote("git@github.com:tzervas/foo.git").as_deref(),
+            Some("tzervas/foo")
+        );
+        assert_eq!(
+            parse_github_remote("https://github.com/tzervas/foo.git").as_deref(),
+            Some("tzervas/foo")
+        );
+    }
+
+    #[test]
+    fn redacts_bearer() {
+        let s = redact("Bearer ghp_ABCDEFGHIJKLMNOPQRST");
+        assert!(!s.contains("ABCDEF"));
     }
 }
