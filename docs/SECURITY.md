@@ -1,6 +1,6 @@
-# Security model
+# Security Model
 
-## Threats we design for
+## Threats We Design For
 
 | Threat | Mitigation |
 |---|---|
@@ -13,14 +13,16 @@
 | Twin controllers racing | Exclusive flock on `listen` / `up` |
 | Public fork abuse of self-hosted | Prefer private repos; documented warning on `up` |
 | Stale registration after ephemeral job | Wipe `.runner` / credentials on `down` in ephemeral mode |
+| Workstation exhaustion (DoS) | Sane horizontal constraints (`--max-runners`) and system load averages protection (`--max-load`) |
+| Malicious Package Mirror spoofing | Forced SSL/TLS packages updates via `apt-transport-https` and rewrite to `https://` mirror URIs |
 
-## Org vs personal repos
+## Org vs Personal Repos
 
 Organization runners only serve **repositories in that org**. Personal
 `user/repo` workflows cannot use `vectorweighttechnologies` runners while
 staying outside the org. See README.
 
-## Operator checklist
+## Operator Checklist
 
 - [ ] `gh auth` / `GH_TOKEN` with least privilege for registration only  
 - [ ] Runner groups in org UI limited to intended repos  
@@ -29,7 +31,7 @@ staying outside the org. See README.
 - [ ] Keep `gha-runner-ctl` and the image pin current (runner sha256 in Containerfile)  
 - [ ] Run `bash scripts/security-scan.sh` before each release  
 
-## Local scanners
+## Local Scanners
 
 ```bash
 bash scripts/security-scan.sh
@@ -39,7 +41,7 @@ bash scripts/security-scan.sh
 # trivy fs             — vulns/secrets/misconfig (Containerfile, etc.)
 ```
 
-## Host + snapshot freshness
+## Host + Snapshot Freshness
 
 `gha-runner-ctl prepare` **updates host packages first** (apt/dnf), then rebuilds
 the image with `--pull=always` and reseeds the volume. That keeps the long-lived
