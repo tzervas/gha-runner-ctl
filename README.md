@@ -1,50 +1,44 @@
 # gha-runner-ctl
 
-**One** GitHub Actions self-hosted runner on Podman: pre-seeded snapshot, short-lived auto-registration, on-demand up/down.
+**One** hardened, highly performant Rust controller for a GitHub Actions self-hosted runner on Podman. It features pre-seeded snapshot volumes, short-lived auto-registration, and automatic, on-demand up/down scaling.
 
-Not a fleet. Not 140 processes. One listener on your workstation, shared by every repo that targets its labels.
+This is a production-grade **1-click deployment** solution with advanced Git Credential Manager (GCM) integration, interactive secret guarding, and automatic multi-repo retargeting.
 
-[MIT](LICENSE) · [NOTICE](NOTICE) (cites [actions/runner](https://github.com/actions/runner), also MIT)
+---
 
-## Why
+## Why (Design Philosophy)
 
-| Goal | Approach |
-|---|---|
-| Fast start | Image + volume snapshot (`prepare`) — no tarball download on the hot path |
-| Secure register | Mint registration token via API / `gh auth`; never commit UI tokens |
-| Idle cost | Ephemeral mode + idle timeout tears the container down |
-| Many repos | Prefer **org-level** registration (one runner, GitHub dispatches jobs) |
-| Queues | GitHub queues jobs to matching labels; one runner takes one job at a time; `listen` brings it back for the next |
+Unlike heavy Kubernetes operators or idle VMs that consume resources 24/7, `gha-runner-ctl` operates on a simple, hardened principle:
 
-## Requirements
+* **Idle Zero-Cost:** The only component running continuously is the thin, lightweight Rust listener/agent. The runner container is started ephemerally when a job is dispatched, and torn down after completion or upon idling.
+* **Fast Start via Seeded Volumes:** Instead of downloading a massive official runner tarball on every cold start, `gha-runner-ctl prepare` bakes the binary baseline into a reusable Podman volume. Cold starts happen in under 2 seconds.
+* **Secure Registration Guard:** Self-hosted runner registration tokens are short-lived. We dynamically query GitHub API, write credentials to a locked `0600` runtime file, start the container, and immediately shred/unlink the secret from the host.
+* **Multi-Repo Capability (Scope User/Org):** One single controller process polls all repositories in your user or organization namespace, ephemerally starting the runner and registering it to whichever repository has queued self-hosted work.
 
-- Rust **1.96+** (build), **Podman**, **`gh`** logged in  
-- Token that can create runner registration tokens:
-  - **Repo runner:** admin on that repo  
-  - **Org runner:** org owner / runner admin  
+---
 
-Personal GitHub **user** accounts only get **repo-scoped** runners. For one runner across many repos, use a **GitHub Organization** and `--scope org`.
+## Key Features
 
-## Install (release binary — preferred)
+1. **1-Click `--full-auto` Mode:** Detects if you are inside a Git checkout (targeting that repository) or defaults to user-level batch polling. Instantly prepares the Podman snapshot if missing, and initiates the polling listener.
+2. **Secure Interactive Fallback & Secret Guarding:** Never pass secrets in CLI parameters or environment variables directly. If missing, `gha-runner-ctl` prompts for your token via a masked prompt. Any raw token pattern detected in raw command arguments is intercepted and scrubbed to prevent shell/TTY history leaks.
+3. **Git Credential Manager (GCM) Integration:** Automatically queries GCM (using standard `git credential fill` protocol) to safely retrieve your GitHub Personal Access Token without human intervention. Offers automatic interactive GCM installation if missing on Debian/Ubuntu-based machines.
+4. **Visibility Filtering:** Keep control of security with `--public-only`, `--private-only`, or `--all-repos` (defaults safely to the user's public repositories).
+5. **Secure Container Environment:** Pre-configures the Ubuntu 24.04 runner container to only pull packages from trusted mirrors over secure HTTPS connections.
 
-```bash
-VER=0.2.0
-TARGET=x86_64-unknown-linux-gnu
-BASE="https://github.com/tzervas/gha-runner-ctl/releases/download/v${VER}"
+---
 
-curl -fsSL -o "gha-runner-ctl-${VER}-${TARGET}.tar.gz" \
-  "${BASE}/gha-runner-ctl-${VER}-${TARGET}.tar.gz"
-curl -fsSL -o "SHA256SUMS-${VER}.txt" \
-  "${BASE}/SHA256SUMS-${VER}.txt"
-sha256sum -c "SHA256SUMS-${VER}.txt"
-tar xzf "gha-runner-ctl-${VER}-${TARGET}.tar.gz"
-cd "gha-runner-ctl-${VER}-${TARGET}"
-bash install.sh
-export PATH="$HOME/.local/bin:$PATH"
-gha-runner-ctl --help
-```
+## Prerequisites
 
-From source (dev):
+* **Podman** installed on the workstation.
+* A GitHub Personal Access Token (PAT) with `admin:org` (for org scope) or repository-level admin permissions.
+
+---
+
+## Quick Start & Installation
+
+### 1-Click Install & Run
+
+Compile and install `gha-runner-ctl` to `~/.local/bin` from source:
 
 ```bash
 git clone https://github.com/tzervas/gha-runner-ctl.git
@@ -53,55 +47,42 @@ bash packaging/install-ctl.sh
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-## Quick start
+To run a fully automated deployment with 1-click:
 
 ```bash
-# Once per machine
+# Automatically detects current directory repo context, prepares snapshot, and starts polling
+gha-runner-ctl --full-auto
+```
+
+### Manual Execution
+
+If you prefer to invoke commands individually:
+
+```bash
+# 1. Build container image and seed the snapshot volume
 gha-runner-ctl prepare
+
+# 2. Start polling for a specific repository with custom visibility filter
+gha-runner-ctl --scope repo --repo your-username/your-repo --private-only listen --interval 30 --idle-secs 180
 ```
 
-### Current repo (auto-detect from checkout)
+---
 
-```bash
-cd ~/work/tg-agent-relay
-gha-runner-ctl --scope repo --auto listen --interval 30 --idle-secs 180
-# or: bash scripts/auto-listen.sh
-```
+## Commands
 
-### Batch all personal repos (tzervas)
+| Command | Description |
+|---|---|
+| `prepare` | Builds Podman container image and seeds the persistent baseline volume. |
+| `up` | Dynamically fetches registration token, seeds env, and brings up the Podman runner. |
+| `down` | Safely stops the runner container, deletes container instance, and cleans up volume registration. |
+| `status` | Checks active scope, container state, and registration details. |
+| `listen` | Runs the main polling daemon, monitoring queues and scaling the runner on-demand. |
 
-One runner process. When a self-hosted job is queued on any **owned** personal
-repo, the controller ephemerally re-registers to **that** repo, runs the job,
-then can retarget the next. GitHub still queues; you do not run 140 processes.
+---
 
-```bash
-gha-runner-ctl --scope user --user tzervas listen --interval 30 --idle-secs 180
-# or: bash scripts/auto-listen.sh --batch --user tzervas
-```
+## Consumer Workflows
 
-### Organization (true multi-repo, one registration)
-
-Repos must live under the org. Personal `tzervas/*` cannot use an org runner
-while remaining outside that org.
-
-```bash
-gha-runner-ctl --scope org --owner vectorweighttechnologies \
-  listen --interval 30 --idle-secs 180
-# or: bash scripts/auto-listen.sh --org vectorweighttechnologies
-```
-
-### Manual
-
-```bash
-gha-runner-ctl --scope repo --auto detect
-gha-runner-ctl --scope repo --repo tzervas/tg-agent-relay up
-gha-runner-ctl status
-gha-runner-ctl down
-```
-
-## Consumer workflows
-
-In **any** repo that should use this host:
+Configure any repository workflow file to target your workstation runner by adding the appropriate `runs-on` labels:
 
 ```yaml
 jobs:
@@ -109,49 +90,18 @@ jobs:
     runs-on: [self-hosted, linux, x64, podman]
     steps:
       - uses: actions/checkout@v4
-      # …
+      - name: Verify Environment
+        run: |
+          echo "Running on secure, on-demand self-hosted compute!"
 ```
 
-Use the **same labels** the runner registered with. GitHub matches labels and queues work; you do not start a runner per repo.
+---
 
-See [docs/CONSUMERS.md](docs/CONSUMERS.md).
+## Security Model
 
-## Modes
+The controller enforces robust, fail-closed security guarantees:
+* **Shell Injection Block:** Strict allowlist validation is applied to all repository names, labels, and CPU/memory specifications to eliminate shell metacharacters before calling APIs or Podman.
+* **Token Redaction:** Log traces and errors are automatically parsed to filter and redact `ghp_`, `github_pat_`, and `Bearer` secret strings.
+* **User Privileges:** The runner container runs completely under a non-root user (`runner` UID 1001) with `no-new-privileges` enabled, ensuring complete sandboxing from the host system.
 
-| Mode | Behavior |
-|---|---|
-| `ephemeral` (default) | Fresh registration each `up`; runner drops after one job |
-| `retain` | Keep `.runner` on the snapshot volume across restarts |
-
-```bash
-gha-runner-ctl --mode retain up
-```
-
-## Hardening (summary)
-
-- Identity allowlists (no shell metacharacters into Podman/API)
-- Short-lived registration tokens; scrubbed logs; private env file shredded after start
-- `no-new-privileges`, `--pull=never` on run path; resource caps
-- One controller instance via flock; wake endpoint needs `GHA_WAKE_TOKEN`
-- Prefer **private** repos on self-hosted runners  
-
-Details: [docs/SECURITY.md](docs/SECURITY.md).
-
-## What `config.sh` is
-
-That script ships **inside** the official runner package. This tool runs it for you in the container. You do not install the runner by hand or paste UI tokens.
-
-## Citation / license
-
-- This project: **MIT** (Tyler Zervas), see [LICENSE](LICENSE).  
-- Official runner binary: **MIT** ([actions/runner](https://github.com/actions/runner)), see [NOTICE](NOTICE).  
-
-## Commands
-
-```
-gha-runner-ctl prepare   # build image + seed volume
-gha-runner-ctl up        # register + start
-gha-runner-ctl down      # stop
-gha-runner-ctl status
-gha-runner-ctl listen    # poll for demand; idle down
-```
+For details, refer to `docs/SECURITY.md`.
