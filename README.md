@@ -1,10 +1,29 @@
 # gha-runner-ctl
 
-**One** hardened Rust controller for a GitHub Actions self-hosted runner on Podman: pre-seeded snapshot volumes, short-lived auto-registration, and on-demand up/down scaling.
+**Hardened Rust controller** for GitHub Actions self-hosted runners on Podman: pre-seeded snapshots, short-lived registration, on-demand up/down, multi-instance CPU + soft GPU slices (WSL).
 
-Not a fleet. Not one process per repo. One listener on your workstation, shared by every repo that targets its labels.
+[![CI](https://github.com/tzervas/gha-runner-ctl/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tzervas/gha-runner-ctl/actions/workflows/ci.yml?query=branch%3Amain)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![MSRV](https://img.shields.io/badge/MSRV-1.96-blue.svg)](rust-toolchain.toml)
+[![Runner](https://img.shields.io/badge/runs--on-self--hosted%20podman-informational)](docs/QUICKSTART.md)
+
+CI badge reflects **self-hosted** workflow status on `main` (`runs-on: [self-hosted, linux, x64, podman]`). It is only green when a host listener registers a runner and completes the job—no GitHub-hosted fallback.
+
+**Docs:** [QUICKSTART](docs/QUICKSTART.md) · [HOST_OPS](docs/HOST_OPS.md) · [SECURITY](docs/SECURITY.md) · [CONSUMERS](docs/CONSUMERS.md) · [DESIGN](docs/DESIGN.md)
 
 [MIT](LICENSE) · [NOTICE](NOTICE) (cites [actions/runner](https://github.com/actions/runner), also MIT)
+
+---
+
+## Screenshots / phases
+
+| Phase | Visual |
+|-------|--------|
+| Fleet layout (CPU + GPU slices) | ![architecture](docs/assets/architecture-wsl-fleet.jpg) |
+| Enable listeners | ![terminal](docs/assets/terminal-enable-listeners.jpg) |
+| Workflows → self-hosted | ![workflow](docs/assets/workflow-runs-on-self-hosted.jpg) |
+
+Real host snapshot text: [docs/assets/setup-status.txt](docs/assets/setup-status.txt).
 
 ---
 
@@ -14,9 +33,10 @@ Not a fleet. Not one process per repo. One listener on your workstation, shared 
 |---|---|
 | Fast start | Image + volume snapshot (`prepare`) — no tarball download on the hot path |
 | Secure register | Mint registration token via API / `gh` / GCM / interactive prompt; private `0600` env file shredded after start |
-| Idle cost | Ephemeral mode + idle timeout tears the container down |
-| Many repos | **user** batch (poll owned repos, re-register per demand) or **org** registration (one runner, GitHub dispatches) |
-| Queues | GitHub queues jobs to matching labels; one runner takes one job at a time; `listen` brings it back for the next |
+| Idle cost | Ephemeral mode + idle timeout tears the container down (**GPU freed** when no GPU workers remain) |
+| Many repos | **user** batch (poll owned repos, re-register per demand) or **org** registration |
+| Horizontal | Multiple `listen` processes (locks per `--container`): e.g. 1× CPU + 2× GPU soft-slices |
+| GPU (WSL) | `--gpu` + optional `--gpu-slice a\|b` (time-share on consumer GeForce; no MIG) |
 
 ---
 
@@ -29,6 +49,9 @@ Not a fleet. Not one process per repo. One listener on your workstation, shared 
 5. **Visibility filters:** `--public-only` (default when unset), `--private-only`, or `--all-repos`.
 6. **Scopes:** `repo` | `user` (batch personal) | `org` (org-level registration).
 7. **Hardened container:** Non-root `runner` (UID 1001), `no-new-privileges`, `--pull=never` on hot path.
+8. **Demand filters (0.2.4+):** `--demand-require-labels` / `--demand-exclude-labels` so CPU listeners ignore GPU jobs and GPU listeners only wake on `gpu`.
+9. **Sticky user-batch:** do not recycle registration while the active repo still has matching work.
+10. **Multi-instance locks:** `up`/`listen` locks namespaced by `--container`.
 
 ---
 
