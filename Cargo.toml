@@ -1,6 +1,6 @@
 [package]
 name = "gha_runner_ctl"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 rust-version = "1.96"
 license = "MIT"

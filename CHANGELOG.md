@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.3
+
+- **Multi-instance locks:** `up`/`listen` PID locks are namespaced by `--container`, so two controllers (e.g. CPU + GPU) can run side-by-side
+- **`--gpu` / `GHA_GPU`:** Podman GPU attach for WSL2 (`--gpus all`, `/dev/dxg`, `/usr/lib/wsl` mount + `LD_LIBRARY_PATH`)
+- Pair GPU instance with an extra runner label (e.g. `gpu`) so only GPU jobs schedule there
+
 ## 0.2.2
 
 - **`prepare` updates the host first** (`apt-get`/`dnf` upgrade) before building
