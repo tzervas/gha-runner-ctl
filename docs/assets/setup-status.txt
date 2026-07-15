@@ -1,0 +1,32 @@
+=== systemctl --user status (listeners) ===
+inactive
+inactive
+inactive
+  UNIT LOAD ACTIVE SUB DESCRIPTION
+
+0 loaded units listed. Pass --all to see loaded but inactive units, too.
+To show all installed unit files use 'systemctl list-unit-files'.
+
+=== instance env (cpu) ===
+GHA_SCOPE=user
+GHA_USER=tzervas
+GHA_ALL_REPOS=true
+GHA_CONTAINER=gha-runner-cpu
+GHA_VOLUME=gha-runner-cpu-data
+GHA_RUNNER_NAME=wsl-cpu-1
+GHA_LABELS=self-hosted,linux,x64,podman
+GHA_CPUS=4
+GHA_MEMORY=4g
+GHA_MODE=ephemeral
+GHA_IMAGE=localhost/gha-runner-ctl:latest
+GHA_DEMAND_EXCLUDE_LABELS=gpu
+
+=== gha-runner-ctl VERSION ===
+0.2.4
+
+=== podman volumes ===
+local       tg-agent-relay-gha-runner-data
+local       gha-runner-cpu-data
+local       gha-runner-gpu-data
+local       gha-runner-gpu-a-data
+local       gha-runner-gpu-b-data

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.4
+
+- **Demand filters:** `--demand-require-labels` / `--demand-exclude-labels` so CPU listeners ignore GPU jobs and GPU listeners only wake on `gpu`
+- **Sticky user-batch:** do not recycle registration while active repo still has matching work
+- **GPU soft-slices:** `--gpu-slice a|b` for dual workers on one consumer GPU (time-share; no MIG); idle `down` frees GPU
+- Labels convention: `gpu` + optional `gpu-slice-a` / `gpu-slice-b`
+
 ## 0.2.3
 
 - **Multi-instance locks:** `up`/`listen` PID locks are namespaced by `--container`, so two controllers (e.g. CPU + GPU) can run side-by-side
