@@ -1,5 +1,42 @@
 use gha_runner_ctl::*;
 
+#[test]
+fn test_wake_auth_preserves_token_case() {
+    // Mixed-case secret must match when Authorization/Bearer casing varies.
+    let token = "AbCdEfGhIjKlMnOp"; // 16 chars
+    assert!(wake_request_line_authorized(
+        &format!("Authorization: Bearer {token}"),
+        token
+    ));
+    assert!(wake_request_line_authorized(
+        &format!("authorization: bearer {token}"),
+        token
+    ));
+    assert!(wake_request_line_authorized(
+        &format!("AUTHORIZATION: BEARER {token}"),
+        token
+    ));
+    // Lowercasing the secret must NOT authenticate against the original token.
+    assert!(!wake_request_line_authorized(
+        &format!("Authorization: Bearer {}", token.to_ascii_lowercase()),
+        token
+    ));
+    // Wrong secret rejected.
+    assert!(!wake_request_line_authorized(
+        "Authorization: Bearer totally-wrong-tok",
+        token
+    ));
+    // X-Wake-Token path (exact header name) still works.
+    assert!(wake_request_line_authorized(
+        &format!("X-Wake-Token: {token}"),
+        token
+    ));
+    assert!(!wake_request_line_authorized(
+        &format!("X-Wake-Token: {}", token.to_ascii_lowercase()),
+        token
+    ));
+}
+
 /// Parameterized test case structure for is_safe_repo validation
 struct RepoTestCase {
     repo: &'static str,

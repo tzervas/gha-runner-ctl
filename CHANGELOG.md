@@ -19,7 +19,8 @@
 - **`--auto`**: detect `owner/repo` from cwd (`gh repo view` / `git remote`)
 - **`scope=user`**: batch poll all personal owned repos; ephemeral re-register
   to whichever has self-hosted demand (one process, not one per repo)
-- **`detect`** command and **`scripts/auto-listen.sh`** (`--batch` / `--org` / default auto)
+- **`detect`** command and **`scripts/auto-listen.sh`** (thin `--full-auto` shim;
+  pass-through args only — not a separate `--batch`/`--org` driver)
 - Distributed release still via `scripts/dist.sh --upload` (local build)
 
 ## 0.1.1

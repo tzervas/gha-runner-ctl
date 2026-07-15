@@ -1785,6 +1785,25 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
         == 0
 }
 
+/// Whether a single HTTP request header line authorizes the wake server.
+///
+/// Header *names* (and the `Bearer` scheme keyword) are matched case-insensitively.
+/// The secret token bytes themselves are **never** lowercased before compare — mixed-case
+/// `GHA_WAKE_TOKEN` values must still authenticate.
+pub fn wake_request_line_authorized(line: &str, token: &str) -> bool {
+    // ASCII-only prefix; byte length equals character length.
+    const BEARER_PREFIX: &str = "authorization: bearer ";
+    let lower = line.to_ascii_lowercase();
+    if lower.starts_with(BEARER_PREFIX) {
+        let rest = &line[BEARER_PREFIX.len()..];
+        return constant_time_eq(rest.trim(), token);
+    }
+    if let Some(rest) = line.strip_prefix("X-Wake-Token:") {
+        return constant_time_eq(rest.trim(), token);
+    }
+    false
+}
+
 fn wake_server(port: u16, snap: CliSnap, token: String) {
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -1802,16 +1821,9 @@ fn wake_server(port: u16, snap: CliSnap, token: String) {
         let mut buf = [0_u8; 2048];
         let n = s.read(&mut buf).unwrap_or(0);
         let req = String::from_utf8_lossy(&buf[..n]);
-        let authed = req.lines().any(|line| {
-            let lower = line.to_ascii_lowercase();
-            if let Some(rest) = lower.strip_prefix("authorization: bearer ") {
-                return constant_time_eq(rest.trim(), token.as_str());
-            }
-            if let Some(rest) = line.strip_prefix("X-Wake-Token:") {
-                return constant_time_eq(rest.trim(), token.as_str());
-            }
-            false
-        });
+        let authed = req
+            .lines()
+            .any(|line| wake_request_line_authorized(line, token.as_str()));
         if !authed && !req.starts_with("GET /health") {
             let body = "unauthorized\n";
             let _ = write!(

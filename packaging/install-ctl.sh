@@ -32,5 +32,8 @@ fi
 echo
 echo "Next:"
 echo "  gha-runner-ctl prepare"
-echo "  # repo:  GHA_SCOPE=repo GHA_REPO=owner/name gha-runner-ctl listen"
-echo "  # org:   GHA_SCOPE=org  GHA_OWNER=my-org   gha-runner-ctl listen"
+echo "  # 1-click: detect cwd repo or fall back to personal user batch"
+echo "  gha-runner-ctl --full-auto"
+echo "  # user batch:  gha-runner-ctl --scope user --user YOUR_LOGIN listen"
+echo "  # repo:        gha-runner-ctl --scope repo --repo owner/name listen"
+echo "  # org:         gha-runner-ctl --scope org  --owner my-org listen"
