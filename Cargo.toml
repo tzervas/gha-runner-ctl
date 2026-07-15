@@ -11,6 +11,10 @@ keywords = ["github-actions", "self-hosted", "podman", "runner"]
 categories = ["command-line-utilities", "development-tools"]
 publish = false
 
+[lib]
+name = "gha_runner_ctl"
+path = "src/lib.rs"
+
 [[bin]]
 name = "gha-runner-ctl"
 path = "src/main.rs"
