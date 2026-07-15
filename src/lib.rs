@@ -1,4 +1,4 @@
-//! One GitHub Actions self-hosted runner controller (Podman) library.
+//! One GitHub Actions self-hosted runner controller (Podman).
 //!
 //! Registration targets:
 //! - **repo** — one repository (optional **--auto** from cwd / `gh repo view`)
@@ -9,9 +9,9 @@
 //! GitHub queues jobs; one runner process handles one job at a time.
 
 use clap::{Parser, Subcommand, ValueEnum};
-use serde::Deserialize;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use serde::{Deserialize, Serialize};
+use std::fs::{self, File, OpenOptions};
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -52,59 +52,79 @@ pub enum Scope {
 )]
 pub struct Cli {
     #[command(subcommand)]
-    pub cmd: Cmd,
+    cmd: Option<Cmd>,
 
     #[arg(long, env = "GHA_SCOPE", value_enum, default_value_t = Scope::Repo, global = true)]
-    pub scope: Scope,
+    scope: Scope,
 
     /// owner/repo when scope=repo (or filled by --auto)
     #[arg(long, env = "GHA_REPO", global = true)]
-    pub repo: Option<String>,
+    repo: Option<String>,
 
     /// Org login when scope=org
     #[arg(long, env = "GHA_OWNER", global = true)]
-    pub owner: Option<String>,
+    owner: Option<String>,
 
     /// User login when scope=user (default: authenticated gh user)
     #[arg(long, env = "GHA_USER", global = true)]
-    pub user: Option<String>,
+    user: Option<String>,
 
     /// Infer owner/repo from the current git checkout / gh context
     #[arg(long, env = "GHA_AUTO", global = true, default_value_t = false)]
-    pub auto: bool,
+    auto: bool,
 
     #[arg(long, env = "GHA_IMAGE", default_value = DEFAULT_IMAGE, global = true)]
-    pub image: String,
+    image: String,
 
     #[arg(long, env = "GHA_CONTAINER", default_value = DEFAULT_CONTAINER, global = true)]
-    pub container: String,
+    container: String,
 
     #[arg(long, env = "GHA_VOLUME", default_value = DEFAULT_VOLUME, global = true)]
-    pub volume: String,
+    volume: String,
 
     #[arg(long, env = "GHA_RUNNER_NAME", default_value = DEFAULT_NAME, global = true)]
-    pub runner_name: String,
+    runner_name: String,
 
     #[arg(long, env = "GHA_LABELS", default_value = DEFAULT_LABELS, global = true)]
-    pub labels: String,
+    labels: String,
 
     #[arg(long, env = "GHA_CPUS", default_value = "5", global = true)]
-    pub cpus: String,
+    cpus: String,
 
     #[arg(long, env = "GHA_MEMORY", default_value = "8g", global = true)]
-    pub memory: String,
+    memory: String,
 
     #[arg(long, env = "GHA_BUILD_DIR", global = true)]
-    pub build_dir: Option<PathBuf>,
+    build_dir: Option<PathBuf>,
 
     #[arg(long, env = "GHA_MODE", value_enum, default_value_t = Mode::Ephemeral, global = true)]
-    pub mode: Mode,
+    mode: Mode,
 
     #[arg(long, env = "GHA_WAKE_TOKEN", global = true)]
-    pub wake_token: Option<String>,
+    wake_token: Option<String>,
+
+    /// Automatically prepare, poll, and register (loose 60s polling, 500s timeout)
+    #[arg(long, env = "GHA_FULL_AUTO", default_value_t = false, global = true)]
+    full_auto: bool,
+
+    /// Target a specific repository: [platform/]owner/name (defaults platform to github.com)
+    #[arg(long, env = "GHA_THIS_REPO_ONLY", global = true)]
+    this_repo_only: Option<String>,
+
+    /// Only target public repositories (default if no visibility filter is specified)
+    #[arg(long, env = "GHA_PUBLIC_ONLY", default_value_t = false, global = true)]
+    public_only: bool,
+
+    /// Only target private repositories
+    #[arg(long, env = "GHA_PRIVATE_ONLY", default_value_t = false, global = true)]
+    private_only: bool,
+
+    /// Target both public and private repositories
+    #[arg(long, env = "GHA_ALL_REPOS", default_value_t = false, global = true)]
+    all_repos: bool,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Subcommand, Clone)]
 pub enum Cmd {
     /// Build image + seed volume snapshot (updates host packages first unless skipped)
     Prepare {
@@ -134,20 +154,69 @@ pub enum Cmd {
     },
 }
 
+/// Checks for raw token patterns in CLI arguments. If found, prints an error message and exits.
+/// This prevents users from leaking secrets in shell history, process listings, or logs.
+pub fn prevent_raw_token_args() {
+    let token_prefixes = ["ghp_", "gho_", "ghu_", "ghs_", "github_pat_"];
+    for arg in std::env::args() {
+        for prefix in token_prefixes {
+            if arg.contains(prefix) {
+                eprintln!("gha-runner-ctl ERROR: Raw GitHub token/PAT pattern detected in command line arguments!");
+                eprintln!("We take an opinionated stance on security: we do NOT allow passing secrets directly via CLI arguments to prevent history or process logs exposure.");
+                eprintln!("Please run without token arguments. We will securely prompt you interactively, retrieve it via Git Credential Manager, or load it from config.");
+                eprintln!("\nTo scrub this command from your shell history:");
+                eprintln!("  - In Bash: history -d $(history | tail -n 2 | head -n 1 | awk '{{print $1}}') (or edit ~/.bash_history)");
+                eprintln!("  - In Zsh:  fc -W && fc -R (or edit ~/.zsh_history)");
+                std::process::exit(127);
+            }
+        }
+    }
+}
+
 pub fn run() -> Result<(), String> {
     let mut cli = Cli::parse();
     resolve_cli(&mut cli)?;
     validate_cli(&cli)?;
-    match &cli.cmd {
+
+    if cli.full_auto {
+        let has_vol = volume_exists(&cli.volume);
+        let has_img = podman(&["image", "exists", &cli.image]).is_ok();
+        if !has_vol || !has_img {
+            eprintln!(
+                "full-auto: missing Podman volume or image. Triggering automated prepare first..."
+            );
+            prepare(&cli, true, false)?;
+        }
+    }
+
+    let cmd = match cli.cmd.as_ref() {
+        Some(c) => c.clone(),
+        None => {
+            if cli.full_auto {
+                eprintln!("full-auto: initiating automated listener/handler...");
+                Cmd::Listen {
+                    interval: 60,
+                    idle_secs: 500,
+                    wake_port: None,
+                }
+            } else {
+                return Err(
+                    "No command specified. Run with --help for options, or use --full-auto.".into(),
+                );
+            }
+        }
+    };
+
+    match cmd {
         Cmd::Prepare {
             with_container,
             skip_host_update,
-        } => prepare(&cli, *with_container, *skip_host_update),
+        } => prepare(&cli, with_container, skip_host_update),
         Cmd::Up => {
             let _lock = InstanceLock::acquire("up")?;
             up(&cli)
         }
-        Cmd::Down { rm } => down(&cli, *rm),
+        Cmd::Down { rm } => down(&cli, rm),
         Cmd::Status => status(&cli),
         Cmd::Detect => {
             print_detect(&cli);
@@ -158,27 +227,94 @@ pub fn run() -> Result<(), String> {
             idle_secs,
             wake_port,
         } => {
-            let interval = (*interval).clamp(MIN_POLL_SECS, MAX_POLL_SECS);
-            let idle_secs = (*idle_secs).clamp(MIN_IDLE_SECS, MAX_IDLE_SECS);
+            let interval = interval.clamp(MIN_POLL_SECS, MAX_POLL_SECS);
+            let idle_secs = idle_secs.clamp(MIN_IDLE_SECS, MAX_IDLE_SECS);
             let _lock = InstanceLock::acquire("listen")?;
-            listen(&cli, interval, idle_secs, *wake_port)
+            listen(&cli, interval, idle_secs, wake_port)
         }
     }
 }
 
 // --- Resolve auto / batch context --------------------------------------------
 
+fn get_user_login_from_token(token: &str) -> Result<String, String> {
+    #[derive(Deserialize)]
+    struct UserResponse {
+        login: String,
+    }
+
+    let resp = http_agent()
+        .get("https://api.github.com/user")
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("Accept", "application/vnd.github+json")
+        .set("X-GitHub-Api-Version", "2022-11-28")
+        .call()
+        .map_err(|e| format!("Failed to get user info from token: {e}"))?;
+
+    if resp.status() != 200 {
+        return Err(format!("GET /user returned HTTP {}", resp.status()));
+    }
+
+    let body: UserResponse = resp
+        .into_json()
+        .map_err(|e| format!("Failed to parse user info: {e}"))?;
+    Ok(body.login)
+}
+
 fn resolve_cli(cli: &mut Cli) -> Result<(), String> {
+    if let Some(ref target) = cli.this_repo_only {
+        let cleaned = target
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .trim_end_matches('/')
+            .to_string();
+        let parts: Vec<&str> = cleaned.split('/').collect();
+        if parts.len() == 3 {
+            cli.scope = Scope::Repo;
+            cli.repo = Some(format!("{}/{}", parts[1], parts[2]));
+        } else if parts.len() == 2 {
+            cli.scope = Scope::Repo;
+            cli.repo = Some(format!("{}/{}", parts[0], parts[1]));
+        } else {
+            return Err(
+                "invalid format for --this-repo-only. Expected [platform/]username/repo_name"
+                    .into(),
+            );
+        }
+    }
+
+    if cli.full_auto {
+        cli.auto = true;
+        if cli.this_repo_only.is_none() && cli.repo.is_none() {
+            if let Ok(detected) = detect_repo_from_cwd() {
+                eprintln!("full-auto: detected repository {detected}");
+                cli.repo = Some(detected);
+                cli.scope = Scope::Repo;
+            } else {
+                eprintln!("full-auto: not in a git checkout. Defaulting to personal user-level batch scope.");
+                cli.scope = Scope::User;
+            }
+        }
+    }
+
     if cli.auto && cli.scope == Scope::Repo && cli.repo.is_none() {
         let detected = detect_repo_from_cwd()?;
         eprintln!("auto: detected repository {detected}");
         cli.repo = Some(detected);
     }
+
     if cli.scope == Scope::User && cli.user.is_none() {
-        let u = gh_login()?;
+        let u = if let Ok(login) = gh_login() {
+            login
+        } else if let Ok(tok) = github_token() {
+            get_user_login_from_token(&tok)?
+        } else {
+            return Err("Could not resolve authenticated user login. Please log in using 'gh auth login' or provide a token.".into());
+        };
         eprintln!("user: authenticated login {u}");
         cli.user = Some(u);
     }
+
     // Convenience: GHA_BATCH=1 implies user scope for current gh user
     if std::env::var("GHA_BATCH").ok().as_deref() == Some("1") && cli.scope == Scope::Repo {
         cli.scope = Scope::User;
@@ -194,7 +330,7 @@ fn resolve_cli(cli: &mut Cli) -> Result<(), String> {
 }
 
 /// Detect owner/repo from cwd: prefer `gh repo view`, else `git remote get-url origin`.
-fn detect_repo_from_cwd() -> Result<String, String> {
+pub fn detect_repo_from_cwd() -> Result<String, String> {
     if let Ok(out) = Command::new("gh")
         .args([
             "repo",
@@ -288,7 +424,7 @@ fn print_detect(cli: &Cli) {
 
 // --- Validation / redaction --------------------------------------------------
 
-fn is_safe_ident(s: &str) -> bool {
+pub fn is_safe_ident(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 128
         && !s.contains("..")
@@ -301,7 +437,7 @@ pub fn is_safe_repo(s: &str) -> bool {
     parts.len() == 2 && parts.iter().all(|p| is_safe_ident(p))
 }
 
-fn is_safe_image(s: &str) -> bool {
+pub fn is_safe_image(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 256
         && !s.contains("..")
@@ -309,7 +445,7 @@ fn is_safe_image(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':'))
 }
 
-fn is_safe_labels(s: &str) -> bool {
+pub fn is_safe_labels(s: &str) -> bool {
     let parts: Vec<&str> = s
         .split(',')
         .map(str::trim)
@@ -320,14 +456,14 @@ fn is_safe_labels(s: &str) -> bool {
         && parts.iter().all(|p| is_safe_ident(p) && p.len() <= 64)
 }
 
-fn is_safe_cpus(s: &str) -> bool {
+pub fn is_safe_cpus(s: &str) -> bool {
     if s.is_empty() || s.len() > 8 {
         return false;
     }
     s.parse::<f64>().is_ok_and(|n| n > 0.0 && n <= 64.0)
 }
 
-fn is_safe_memory(s: &str) -> bool {
+pub fn is_safe_memory(s: &str) -> bool {
     let s = s.trim();
     if s.is_empty() || s.len() > 16 {
         return false;
@@ -357,23 +493,15 @@ pub fn redact(s: &str) -> String {
         "Bearer ",
         "RUNNER_TOKEN=",
     ] {
-        let mut start_idx = 0;
-        while let Some(relative_i) = out[start_idx..].find(key) {
-            let i = start_idx + relative_i;
+        if let Some(i) = out.find(key) {
             let rest = &out[i + key.len()..];
-            let take_bytes = rest
-                .char_indices()
-                .take_while(|(_, c)| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
-                .map(|(idx, c)| idx + c.len_utf8())
-                .last()
-                .unwrap_or(0)
+            let take = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+                .count()
                 .min(200);
-            let end = i + key.len() + take_bytes;
+            let end = i + key.len() + take;
             out.replace_range(i..end, &format!("{key}***REDACTED***"));
-            start_idx = i + key.len() + "***REDACTED***".len();
-            if start_idx >= out.len() {
-                break;
-            }
         }
     }
     if out.len() > 400 {
@@ -485,30 +613,25 @@ fn registration_api(cli: &Cli) -> String {
 
 // --- Single-instance lock ----------------------------------------------------
 
-pub struct InstanceLock {
+struct InstanceLock {
     path: PathBuf,
 }
 
 impl InstanceLock {
-    pub fn acquire(kind: &str) -> Result<Self, String> {
+    fn acquire(kind: &str) -> Result<Self, String> {
         let dir = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
-        let user_suffix = std::env::var("USER")
-            .or_else(|_| std::env::var("USERNAME"))
-            .unwrap_or_else(|_| "shared".to_string());
-        let path = dir.join(format!("gha-runner-ctl-{user_suffix}-{kind}.lock"));
+        let path = dir.join(format!("gha-runner-ctl-{kind}.lock"));
         for attempt in 0..2 {
-            let mut options = OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            match options.open(&path) {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
                 Ok(mut f) => {
                     let _ = writeln!(f, "{}", std::process::id());
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+                    }
                     return Ok(Self { path });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -552,7 +675,206 @@ impl Drop for InstanceLock {
 
 // --- Auth / HTTP -------------------------------------------------------------
 
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct Config {
+    github_token: Option<String>,
+}
+
+fn load_config() -> Option<Config> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let path = home
+        .join(".config")
+        .join("gha-runner-ctl")
+        .join("config.json");
+    if path.is_file() {
+        let content = fs::read_to_string(&path).ok()?;
+        serde_json::from_str(&content).ok()
+    } else {
+        None
+    }
+}
+
+fn save_config(config: &Config) -> Result<(), String> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or("No HOME directory found")?;
+    let dir = home.join(".config").join("gha-runner-ctl");
+    fs::create_dir_all(&dir).map_err(|e| format!("Failed to create config dir: {e}"))?;
+    let path = dir.join("config.json");
+    let content = serde_json::to_string_pretty(config)
+        .map_err(|e| format!("Failed to serialize config: {e}"))?;
+    fs::write(&path, content).map_err(|e| format!("Failed to write config file: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+fn get_token_from_git_credential() -> Option<String> {
+    let mut child = Command::new("git")
+        .args(["credential", "fill"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+
+    {
+        let stdin = child.stdin.as_mut()?;
+        writeln!(stdin, "protocol=https\nhost=github.com\n").ok()?;
+    }
+
+    let out = child.wait_with_output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+
+    let stdout_str = String::from_utf8_lossy(&out.stdout);
+    for line in stdout_str.lines() {
+        if let Some(token) = line.trim().strip_prefix("password=") {
+            let t = token.trim().to_string();
+            if !t.is_empty() {
+                return Some(t);
+            }
+        }
+    }
+    None
+}
+
+fn is_gcm_installed() -> bool {
+    if Command::new("git-credential-manager")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+    {
+        return true;
+    }
+    if Command::new("git-credential-manager-core")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+    {
+        return true;
+    }
+    if let Ok(out) = Command::new("git")
+        .args(["config", "--get", "credential.helper"])
+        .output()
+    {
+        let helper = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if helper.contains("manager") {
+            return true;
+        }
+    }
+    false
+}
+
+fn install_gcm() -> Result<(), String> {
+    eprintln!(
+        "prepare: Git Credential Manager (GCM) is missing. Attempting automatic installation..."
+    );
+    if !Path::new("/usr/bin/dpkg").exists() {
+        return Err("Automatic GCM installation is currently only supported on Debian/Ubuntu-based systems.\nTo install GCM on your system, please refer to: https://github.com/git-ecosystem/git-credential-manager/blob/main/docs/install.md".into());
+    }
+
+    let ver = "2.5.1";
+    let url = format!("https://github.com/git-ecosystem/git-credential-manager/releases/download/v{ver}/gcm-linux_amd64.{ver}.deb");
+    eprintln!("Downloading GCM deb from: {url}");
+
+    let dest_path = std::env::temp_dir().join(format!("gcm-{ver}.deb"));
+
+    let resp = http_agent()
+        .get(&url)
+        .call()
+        .map_err(|e| format!("Failed to download GCM deb package: {e}"))?;
+
+    if resp.status() != 200 {
+        return Err(format!(
+            "Failed to download GCM: HTTP status {}",
+            resp.status()
+        ));
+    }
+
+    let mut file =
+        File::create(&dest_path).map_err(|e| format!("Failed to create temp GCM deb file: {e}"))?;
+    let mut reader = resp.into_reader();
+    std::io::copy(&mut reader, &mut file).map_err(|e| format!("Failed to save GCM deb: {e}"))?;
+
+    eprintln!("Installing GCM deb package (requires sudo privileges)...");
+    let status = Command::new("sudo")
+        .args(["dpkg", "-i", dest_path.to_str().unwrap_or("")])
+        .status()
+        .map_err(|e| format!("dpkg execution failed: {e}"))?;
+
+    if !status.success() {
+        return Err("dpkg failed to install GCM package".into());
+    }
+
+    eprintln!("Configuring GCM helper globally...");
+    let configure_status = Command::new("git-credential-manager")
+        .arg("configure")
+        .status()
+        .map_err(|e| format!("Failed to configure GCM: {e}"))?;
+
+    if !configure_status.success() {
+        eprintln!(
+            "Warning: git-credential-manager configure didn't run cleanly. Trying git config..."
+        );
+        let _ = Command::new("git")
+            .args(["config", "--global", "credential.helper", "manager"])
+            .status();
+    }
+
+    eprintln!("Git Credential Manager successfully installed and configured!");
+    Ok(())
+}
+
+fn store_token_in_git_credential(token: &str) -> Result<(), String> {
+    let mut child = Command::new("git")
+        .args(["credential", "approve"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("git credential approve failed to start: {e}"))?;
+
+    {
+        let stdin = child.stdin.as_mut().ok_or("No stdin for git credential")?;
+        writeln!(
+            stdin,
+            "protocol=https\nhost=github.com\nusername=git\npassword={token}\n"
+        )
+        .map_err(|e| format!("Failed to write to git credential: {e}"))?;
+    }
+
+    let status = child
+        .wait()
+        .map_err(|e| format!("Failed to wait for git credential: {e}"))?;
+    if !status.success() {
+        return Err("git credential approve failed".into());
+    }
+    Ok(())
+}
+
+fn prompt_token_interactively() -> Option<String> {
+    eprint!("Enter your GitHub PAT (input is hidden): ");
+    std::io::stderr().flush().ok()?;
+    let pass = rpassword::read_password().ok()?;
+    let trimmed = pass.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
 fn github_token() -> Result<String, String> {
+    // 1. Try env variables
     for key in ["GH_TOKEN", "GITHUB_TOKEN"] {
         if let Ok(t) = std::env::var(key) {
             if !t.is_empty() {
@@ -560,20 +882,81 @@ fn github_token() -> Result<String, String> {
             }
         }
     }
-    let out = Command::new("gh")
+
+    // 2. Try GCM or git credential helper
+    if let Some(t) = get_token_from_git_credential() {
+        return Ok(t);
+    }
+
+    // 3. Try GH CLI
+    if let Ok(out) = Command::new("gh")
         .args(["auth", "token"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
-        .map_err(|e| format!("gh auth token failed: {e}"))?;
-    if !out.status.success() {
-        return Err("authenticate with `gh auth login` or set GH_TOKEN".into());
+    {
+        if out.status.success() {
+            let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !t.is_empty() {
+                return Ok(t);
+            }
+        }
     }
-    let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if t.is_empty() {
-        return Err("empty token from gh auth token".into());
+
+    // 4. Try Config file
+    if let Some(cfg) = load_config() {
+        if let Some(t) = cfg.github_token {
+            if !t.is_empty() {
+                return Ok(t);
+            }
+        }
     }
-    Ok(t)
+
+    // Check GCM installation status and offer installation if interactive
+    let is_atty = std::io::stdin().is_terminal();
+    if is_atty && !is_gcm_installed() {
+        eprint!("Git Credential Manager (GCM) is missing. Would you like to install it? [y/N]: ");
+        std::io::stderr().flush().ok();
+        let mut response = String::new();
+        if std::io::stdin().read_line(&mut response).is_ok() {
+            let resp_trimmed = response.trim().to_lowercase();
+            if resp_trimmed == "y" || resp_trimmed == "yes" {
+                if let Err(e) = install_gcm() {
+                    eprintln!("Failed to install GCM: {e}");
+                }
+            }
+        }
+    }
+
+    // 5. Interactive fallback
+    if is_atty {
+        if let Some(t) = prompt_token_interactively() {
+            eprint!("Would you like to securely save this token to config and GCM? [y/N]: ");
+            std::io::stderr().flush().ok();
+            let mut response = String::new();
+            if std::io::stdin().read_line(&mut response).is_ok() {
+                let resp_trimmed = response.trim().to_lowercase();
+                if resp_trimmed == "y" || resp_trimmed == "yes" {
+                    // Save to config
+                    let cfg = Config {
+                        github_token: Some(t.clone()),
+                    };
+                    if let Err(e) = save_config(&cfg) {
+                        eprintln!("Warning: failed to save config: {e}");
+                    }
+                    // Save to GCM
+                    if is_gcm_installed() {
+                        if let Err(e) = store_token_in_git_credential(&t) {
+                            eprintln!("Warning: failed to store token in GCM: {e}");
+                        }
+                    }
+                }
+            }
+            return Ok(t);
+        }
+    }
+
+    Err("No GitHub token or PAT found. Please authenticate via 'gh auth login', set GH_TOKEN environment variable, install Git Credential Manager, or enter it interactively.".into())
 }
 
 #[derive(Deserialize)]
@@ -590,9 +973,9 @@ fn http_agent() -> ureq::Agent {
         .build()
 }
 
-fn registration_token(cli: &Cli, api_token: &str, agent: &ureq::Agent) -> Result<String, String> {
+fn registration_token(cli: &Cli, api_token: &str) -> Result<String, String> {
     let url = registration_api(cli);
-    let resp = agent
+    let resp = http_agent()
         .post(&url)
         .set("Authorization", &format!("Bearer {api_token}"))
         .set("Accept", "application/vnd.github+json")
@@ -661,34 +1044,18 @@ fn resolve_build_dir(cli: &Cli) -> Result<PathBuf, String> {
         }
         return Ok(p);
     }
-
-    let mut candidates = Vec::new();
-
-    if let Ok(here) = PathBuf::from(env!("CARGO_MANIFEST_DIR")).canonicalize() {
-        candidates.push(here.join("packaging"));
+    let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let candidate = here
+        .join("packaging")
+        .canonicalize()
+        .map_err(|e| format!("resolve packaging/: {e}"))?;
+    if !candidate.join("Containerfile").is_file() {
+        return Err(format!(
+            "Containerfile not found under {} — pass --build-dir",
+            candidate.display()
+        ));
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            candidates.push(parent.join("packaging"));
-            if let Some(grandparent) = parent.parent() {
-                candidates.push(grandparent.join("packaging"));
-            }
-        }
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("packaging"));
-        candidates.push(cwd);
-    }
-
-    for candidate in candidates {
-        if let Ok(p) = candidate.canonicalize() {
-            if p.join("Containerfile").is_file() {
-                return Ok(p);
-            }
-        }
-    }
-
-    Err("Containerfile not found — pass --build-dir".into())
+    Ok(candidate)
 }
 
 // --- Prepare / up / down -----------------------------------------------------
@@ -824,14 +1191,12 @@ fn private_env_path() -> PathBuf {
 
 fn write_env_file(path: &Path, reg_token: &str, cli: &Cli) -> Result<(), String> {
     let ephemeral = matches!(cli.mode, Mode::Ephemeral);
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    let mut f = File::create(path).map_err(|e| format!("env file: {e}"))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
     }
-    let mut f = options.open(path).map_err(|e| format!("env file: {e}"))?;
     writeln!(
         f,
         "REPO_URL={}\nRUNNER_NAME={}\nRUNNER_LABELS={}\nRUNNER_EPHEMERAL={}\nRUNNER_RETAIN={}\nRUNNER_TOKEN={}",
@@ -852,7 +1217,6 @@ fn shred_env_file(path: &Path) {
         if let Ok(mut f) = OpenOptions::new().write(true).open(path) {
             let _ = f.write_all(&vec![0_u8; len.max(64)]);
             let _ = f.flush();
-            let _ = f.sync_all();
         }
     }
     let _ = fs::remove_file(path);
@@ -903,8 +1267,7 @@ fn up(cli: &Cli) -> Result<(), String> {
     }
 
     let api = github_token()?;
-    let agent = http_agent();
-    let reg = registration_token(cli, &api, &agent)?;
+    let reg = registration_token(cli, &api)?;
     let env_path = private_env_path();
     write_env_file(&env_path, &reg, cli)?;
     drop(reg);
@@ -1060,28 +1423,48 @@ struct Job {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct NamedRepo {
-    pub full_name: String,
-    pub fork: Option<bool>,
-    pub archived: Option<bool>,
+struct NamedRepo {
+    full_name: String,
+    fork: Option<bool>,
+    archived: Option<bool>,
+    private: Option<bool>,
 }
 
 /// Returns (need_runner, optional active_repo_for_registration).
-fn demand(cli: &Cli, api: &str, agent: &ureq::Agent) -> Result<(bool, Option<String>), String> {
+fn demand(cli: &Cli, api: &str) -> Result<(bool, Option<String>), String> {
+    let mut filter_private = false;
+    let mut filter_public = false;
+
+    if cli.private_only {
+        filter_private = true;
+    } else if cli.all_repos {
+        // Allow both
+    } else {
+        // Default to public only (includes when public_only is explicitly set)
+        filter_public = true;
+    }
+
     match cli.scope {
         Scope::Repo => {
             let repo = cli.repo.as_ref().expect("validated").clone();
-            Ok((repo_needs_runner(&repo, api, agent)?, Some(repo)))
+            Ok((repo_needs_runner(&repo, api)?, Some(repo)))
         }
         Scope::Org => {
             let owner = cli.owner.as_ref().expect("validated");
             let url = format!("https://api.github.com/orgs/{owner}/repos?per_page=100&type=all");
-            let repos = list_repos_paginated(&url, api, agent)?;
+            let repos = list_repos_paginated(&url, api)?;
             for r in repos {
                 if r.archived.unwrap_or(false) || !is_safe_repo(&r.full_name) {
                     continue;
                 }
-                if repo_needs_runner(&r.full_name, api, agent)? {
+                let is_private = r.private.unwrap_or(false);
+                if filter_private && !is_private {
+                    continue;
+                }
+                if filter_public && is_private {
+                    continue;
+                }
+                if repo_needs_runner(&r.full_name, api)? {
                     // Org runner registration is org-level; active repo is informational.
                     return Ok((true, Some(r.full_name)));
                 }
@@ -1094,7 +1477,7 @@ fn demand(cli: &Cli, api: &str, agent: &ureq::Agent) -> Result<(bool, Option<Str
             let url = format!(
                 "https://api.github.com/users/{user}/repos?type=owner&per_page=100&sort=updated"
             );
-            let repos = list_repos_paginated(&url, api, agent)?;
+            let repos = list_repos_paginated(&url, api)?;
             for r in repos {
                 if r.archived.unwrap_or(false) || r.fork.unwrap_or(false) {
                     continue;
@@ -1106,7 +1489,14 @@ fn demand(cli: &Cli, api: &str, agent: &ureq::Agent) -> Result<(bool, Option<Str
                 if !r.full_name.starts_with(&format!("{user}/")) {
                     continue;
                 }
-                if repo_needs_runner(&r.full_name, api, agent)? {
+                let is_private = r.private.unwrap_or(false);
+                if filter_private && !is_private {
+                    continue;
+                }
+                if filter_public && is_private {
+                    continue;
+                }
+                if repo_needs_runner(&r.full_name, api)? {
                     return Ok((true, Some(r.full_name)));
                 }
             }
@@ -1115,11 +1505,7 @@ fn demand(cli: &Cli, api: &str, agent: &ureq::Agent) -> Result<(bool, Option<Str
     }
 }
 
-fn list_repos_paginated(
-    first_url: &str,
-    api: &str,
-    agent: &ureq::Agent,
-) -> Result<Vec<NamedRepo>, String> {
+fn list_repos_paginated(first_url: &str, api: &str) -> Result<Vec<NamedRepo>, String> {
     let mut out = Vec::new();
     let mut url = Some(first_url.to_string());
     let mut pages = 0;
@@ -1128,7 +1514,7 @@ fn list_repos_paginated(
         if pages > 20 {
             break; // cap: 2000 repos
         }
-        let resp = agent
+        let resp = http_agent()
             .get(&u)
             .set("Authorization", &format!("Bearer {api}"))
             .set("Accept", "application/vnd.github+json")
@@ -1155,13 +1541,13 @@ fn parse_next_link(link: &str) -> Option<String> {
     None
 }
 
-fn repo_needs_runner(repo: &str, api: &str, agent: &ureq::Agent) -> Result<bool, String> {
+fn repo_needs_runner(repo: &str, api: &str) -> Result<bool, String> {
     for status in ["queued", "in_progress"] {
         let url =
             format!("https://api.github.com/repos/{repo}/actions/runs?status={status}&per_page=10");
-        let runs = fetch_runs(&url, api, agent)?;
+        let runs = fetch_runs(&url, api)?;
         for run in runs {
-            if job_wants_self_hosted(repo, run.id, api, agent)? {
+            if job_wants_self_hosted(repo, run.id, api)? {
                 return Ok(true);
             }
         }
@@ -1169,8 +1555,8 @@ fn repo_needs_runner(repo: &str, api: &str, agent: &ureq::Agent) -> Result<bool,
     Ok(false)
 }
 
-fn fetch_runs(url: &str, api: &str, agent: &ureq::Agent) -> Result<Vec<WorkflowRun>, String> {
-    let resp = agent
+fn fetch_runs(url: &str, api: &str) -> Result<Vec<WorkflowRun>, String> {
+    let resp = http_agent()
         .get(url)
         .set("Authorization", &format!("Bearer {api}"))
         .set("Accept", "application/vnd.github+json")
@@ -1181,14 +1567,9 @@ fn fetch_runs(url: &str, api: &str, agent: &ureq::Agent) -> Result<Vec<WorkflowR
     Ok(body.workflow_runs)
 }
 
-fn job_wants_self_hosted(
-    repo: &str,
-    run_id: u64,
-    api: &str,
-    agent: &ureq::Agent,
-) -> Result<bool, String> {
+fn job_wants_self_hosted(repo: &str, run_id: u64, api: &str) -> Result<bool, String> {
     let url = format!("https://api.github.com/repos/{repo}/actions/runs/{run_id}/jobs");
-    let resp = agent
+    let resp = http_agent()
         .get(&url)
         .set("Authorization", &format!("Bearer {api}"))
         .set("Accept", "application/vnd.github+json")
@@ -1232,7 +1613,6 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
 
     let mut idle_since: Option<Instant> = None;
     let mut cli = cli.clone_for_listen();
-    let agent = http_agent();
 
     loop {
         let api = match github_token() {
@@ -1244,7 +1624,7 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
             }
         };
 
-        let (need, target_repo) = match demand(&cli, &api, &agent) {
+        let (need, target_repo) = match demand(&cli, &api) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("listen: poll: {}", redact(&e));
@@ -1298,7 +1678,7 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
 impl Cli {
     fn clone_for_listen(&self) -> Self {
         Self {
-            cmd: Cmd::Status,
+            cmd: Some(Cmd::Status),
             scope: self.scope.clone(),
             repo: self.repo.clone(),
             owner: self.owner.clone(),
@@ -1314,25 +1694,35 @@ impl Cli {
             build_dir: self.build_dir.clone(),
             mode: self.mode.clone(),
             wake_token: self.wake_token.clone(),
+            full_auto: self.full_auto,
+            this_repo_only: self.this_repo_only.clone(),
+            public_only: self.public_only,
+            private_only: self.private_only,
+            all_repos: self.all_repos,
         }
     }
 }
 
-pub struct CliSnap {
-    pub scope: Scope,
-    pub repo: Option<String>,
-    pub owner: Option<String>,
-    pub user: Option<String>,
-    pub auto: bool,
-    pub image: String,
-    pub container: String,
-    pub volume: String,
-    pub runner_name: String,
-    pub labels: String,
-    pub cpus: String,
-    pub memory: String,
-    pub mode: Mode,
-    pub wake_token: Option<String>,
+struct CliSnap {
+    scope: Scope,
+    repo: Option<String>,
+    owner: Option<String>,
+    user: Option<String>,
+    auto: bool,
+    image: String,
+    container: String,
+    volume: String,
+    runner_name: String,
+    labels: String,
+    cpus: String,
+    memory: String,
+    mode: Mode,
+    wake_token: Option<String>,
+    full_auto: bool,
+    this_repo_only: Option<String>,
+    public_only: bool,
+    private_only: bool,
+    all_repos: bool,
 }
 
 fn cli_snapshot(cli: &Cli) -> CliSnap {
@@ -1351,12 +1741,17 @@ fn cli_snapshot(cli: &Cli) -> CliSnap {
         memory: cli.memory.clone(),
         mode: cli.mode.clone(),
         wake_token: cli.wake_token.clone(),
+        full_auto: cli.full_auto,
+        this_repo_only: cli.this_repo_only.clone(),
+        public_only: cli.public_only,
+        private_only: cli.private_only,
+        all_repos: cli.all_repos,
     }
 }
 
 fn snap_to_cli(s: &CliSnap) -> Cli {
     Cli {
-        cmd: Cmd::Status,
+        cmd: Some(Cmd::Status),
         scope: s.scope.clone(),
         repo: s.repo.clone(),
         owner: s.owner.clone(),
@@ -1372,6 +1767,11 @@ fn snap_to_cli(s: &CliSnap) -> Cli {
         build_dir: None,
         mode: s.mode.clone(),
         wake_token: s.wake_token.clone(),
+        full_auto: s.full_auto,
+        this_repo_only: s.this_repo_only.clone(),
+        public_only: s.public_only,
+        private_only: s.private_only,
+        all_repos: s.all_repos,
     }
 }
 
@@ -1383,6 +1783,25 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
         .zip(b.bytes())
         .fold(0_u8, |acc, (x, y)| acc | (x ^ y))
         == 0
+}
+
+/// Whether a single HTTP request header line authorizes the wake server.
+///
+/// Header *names* (and the `Bearer` scheme keyword) are matched case-insensitively.
+/// The secret token bytes themselves are **never** lowercased before compare — mixed-case
+/// `GHA_WAKE_TOKEN` values must still authenticate.
+pub fn wake_request_line_authorized(line: &str, token: &str) -> bool {
+    // ASCII-only prefix; byte length equals character length.
+    const BEARER_PREFIX: &str = "authorization: bearer ";
+    let lower = line.to_ascii_lowercase();
+    if lower.starts_with(BEARER_PREFIX) {
+        let rest = &line[BEARER_PREFIX.len()..];
+        return constant_time_eq(rest.trim(), token);
+    }
+    if let Some(rest) = line.strip_prefix("X-Wake-Token:") {
+        return constant_time_eq(rest.trim(), token);
+    }
+    false
 }
 
 fn wake_server(port: u16, snap: CliSnap, token: String) {
@@ -1399,21 +1818,12 @@ fn wake_server(port: u16, snap: CliSnap, token: String) {
     };
     for stream in listener.incoming().flatten() {
         let mut s = stream;
-        let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
-        let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
         let mut buf = [0_u8; 2048];
         let n = s.read(&mut buf).unwrap_or(0);
         let req = String::from_utf8_lossy(&buf[..n]);
-        let authed = req.lines().any(|line| {
-            let lower = line.to_ascii_lowercase();
-            if let Some(rest) = lower.strip_prefix("authorization: bearer ") {
-                return constant_time_eq(rest.trim(), token.as_str());
-            }
-            if let Some(rest) = lower.strip_prefix("x-wake-token:") {
-                return constant_time_eq(rest.trim(), token.as_str());
-            }
-            false
-        });
+        let authed = req
+            .lines()
+            .any(|line| wake_request_line_authorized(line, token.as_str()));
         if !authed && !req.starts_with("GET /health") {
             let body = "unauthorized\n";
             let _ = write!(

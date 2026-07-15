@@ -10,7 +10,7 @@
 | Privilege escalation in container | `--security-opt no-new-privileges`, no docker.sock mount |
 | Surprise image pulls on `up` | `--pull=never` after `prepare` |
 | Unauthenticated wake endpoint | Loopback only; **requires** `GHA_WAKE_TOKEN` (≥16 chars) |
-| Twin controllers racing | Exclusive flock on `listen` / `up` |
+| Twin controllers racing | Exclusive **PID/instance lock file** on `listen` / `up` (`create_new` + live-PID check; not `flock(2)`) |
 | Public fork abuse of self-hosted | Prefer private repos; documented warning on `up` |
 | Stale registration after ephemeral job | Wipe `.runner` / credentials on `down` in ephemeral mode |
 
