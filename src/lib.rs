@@ -22,7 +22,7 @@ const DEFAULT_CONTAINER: &str = "gha-runner-ctl";
 const DEFAULT_VOLUME: &str = "gha-runner-ctl-data";
 const DEFAULT_LABELS: &str = "self-hosted,linux,x64,podman";
 const DEFAULT_NAME: &str = "shared-podman-1";
-const UA: &str = "gha-runner-ctl/0.2.3";
+const UA: &str = "gha-runner-ctl/0.2.4";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 const MIN_POLL_SECS: u64 = 5;
 const MAX_POLL_SECS: u64 = 3600;
@@ -98,6 +98,22 @@ pub struct Cli {
     /// Pair with a `gpu` runner label so only GPU jobs schedule here.
     #[arg(long, env = "GHA_GPU", default_value_t = false, global = true)]
     gpu: bool,
+
+    /// Soft GPU share id for dual workers on one consumer GPU (`a` or `b`).
+    /// Sets env markers for jobs; both may time-share the same device (no MIG on GeForce).
+    /// Tear-down on idle returns the GPU (container stop frees device processes).
+    #[arg(long, env = "GHA_GPU_SLICE", global = true)]
+    gpu_slice: Option<String>,
+
+    /// Only wake for jobs whose labels include **all** of these (comma-separated).
+    /// Example GPU listener: `--demand-require-labels gpu`
+    #[arg(long, env = "GHA_DEMAND_REQUIRE_LABELS", global = true)]
+    demand_require_labels: Option<String>,
+
+    /// Skip jobs that include **any** of these labels (comma-separated).
+    /// Example CPU listener: `--demand-exclude-labels gpu`
+    #[arg(long, env = "GHA_DEMAND_EXCLUDE_LABELS", global = true)]
+    demand_exclude_labels: Option<String>,
 
     #[arg(long, env = "GHA_BUILD_DIR", global = true)]
     build_dir: Option<PathBuf>,
@@ -571,6 +587,15 @@ fn validate_cli(cli: &Cli) -> Result<(), String> {
     }
     if !is_safe_memory(&cli.memory) {
         return Err("invalid --memory".into());
+    }
+    if let Some(s) = cli.gpu_slice.as_ref() {
+        let s = s.trim().to_ascii_lowercase();
+        if s != "a" && s != "b" {
+            return Err("invalid --gpu-slice (use a or b)".into());
+        }
+        if !cli.gpu {
+            return Err("--gpu-slice requires --gpu".into());
+        }
     }
     if let Some(tok) = &cli.wake_token {
         if tok.len() < 16 {
@@ -1337,6 +1362,9 @@ fn up(cli: &Cli) -> Result<(), String> {
         vol.as_str(),
     ];
     // WSL2 GPU: nvidia toolkit + /dev/dxg + host WSL lib mount (verified on this host).
+    // Soft dual-slice: both workers may see the full device (GeForce has no MIG); jobs
+    // cooperate via labels gpu-slice-a|b. Tear-down on idle frees device processes.
+    let mut gpu_env_owned: Vec<String> = Vec::new();
     if cli.gpu {
         args.extend_from_slice(&[
             "--gpus",
@@ -1345,9 +1373,25 @@ fn up(cli: &Cli) -> Result<(), String> {
             "/dev/dxg",
             "-e",
             "LD_LIBRARY_PATH=/usr/lib/wsl/lib",
+            "-e",
+            "NVIDIA_VISIBLE_DEVICES=all",
+            "-e",
+            "CUDA_VISIBLE_DEVICES=0",
             "-v",
             "/usr/lib/wsl:/usr/lib/wsl:ro",
+            "-e",
+            "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=50",
         ]);
+        if let Some(s) = cli.gpu_slice.as_deref() {
+            let s = s.trim().to_ascii_lowercase();
+            if s == "a" || s == "b" {
+                gpu_env_owned.push(format!("GHA_GPU_SLICE={s}"));
+            }
+        }
+    }
+    for e in &gpu_env_owned {
+        args.push("-e");
+        args.push(e.as_str());
     }
     args.push(cli.image.as_str());
     let result = podman(&args);
@@ -1357,7 +1401,10 @@ fn up(cli: &Cli) -> Result<(), String> {
     if let Some(repo) = cli.repo.as_ref() {
         set_active_target(cli, repo);
     }
-    eprintln!("up: container {}", cli.container);
+    eprintln!(
+        "up: container {} gpu={} slice={:?}",
+        cli.container, cli.gpu, cli.gpu_slice
+    );
     Ok(())
 }
 
@@ -1370,6 +1417,14 @@ fn down(cli: &Cli, rm: bool) -> Result<(), String> {
         }
     } else {
         eprintln!("down: no container {}", cli.container);
+    }
+    // When this was a GPU worker and no other GPU runner containers remain, note free.
+    if cli.gpu {
+        let siblings = ["gha-runner-gpu", "gha-runner-gpu-a", "gha-runner-gpu-b"];
+        let any_gpu_up = siblings.iter().any(|n| container_running(n));
+        if !any_gpu_up {
+            eprintln!("down: no GPU runner containers running — GPU returned to host (idle)");
+        }
     }
     let ephemeral = matches!(cli.mode, Mode::Ephemeral) || matches!(cli.scope, Scope::User);
     if ephemeral {
@@ -1477,7 +1532,7 @@ fn demand(cli: &Cli, api: &str) -> Result<(bool, Option<String>), String> {
     match cli.scope {
         Scope::Repo => {
             let repo = cli.repo.as_ref().expect("validated").clone();
-            Ok((repo_needs_runner(&repo, api)?, Some(repo)))
+            Ok((repo_needs_runner(cli, &repo, api)?, Some(repo)))
         }
         Scope::Org => {
             let owner = cli.owner.as_ref().expect("validated");
@@ -1494,7 +1549,7 @@ fn demand(cli: &Cli, api: &str) -> Result<(bool, Option<String>), String> {
                 if filter_public && is_private {
                     continue;
                 }
-                if repo_needs_runner(&r.full_name, api)? {
+                if repo_needs_runner(cli, &r.full_name, api)? {
                     // Org runner registration is org-level; active repo is informational.
                     return Ok((true, Some(r.full_name)));
                 }
@@ -1526,7 +1581,7 @@ fn demand(cli: &Cli, api: &str) -> Result<(bool, Option<String>), String> {
                 if filter_public && is_private {
                     continue;
                 }
-                if repo_needs_runner(&r.full_name, api)? {
+                if repo_needs_runner(cli, &r.full_name, api)? {
                     return Ok((true, Some(r.full_name)));
                 }
             }
@@ -1571,18 +1626,59 @@ fn parse_next_link(link: &str) -> Option<String> {
     None
 }
 
-fn repo_needs_runner(repo: &str, api: &str) -> Result<bool, String> {
+fn repo_needs_runner(cli: &Cli, repo: &str, api: &str) -> Result<bool, String> {
     for status in ["queued", "in_progress"] {
         let url =
             format!("https://api.github.com/repos/{repo}/actions/runs?status={status}&per_page=10");
         let runs = fetch_runs(&url, api)?;
         for run in runs {
-            if job_wants_self_hosted(repo, run.id, api)? {
+            if job_matches_listener(cli, repo, run.id, api)? {
                 return Ok(true);
             }
         }
     }
     Ok(false)
+}
+
+fn parse_label_csv(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(|x| x.trim().to_ascii_lowercase())
+        .filter(|x| !x.is_empty())
+        .collect()
+}
+
+/// Whether an incomplete job's labels should wake this listener.
+fn labels_match_demand(cli: &Cli, job_labels: &[String]) -> bool {
+    let job: Vec<String> = job_labels
+        .iter()
+        .map(|l| l.trim().to_ascii_lowercase())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if job.is_empty() {
+        return false;
+    }
+    // Baseline: self-hosted or podman (or gpu) so we never wake for pure ubuntu-latest.
+    let baseline = job
+        .iter()
+        .any(|l| l == "self-hosted" || l == "podman" || l == "gpu" || l.starts_with("gpu-slice"));
+    if !baseline {
+        return false;
+    }
+    if let Some(req) = cli.demand_require_labels.as_ref() {
+        for r in parse_label_csv(req) {
+            if !job.iter().any(|l| l == &r) {
+                return false;
+            }
+        }
+    }
+    if let Some(ex) = cli.demand_exclude_labels.as_ref() {
+        for e in parse_label_csv(ex) {
+            if job.iter().any(|l| l == &e) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn fetch_runs(url: &str, api: &str) -> Result<Vec<WorkflowRun>, String> {
@@ -1597,7 +1693,7 @@ fn fetch_runs(url: &str, api: &str) -> Result<Vec<WorkflowRun>, String> {
     Ok(body.workflow_runs)
 }
 
-fn job_wants_self_hosted(repo: &str, run_id: u64, api: &str) -> Result<bool, String> {
+fn job_matches_listener(cli: &Cli, repo: &str, run_id: u64, api: &str) -> Result<bool, String> {
     let url = format!("https://api.github.com/repos/{repo}/actions/runs/{run_id}/jobs");
     let resp = http_agent()
         .get(&url)
@@ -1611,12 +1707,16 @@ fn job_wants_self_hosted(repo: &str, run_id: u64, api: &str) -> Result<bool, Str
         if j.status == "completed" {
             continue;
         }
-        let labels = j.labels.join(",").to_ascii_lowercase();
-        if labels.contains("self-hosted") || labels.contains("podman") {
+        if labels_match_demand(cli, &j.labels) {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+/// True if active registration still has incomplete matching jobs (sticky; do not recycle).
+fn active_repo_still_busy(cli: &Cli, repo: &str, api: &str) -> Result<bool, String> {
+    repo_needs_runner(cli, repo, api)
 }
 
 fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> Result<(), String> {
@@ -1665,14 +1765,35 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
         drop(api);
 
         // User batch: pin registration target to the repo that needs work.
+        // Never recycle while the active repo still has matching in-flight jobs.
         if matches!(cli.scope, Scope::User) {
             if let Some(ref r) = target_repo {
                 let active = get_active_target(&cli);
-                if active.as_deref() != Some(r.as_str()) && container_running(&cli.container) {
-                    eprintln!("listen: demand moved {active:?} → {r}; recycling runner");
-                    let _ = down(&cli, true);
+                if active.as_deref() != Some(r.as_str()) {
+                    let busy = active
+                        .as_ref()
+                        .map(|a| {
+                            github_token()
+                                .ok()
+                                .and_then(|tok| active_repo_still_busy(&cli, a, &tok).ok())
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if container_running(&cli.container) && busy {
+                        eprintln!("listen: sticky on {active:?} (still busy); defer move to {r}");
+                        if let Some(a) = active {
+                            cli.repo = Some(a);
+                        }
+                    } else if container_running(&cli.container) {
+                        eprintln!("listen: demand moved {active:?} → {r}; recycling runner");
+                        let _ = down(&cli, true);
+                        cli.repo = Some(r.clone());
+                    } else {
+                        cli.repo = Some(r.clone());
+                    }
+                } else {
+                    cli.repo = Some(r.clone());
                 }
-                cli.repo = Some(r.clone());
             }
         }
 
@@ -1722,6 +1843,9 @@ impl Cli {
             cpus: self.cpus.clone(),
             memory: self.memory.clone(),
             gpu: self.gpu,
+            gpu_slice: self.gpu_slice.clone(),
+            demand_require_labels: self.demand_require_labels.clone(),
+            demand_exclude_labels: self.demand_exclude_labels.clone(),
             build_dir: self.build_dir.clone(),
             mode: self.mode.clone(),
             wake_token: self.wake_token.clone(),
@@ -1748,6 +1872,9 @@ struct CliSnap {
     cpus: String,
     memory: String,
     gpu: bool,
+    gpu_slice: Option<String>,
+    demand_require_labels: Option<String>,
+    demand_exclude_labels: Option<String>,
     mode: Mode,
     wake_token: Option<String>,
     full_auto: bool,
@@ -1772,6 +1899,9 @@ fn cli_snapshot(cli: &Cli) -> CliSnap {
         cpus: cli.cpus.clone(),
         memory: cli.memory.clone(),
         gpu: cli.gpu,
+        gpu_slice: cli.gpu_slice.clone(),
+        demand_require_labels: cli.demand_require_labels.clone(),
+        demand_exclude_labels: cli.demand_exclude_labels.clone(),
         mode: cli.mode.clone(),
         wake_token: cli.wake_token.clone(),
         full_auto: cli.full_auto,
@@ -1798,6 +1928,9 @@ fn snap_to_cli(s: &CliSnap) -> Cli {
         cpus: s.cpus.clone(),
         memory: s.memory.clone(),
         gpu: s.gpu,
+        gpu_slice: s.gpu_slice.clone(),
+        demand_require_labels: s.demand_require_labels.clone(),
+        demand_exclude_labels: s.demand_exclude_labels.clone(),
         build_dir: None,
         mode: s.mode.clone(),
         wake_token: s.wake_token.clone(),
