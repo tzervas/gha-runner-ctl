@@ -9,13 +9,34 @@ struct RepoTestCase {
 #[test]
 fn test_is_safe_repo_parameterized() {
     let test_cases = vec![
-        RepoTestCase { repo: "tzervas/tg-agent-relay", expected: true },
-        RepoTestCase { repo: "foo/bar", expected: true },
-        RepoTestCase { repo: "foo/bar;rm", expected: false },
-        RepoTestCase { repo: "foo/../bar", expected: false },
-        RepoTestCase { repo: "foo/bar ", expected: false },
-        RepoTestCase { repo: "owner-name/repo_name.dot", expected: true },
-        RepoTestCase { repo: "owner/repo_name/extra", expected: false },
+        RepoTestCase {
+            repo: "tzervas/tg-agent-relay",
+            expected: true,
+        },
+        RepoTestCase {
+            repo: "foo/bar",
+            expected: true,
+        },
+        RepoTestCase {
+            repo: "foo/bar;rm",
+            expected: false,
+        },
+        RepoTestCase {
+            repo: "foo/../bar",
+            expected: false,
+        },
+        RepoTestCase {
+            repo: "foo/bar ",
+            expected: false,
+        },
+        RepoTestCase {
+            repo: "owner-name/repo_name.dot",
+            expected: true,
+        },
+        RepoTestCase {
+            repo: "owner/repo_name/extra",
+            expected: false,
+        },
     ];
 
     for case in test_cases {
@@ -113,13 +134,34 @@ struct SpecTestCase {
 #[test]
 fn test_is_safe_cpus_parameterized() {
     let test_cases = vec![
-        SpecTestCase { spec: "1", expected: true },
-        SpecTestCase { spec: "0.5", expected: true },
-        SpecTestCase { spec: "64", expected: true },
-        SpecTestCase { spec: "0", expected: false },
-        SpecTestCase { spec: "-1", expected: false },
-        SpecTestCase { spec: "65", expected: false },
-        SpecTestCase { spec: "abc", expected: false },
+        SpecTestCase {
+            spec: "1",
+            expected: true,
+        },
+        SpecTestCase {
+            spec: "0.5",
+            expected: true,
+        },
+        SpecTestCase {
+            spec: "64",
+            expected: true,
+        },
+        SpecTestCase {
+            spec: "0",
+            expected: false,
+        },
+        SpecTestCase {
+            spec: "-1",
+            expected: false,
+        },
+        SpecTestCase {
+            spec: "65",
+            expected: false,
+        },
+        SpecTestCase {
+            spec: "abc",
+            expected: false,
+        },
     ];
 
     for case in test_cases {
@@ -135,12 +177,30 @@ fn test_is_safe_cpus_parameterized() {
 #[test]
 fn test_is_safe_memory_parameterized() {
     let test_cases = vec![
-        SpecTestCase { spec: "8g", expected: true },
-        SpecTestCase { spec: "512m", expected: true },
-        SpecTestCase { spec: "16gb", expected: true },
-        SpecTestCase { spec: "4gi", expected: true },
-        SpecTestCase { spec: "abc", expected: false },
-        SpecTestCase { spec: "-4g", expected: false },
+        SpecTestCase {
+            spec: "8g",
+            expected: true,
+        },
+        SpecTestCase {
+            spec: "512m",
+            expected: true,
+        },
+        SpecTestCase {
+            spec: "16gb",
+            expected: true,
+        },
+        SpecTestCase {
+            spec: "4gi",
+            expected: true,
+        },
+        SpecTestCase {
+            spec: "abc",
+            expected: false,
+        },
+        SpecTestCase {
+            spec: "-4g",
+            expected: false,
+        },
     ];
 
     for case in test_cases {

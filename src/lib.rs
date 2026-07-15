@@ -173,7 +173,6 @@ pub fn prevent_raw_token_args() {
     }
 }
 
-
 pub fn run() -> Result<(), String> {
     let mut cli = Cli::parse();
     resolve_cli(&mut cli)?;
@@ -183,7 +182,9 @@ pub fn run() -> Result<(), String> {
         let has_vol = volume_exists(&cli.volume);
         let has_img = podman(&["image", "exists", &cli.image]).is_ok();
         if !has_vol || !has_img {
-            eprintln!("full-auto: missing Podman volume or image. Triggering automated prepare first...");
+            eprintln!(
+                "full-auto: missing Podman volume or image. Triggering automated prepare first..."
+            );
             prepare(&cli, true, false)?;
         }
     }
@@ -199,7 +200,9 @@ pub fn run() -> Result<(), String> {
                     wake_port: None,
                 }
             } else {
-                return Err("No command specified. Run with --help for options, or use --full-auto.".into());
+                return Err(
+                    "No command specified. Run with --help for options, or use --full-auto.".into(),
+                );
             }
         }
     };
@@ -252,16 +255,19 @@ fn get_user_login_from_token(token: &str) -> Result<String, String> {
         return Err(format!("GET /user returned HTTP {}", resp.status()));
     }
 
-    let body: UserResponse = resp.into_json().map_err(|e| format!("Failed to parse user info: {e}"))?;
+    let body: UserResponse = resp
+        .into_json()
+        .map_err(|e| format!("Failed to parse user info: {e}"))?;
     Ok(body.login)
 }
 
 fn resolve_cli(cli: &mut Cli) -> Result<(), String> {
     if let Some(ref target) = cli.this_repo_only {
-        let cleaned = target.trim_start_matches("https://")
-                            .trim_start_matches("http://")
-                            .trim_end_matches('/')
-                            .to_string();
+        let cleaned = target
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .trim_end_matches('/')
+            .to_string();
         let parts: Vec<&str> = cleaned.split('/').collect();
         if parts.len() == 3 {
             cli.scope = Scope::Repo;
@@ -270,7 +276,10 @@ fn resolve_cli(cli: &mut Cli) -> Result<(), String> {
             cli.scope = Scope::Repo;
             cli.repo = Some(format!("{}/{}", parts[0], parts[1]));
         } else {
-            return Err("invalid format for --this-repo-only. Expected [platform/]username/repo_name".into());
+            return Err(
+                "invalid format for --this-repo-only. Expected [platform/]username/repo_name"
+                    .into(),
+            );
         }
     }
 
@@ -673,7 +682,10 @@ struct Config {
 
 fn load_config() -> Option<Config> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    let path = home.join(".config").join("gha-runner-ctl").join("config.json");
+    let path = home
+        .join(".config")
+        .join("gha-runner-ctl")
+        .join("config.json");
     if path.is_file() {
         let content = fs::read_to_string(&path).ok()?;
         serde_json::from_str(&content).ok()
@@ -683,11 +695,14 @@ fn load_config() -> Option<Config> {
 }
 
 fn save_config(config: &Config) -> Result<(), String> {
-    let home = std::env::var_os("HOME").map(PathBuf::from).ok_or("No HOME directory found")?;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or("No HOME directory found")?;
     let dir = home.join(".config").join("gha-runner-ctl");
     fs::create_dir_all(&dir).map_err(|e| format!("Failed to create config dir: {e}"))?;
     let path = dir.join("config.json");
-    let content = serde_json::to_string_pretty(config).map_err(|e| format!("Failed to serialize config: {e}"))?;
+    let content = serde_json::to_string_pretty(config)
+        .map_err(|e| format!("Failed to serialize config: {e}"))?;
     fs::write(&path, content).map_err(|e| format!("Failed to write config file: {e}"))?;
     #[cfg(unix)]
     {
@@ -729,13 +744,28 @@ fn get_token_from_git_credential() -> Option<String> {
 }
 
 fn is_gcm_installed() -> bool {
-    if Command::new("git-credential-manager").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success()) {
+    if Command::new("git-credential-manager")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+    {
         return true;
     }
-    if Command::new("git-credential-manager-core").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success()) {
+    if Command::new("git-credential-manager-core")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+    {
         return true;
     }
-    if let Ok(out) = Command::new("git").args(["config", "--get", "credential.helper"]).output() {
+    if let Ok(out) = Command::new("git")
+        .args(["config", "--get", "credential.helper"])
+        .output()
+    {
         let helper = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if helper.contains("manager") {
             return true;
@@ -745,7 +775,9 @@ fn is_gcm_installed() -> bool {
 }
 
 fn install_gcm() -> Result<(), String> {
-    eprintln!("prepare: Git Credential Manager (GCM) is missing. Attempting automatic installation...");
+    eprintln!(
+        "prepare: Git Credential Manager (GCM) is missing. Attempting automatic installation..."
+    );
     if !Path::new("/usr/bin/dpkg").exists() {
         return Err("Automatic GCM installation is currently only supported on Debian/Ubuntu-based systems.\nTo install GCM on your system, please refer to: https://github.com/git-ecosystem/git-credential-manager/blob/main/docs/install.md".into());
     }
@@ -762,10 +794,14 @@ fn install_gcm() -> Result<(), String> {
         .map_err(|e| format!("Failed to download GCM deb package: {e}"))?;
 
     if resp.status() != 200 {
-        return Err(format!("Failed to download GCM: HTTP status {}", resp.status()));
+        return Err(format!(
+            "Failed to download GCM: HTTP status {}",
+            resp.status()
+        ));
     }
 
-    let mut file = File::create(&dest_path).map_err(|e| format!("Failed to create temp GCM deb file: {e}"))?;
+    let mut file =
+        File::create(&dest_path).map_err(|e| format!("Failed to create temp GCM deb file: {e}"))?;
     let mut reader = resp.into_reader();
     std::io::copy(&mut reader, &mut file).map_err(|e| format!("Failed to save GCM deb: {e}"))?;
 
@@ -786,7 +822,9 @@ fn install_gcm() -> Result<(), String> {
         .map_err(|e| format!("Failed to configure GCM: {e}"))?;
 
     if !configure_status.success() {
-        eprintln!("Warning: git-credential-manager configure didn't run cleanly. Trying git config...");
+        eprintln!(
+            "Warning: git-credential-manager configure didn't run cleanly. Trying git config..."
+        );
         let _ = Command::new("git")
             .args(["config", "--global", "credential.helper", "manager"])
             .status();
@@ -807,10 +845,16 @@ fn store_token_in_git_credential(token: &str) -> Result<(), String> {
 
     {
         let stdin = child.stdin.as_mut().ok_or("No stdin for git credential")?;
-        writeln!(stdin, "protocol=https\nhost=github.com\nusername=git\npassword={token}\n").map_err(|e| format!("Failed to write to git credential: {e}"))?;
+        writeln!(
+            stdin,
+            "protocol=https\nhost=github.com\nusername=git\npassword={token}\n"
+        )
+        .map_err(|e| format!("Failed to write to git credential: {e}"))?;
     }
 
-    let status = child.wait().map_err(|e| format!("Failed to wait for git credential: {e}"))?;
+    let status = child
+        .wait()
+        .map_err(|e| format!("Failed to wait for git credential: {e}"))?;
     if !status.success() {
         return Err("git credential approve failed".into());
     }
@@ -894,7 +938,9 @@ fn github_token() -> Result<String, String> {
                 let resp_trimmed = response.trim().to_lowercase();
                 if resp_trimmed == "y" || resp_trimmed == "yes" {
                     // Save to config
-                    let cfg = Config { github_token: Some(t.clone()) };
+                    let cfg = Config {
+                        github_token: Some(t.clone()),
+                    };
                     if let Err(e) = save_config(&cfg) {
                         eprintln!("Warning: failed to save config: {e}");
                     }
