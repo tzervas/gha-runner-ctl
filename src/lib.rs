@@ -143,6 +143,13 @@ pub struct Cli {
     /// Target both public and private repositories
     #[arg(long, env = "GHA_ALL_REPOS", default_value_t = false, global = true)]
     all_repos: bool,
+
+    /// Comma-separated `owner/repo` for user-batch demand poll.
+    /// When set, **only** these repos are polled (allowlist) — avoids burning the
+    /// GitHub API rate limit across hundreds of owned repos.
+    /// Example: `tzervas/gha-runner-ctl,tzervas/tg-agent-relay,tzervas/agent-harness`
+    #[arg(long, env = "GHA_PREFER_REPOS", global = true)]
+    prefer_repos: Option<String>,
 }
 
 #[derive(Debug, Subcommand, Clone)]
@@ -1558,7 +1565,36 @@ fn demand(cli: &Cli, api: &str) -> Result<(bool, Option<String>), String> {
         }
         Scope::User => {
             let user = cli.user.as_ref().expect("validated");
-            // Owner repos only (not collaborator noise). Paginate.
+            // Allowlist mode: when prefer_repos is set, ONLY poll those repos.
+            // Prevents O(repos)×2 Actions API calls every interval (rate-limit death).
+            if let Some(pref) = cli.prefer_repos.as_ref() {
+                for name in pref.split(',').map(|x| x.trim()).filter(|x| !x.is_empty()) {
+                    if !is_safe_repo(name) {
+                        continue;
+                    }
+                    if !name.starts_with(&format!("{user}/")) {
+                        continue;
+                    }
+                    match repo_needs_runner(cli, name, api) {
+                        Ok(true) => return Ok((true, Some(name.to_string()))),
+                        Ok(false) => {}
+                        Err(e) => {
+                            if e.contains("403")
+                                || e.contains("404")
+                                || e.contains("401")
+                                || e.contains("rate limit")
+                                || e.contains("status code 403")
+                            {
+                                eprintln!("listen: allowlist skip {name}: {}", redact(&e));
+                                continue;
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
+                return Ok((false, None));
+            }
+            // Full owner list (only when no allowlist — use sparingly).
             let url = format!(
                 "https://api.github.com/users/{user}/repos?type=owner&per_page=100&sort=updated"
             );
@@ -1570,7 +1606,6 @@ fn demand(cli: &Cli, api: &str) -> Result<(bool, Option<String>), String> {
                 if !is_safe_repo(&r.full_name) {
                     continue;
                 }
-                // Only this user's namespace
                 if !r.full_name.starts_with(&format!("{user}/")) {
                     continue;
                 }
@@ -1581,8 +1616,20 @@ fn demand(cli: &Cli, api: &str) -> Result<(bool, Option<String>), String> {
                 if filter_public && is_private {
                     continue;
                 }
-                if repo_needs_runner(cli, &r.full_name, api)? {
-                    return Ok((true, Some(r.full_name)));
+                match repo_needs_runner(cli, &r.full_name, api) {
+                    Ok(true) => return Ok((true, Some(r.full_name))),
+                    Ok(false) => {}
+                    Err(e) => {
+                        if e.contains("403")
+                            || e.contains("404")
+                            || e.contains("401")
+                            || e.contains("rate limit")
+                        {
+                            eprintln!("listen: skip {}: {}", r.full_name, redact(&e));
+                            continue;
+                        }
+                        return Err(e);
+                    }
                 }
             }
             Ok((false, None))
@@ -1630,10 +1677,29 @@ fn repo_needs_runner(cli: &Cli, repo: &str, api: &str) -> Result<bool, String> {
     for status in ["queued", "in_progress"] {
         let url =
             format!("https://api.github.com/repos/{repo}/actions/runs?status={status}&per_page=10");
-        let runs = fetch_runs(&url, api)?;
+        // Soft-fail permission/rate errors so one private/archived repo cannot
+        // block the whole user-batch poll (was: 403 on a single repo → no ups).
+        let runs = match fetch_runs(&url, api) {
+            Ok(r) => r,
+            Err(e) => {
+                if e.contains("403") || e.contains("404") || e.contains("401") {
+                    eprintln!("listen: skip {repo} runs ({status}): {}", redact(&e));
+                    continue;
+                }
+                return Err(e);
+            }
+        };
         for run in runs {
-            if job_matches_listener(cli, repo, run.id, api)? {
-                return Ok(true);
+            match job_matches_listener(cli, repo, run.id, api) {
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(e) => {
+                    if e.contains("403") || e.contains("404") || e.contains("401") {
+                        eprintln!("listen: skip {repo} jobs: {}", redact(&e));
+                        break;
+                    }
+                    return Err(e);
+                }
             }
         }
     }
@@ -1689,6 +1755,13 @@ fn fetch_runs(url: &str, api: &str) -> Result<Vec<WorkflowRun>, String> {
         .set("X-GitHub-Api-Version", "2022-11-28")
         .call()
         .map_err(|e| format!("list runs: {}", redact(&e.to_string())))?;
+    let status = resp.status();
+    if status == 401 || status == 403 || status == 404 {
+        return Err(format!("list runs: {url}: status code {status}"));
+    }
+    if !(200..300).contains(&status) {
+        return Err(format!("list runs: {url}: status code {status}"));
+    }
     let body: WorkflowRuns = resp.into_json().map_err(|e| format!("parse runs: {e}"))?;
     Ok(body.workflow_runs)
 }
@@ -1702,6 +1775,13 @@ fn job_matches_listener(cli: &Cli, repo: &str, run_id: u64, api: &str) -> Result
         .set("X-GitHub-Api-Version", "2022-11-28")
         .call()
         .map_err(|e| format!("list jobs: {}", redact(&e.to_string())))?;
+    let status = resp.status();
+    if status == 401 || status == 403 || status == 404 {
+        return Err(format!("list jobs: status code {status}"));
+    }
+    if !(200..300).contains(&status) {
+        return Err(format!("list jobs: status code {status}"));
+    }
     let body: JobsResp = resp.into_json().map_err(|e| format!("parse jobs: {e}"))?;
     for j in body.jobs {
         if j.status == "completed" {
@@ -1846,6 +1926,7 @@ impl Cli {
             gpu_slice: self.gpu_slice.clone(),
             demand_require_labels: self.demand_require_labels.clone(),
             demand_exclude_labels: self.demand_exclude_labels.clone(),
+            prefer_repos: self.prefer_repos.clone(),
             build_dir: self.build_dir.clone(),
             mode: self.mode.clone(),
             wake_token: self.wake_token.clone(),
@@ -1875,6 +1956,7 @@ struct CliSnap {
     gpu_slice: Option<String>,
     demand_require_labels: Option<String>,
     demand_exclude_labels: Option<String>,
+    prefer_repos: Option<String>,
     mode: Mode,
     wake_token: Option<String>,
     full_auto: bool,
@@ -1902,6 +1984,7 @@ fn cli_snapshot(cli: &Cli) -> CliSnap {
         gpu_slice: cli.gpu_slice.clone(),
         demand_require_labels: cli.demand_require_labels.clone(),
         demand_exclude_labels: cli.demand_exclude_labels.clone(),
+        prefer_repos: cli.prefer_repos.clone(),
         mode: cli.mode.clone(),
         wake_token: cli.wake_token.clone(),
         full_auto: cli.full_auto,
@@ -1931,6 +2014,7 @@ fn snap_to_cli(s: &CliSnap) -> Cli {
         gpu_slice: s.gpu_slice.clone(),
         demand_require_labels: s.demand_require_labels.clone(),
         demand_exclude_labels: s.demand_exclude_labels.clone(),
+        prefer_repos: s.prefer_repos.clone(),
         build_dir: None,
         mode: s.mode.clone(),
         wake_token: s.wake_token.clone(),

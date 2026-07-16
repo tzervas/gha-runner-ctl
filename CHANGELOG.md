@@ -1,6 +1,8 @@
 # Changelog
 
 ## 0.2.4
+- **Rate-limit safe user-batch:** `GHA_PREFER_REPOS` is an allowlist (only those repos polled); soft-skip 403/404 on Actions APIs
+
 
 - **Demand filters:** `--demand-require-labels` / `--demand-exclude-labels` so CPU listeners ignore GPU jobs and GPU listeners only wake on `gpu`
 - **Sticky user-batch:** do not recycle registration while active repo still has matching work
