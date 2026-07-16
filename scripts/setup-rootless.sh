@@ -170,7 +170,8 @@ then
     \"\$AGENT_HOME/.local/bin/gha-runner-ctl\"
   echo \"setup-rootless: installed \$ROOT_BIN\"
 else
-  echo \"setup-rootless: no binary yet (build/release later)\"
+  echo \"setup-rootless: ERROR: no gha-runner-ctl binary — build first (e.g. cargo build --release).\" >&2
+  exit 1
 fi
 "
 

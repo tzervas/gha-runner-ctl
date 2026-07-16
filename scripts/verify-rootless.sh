@@ -77,14 +77,30 @@ then
 fi
 echo "verify-rootless: rootless=true"
 
-podman run --rm docker.io/library/alpine:3.20 \
-  sh -c 'echo "container-ok host_mapped_as=$(id -u)"; test ! -u /bin/su; test ! -e /usr/bin/sudo; echo no-sudo-in-image-ok'
+if [[ "${GHA_SKIP_PULL_TEST:-}" != "1" ]]
+then
+  podman run --rm docker.io/library/alpine:3.20 \
+    sh -c 'echo "container-ok host_mapped_as=$(id -u)"; test ! -u /bin/su; test ! -e /usr/bin/sudo; echo no-sudo-in-image-ok'
+else
+  echo "verify-rootless: skipping alpine pull test (GHA_SKIP_PULL_TEST=1)"
+fi
+
+ROOTFUL_SOCK="unix:///run/podman/podman.sock"
+if [[ "${CONTAINER_HOST:-}" == "$ROOTFUL_SOCK" ]]
+then
+  if podman info &>/dev/null
+  then
+    echo "verify-rootless: FAIL — CONTAINER_HOST is rootful system socket and podman info succeeds." >&2
+    exit 1
+  fi
+fi
 
 if [[ -S /run/podman/podman.sock ]]
 then
   if CONTAINER_HOST=unix:///run/podman/podman.sock podman info &>/dev/null
   then
-    echo "verify-rootless: WARN — can talk to rootful system socket; tighten socket perms." >&2
+    echo "verify-rootless: FAIL — can talk to rootful system socket; tighten socket perms." >&2
+    exit 1
   else
     echo "verify-rootless: cannot use rootful /run/podman/podman.sock (good)"
   fi

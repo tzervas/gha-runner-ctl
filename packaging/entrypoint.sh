@@ -25,6 +25,67 @@ safe_ident() {
     return 0
 }
 
+normalize_repo_url() {
+    local u="${1:-}"
+    while [[ -n "$u" ]]
+    do
+        if [[ "$u" == */ ]]
+        then
+            u="${u%/}"
+        else
+            break
+        fi
+    done
+    printf '%s' "$u"
+}
+
+runner_repo_url_from_file() {
+    local path="${1:-.runner}"
+    local url=""
+    if [[ ! -f "$path" ]]
+    then
+        return 1
+    fi
+    if command -v python3 >/dev/null 2>&1
+    then
+        url="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('gitHubUrl') or d.get('githubUrl') or '')" "$path" 2>/dev/null || true)"
+    fi
+    if [[ -z "$url" ]]
+    then
+        url="$(sed -n 's/.*"[gG]it[Hh]ubUrl"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$path" 2>/dev/null | head -1 || true)"
+    fi
+    if [[ -z "$url" ]]
+    then
+        url="$(grep -Eo 'https://github.com/[A-Za-z0-9._/-]+' "$path" 2>/dev/null | head -1 || true)"
+    fi
+    if [[ -z "$url" ]]
+    then
+        return 1
+    fi
+    if ! safe_url "$url"
+    then
+        return 1
+    fi
+    normalize_repo_url "$url"
+    return 0
+}
+
+check_reuse_runner_matches_repo() {
+    local stored=""
+    local want=""
+    want="$(normalize_repo_url "$REPO_URL")"
+    if ! stored="$(runner_repo_url_from_file ".runner")"
+    then
+        log "ERROR: REUSE but cannot read gitHubUrl from .runner — fail closed"
+        exit 1
+    fi
+    if [[ "$stored" != "$want" ]]
+    then
+        log "ERROR: REUSE repo mismatch: .runner is for ${stored} but REPO_URL is ${want}"
+        exit 1
+    fi
+}
+
 safe_url() {
     # Only github.com over HTTPS (repo or org path).
     local u="${1:-}"
@@ -110,6 +171,7 @@ if [[ "${RUNNER_TOKEN:-}" == "REUSE" ]]
 then
     if [[ -f .runner ]]
     then
+        check_reuse_runner_matches_repo
         log "reusing retained registration (.runner present) — no config.sh"
         need_register=0
         unset RUNNER_TOKEN
@@ -121,6 +183,7 @@ elif [[ "${RUNNER_TOKEN:-}" == "reuse" ]]
 then
     if [[ -f .runner ]]
     then
+        check_reuse_runner_matches_repo
         log "reusing retained registration (.runner present) — no config.sh"
         need_register=0
         unset RUNNER_TOKEN

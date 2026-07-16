@@ -377,9 +377,11 @@ fn effective_uid_is_root() -> bool {
                     }
                 }
             }
+            // Parsed status but no Uid line — fail-closed (treat as root).
+            return true;
         }
-        // Fallback: if we cannot read status, do not block (dev containers vary).
-        false
+        // Unreadable /proc — fail-closed: refuse unless GHA_ALLOW_ROOT.
+        true
     }
     #[cfg(not(unix))]
     {
@@ -1379,11 +1381,22 @@ impl ApiPacer {
                 let retry_after: Option<u64> =
                     resp.header("retry-after").and_then(|s| s.parse().ok());
                 let status = resp.status();
-                if status == 403 || status == 429 {
-                    // Peek body for secondary-limit wording without consuming if we can —
-                    // ureq Response is consumed by into_string; clone status path only.
+                if status == 429 {
                     self.note_rate_limited(retry_after, reset);
                     return Err(format!("status code {status} (rate limited)"));
+                }
+                if status == 403 {
+                    let body_snip = resp.into_string().unwrap_or_default();
+                    let body_ref = if body_snip.is_empty() {
+                        None
+                    } else {
+                        Some(body_snip.as_str())
+                    };
+                    if api_status_is_hard_rate_limit(status, remaining, body_ref) {
+                        self.note_rate_limited(retry_after, reset);
+                        return Err(format!("status code {status} (rate limited)"));
+                    }
+                    return Err(format!("status code {status}"));
                 }
                 if status == 401 || status == 404 {
                     return Err(format!("status code {status}"));
@@ -1403,9 +1416,16 @@ impl ApiPacer {
                     .and_then(|s| s.parse().ok());
                 let retry_after: Option<u64> =
                     resp.header("retry-after").and_then(|s| s.parse().ok());
-                if code == 403 || code == 429 {
+                let body_snip = resp.into_string().unwrap_or_default();
+                let body_ref = if body_snip.is_empty() {
+                    None
+                } else {
+                    Some(body_snip.as_str())
+                };
+                if code == 429
+                    || (code == 403 && api_status_is_hard_rate_limit(code, remaining, body_ref))
+                {
                     self.note_rate_limited(retry_after, reset);
-                    let _ = remaining;
                     return Err(format!("status code {code} (rate limited)"));
                 }
                 Err(format!("status code {code}"))
@@ -1413,6 +1433,26 @@ impl ApiPacer {
             Err(e) => Err(redact(&e.to_string())),
         }
     }
+}
+
+/// True when GitHub indicates a hard API rate limit (not a soft permission 403).
+fn api_status_is_hard_rate_limit(status: u16, remaining: Option<u32>, body: Option<&str>) -> bool {
+    if status == 429 {
+        return true;
+    }
+    if status != 403 {
+        return false;
+    }
+    if remaining == Some(0) {
+        return true;
+    }
+    if let Some(b) = body {
+        let lower = b.to_ascii_lowercase();
+        if lower.contains("secondary rate limit") || lower.contains("secondary_rate_limit") {
+            return true;
+        }
+    }
+    false
 }
 
 /// Host-wide registration pacing (shared by all gha-runner-ctl processes).
@@ -1487,12 +1527,7 @@ fn pace_registration(cli: &Cli) -> Result<(), String> {
                         continue;
                     }
                 }
-                // Reserve slot before network call so concurrent processes back off.
-                state.last_unix = now;
-                state.recent.push(now);
-                if let Ok(s) = serde_json::to_string(&state) {
-                    let _ = fs::write(&state_path, s);
-                }
+                // Budget enforced here; slot committed only after successful token mint.
                 let _ = fs::remove_file(&exclusive);
                 return Ok(());
             }
@@ -1502,6 +1537,31 @@ fn pace_registration(cli: &Cli) -> Result<(), String> {
         }
     }
     Err("register: could not acquire registration pace lock".into())
+}
+
+/// Record a successful registration-token mint in the host-wide hourly budget.
+fn commit_registration_slot() {
+    let (lock_path, state_path) = reg_pace_paths();
+    let exclusive = lock_path.with_extension("exclusive");
+    if OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&exclusive)
+        .is_ok()
+    {
+        let mut state: RegPaceState = fs::read_to_string(&state_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        let now = now_unix();
+        state.recent.retain(|t| now.saturating_sub(*t) < 3600);
+        state.last_unix = now;
+        state.recent.push(now);
+        if let Ok(s) = serde_json::to_string(&state) {
+            let _ = fs::write(&state_path, s);
+        }
+        let _ = fs::remove_file(&exclusive);
+    }
 }
 
 fn note_registration_failure_backoff(secs: u64) {
@@ -1576,6 +1636,7 @@ fn registration_token(cli: &Cli, api_token: &str) -> Result<String, String> {
     if body.token.is_empty() || body.token.len() > 512 {
         return Err("registration token empty or implausible length".into());
     }
+    commit_registration_slot();
     eprintln!(
         "register: minted registration-token for {}",
         github_url(cli)
@@ -1598,22 +1659,39 @@ fn effective_ephemeral(cli: &Cli) -> bool {
 
 // --- Podman ------------------------------------------------------------------
 
+/// Refuse rootful system sockets and remote daemons unless explicitly allowed.
+/// Rootless `unix:///run/user/…/podman.sock` (or path containing both) is permitted.
+fn refuse_container_host_misconfig() -> Option<String> {
+    let host = std::env::var("CONTAINER_HOST").ok()?;
+    let allow = std::env::var("GHA_ALLOW_ROOTFUL_SOCKET")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "YES"))
+        .unwrap_or(false);
+    if allow {
+        return None;
+    }
+    let rootless_podman = host.contains("/run/user/") && host.contains("podman.sock");
+    if rootless_podman {
+        return None;
+    }
+    let risky = host.contains("docker.sock")
+        || host.contains("podman.sock")
+        || host.starts_with("tcp://")
+        || host.starts_with("unix://");
+    if risky {
+        return Some(
+            "refusing CONTAINER_HOST (system/remote podman or docker socket). \
+             Use rootless socket under /run/user/…/podman.sock, or set GHA_ALLOW_ROOTFUL_SOCKET=1 only if intentional."
+                .into(),
+        );
+    }
+    None
+}
+
 fn podman(args: &[&str]) -> Result<String, String> {
-    // Never point work-plane ops at a rootful system socket from an agent process
+    // Never point work-plane ops at a rootful / remote socket from an agent process
     // that was expected to be rootless (misconfiguration guard).
-    if let Ok(host) = std::env::var("CONTAINER_HOST") {
-        if host.contains("/run/podman/podman.sock") || host.contains("/var/run/docker.sock") {
-            let allow = std::env::var("GHA_ALLOW_ROOTFUL_SOCKET")
-                .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
-                .unwrap_or(false);
-            if !allow {
-                return Err(
-                    "refusing rootful CONTAINER_HOST (system podman/docker socket). \
-                     Run as gha-agent rootless, or set GHA_ALLOW_ROOTFUL_SOCKET=1 only if intentional."
-                        .into(),
-                );
-            }
-        }
+    if let Some(msg) = refuse_container_host_misconfig() {
+        return Err(msg);
     }
     let out = Command::new("podman")
         .args(args)
@@ -2209,6 +2287,71 @@ struct NamedRepo {
     private: Option<bool>,
 }
 
+fn repos_round_robin_state_path(container: &str) -> PathBuf {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let safe: String = container
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    dir.join(format!("gha-runner-ctl-rr-{safe}.txt"))
+}
+
+/// Subset of allowlisted repos for this demand tick (`repos_per_tick`; 0 = all).
+fn select_repos_for_tick(cli: &Cli, repos: &[String]) -> Vec<String> {
+    if repos.is_empty() {
+        return Vec::new();
+    }
+    if cli.repos_per_tick == 0 {
+        return repos.to_vec();
+    }
+    let n = cli.repos_per_tick as usize;
+    let len = repos.len();
+    let path = repos_round_robin_state_path(&cli.container);
+    let mut offset: usize = fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+        % len;
+    let take = n.min(len);
+    let mut out = Vec::with_capacity(take);
+    for i in 0..take {
+        out.push(repos[(offset + i) % len].clone());
+    }
+    offset = (offset + take) % len;
+    let _ = fs::write(&path, offset.to_string());
+    out
+}
+
+fn poll_allowlist_repos(
+    cli: &Cli,
+    api: &str,
+    pacer: &mut ApiPacer,
+    repos: &[String],
+) -> Result<(bool, Option<String>), String> {
+    for name in select_repos_for_tick(cli, repos) {
+        match repo_needs_runner(cli, &name, api, pacer) {
+            Ok(true) => return Ok((true, Some(name))),
+            Ok(false) => {}
+            Err(e) if is_soft_api_err(&e) => {
+                eprintln!("listen: allowlist skip {name}: {}", redact(&e));
+                if e.contains("rate limited") || e.contains("budget exhausted") {
+                    return Err(e);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok((false, None))
+}
+
 /// Returns (need_runner, optional active_repo_for_registration).
 fn demand(cli: &Cli, api: &str, pacer: &mut ApiPacer) -> Result<(bool, Option<String>), String> {
     pacer.begin_poll();
@@ -2226,8 +2369,20 @@ fn demand(cli: &Cli, api: &str, pacer: &mut ApiPacer) -> Result<(bool, Option<St
 
     match cli.scope {
         Scope::Repo => {
-            let repo = cli.repo.as_ref().expect("validated").clone();
-            Ok((repo_needs_runner(cli, &repo, api, pacer)?, Some(repo)))
+            if let Some(repo) = cli.repo.as_ref() {
+                let repo = repo.clone();
+                return Ok((repo_needs_runner(cli, &repo, api, pacer)?, Some(repo)));
+            }
+            if let Some(pref) = cli.prefer_repos.as_ref() {
+                let repos: Vec<String> = pref
+                    .split(',')
+                    .map(|x| x.trim())
+                    .filter(|x| !x.is_empty() && is_safe_repo(x))
+                    .map(|s| s.to_string())
+                    .collect();
+                return poll_allowlist_repos(cli, api, pacer, &repos);
+            }
+            Err("repo scope: missing --repo or --prefer-repos".into())
         }
         Scope::Org => {
             let owner = cli.owner.as_ref().expect("validated");
@@ -2262,26 +2417,14 @@ fn demand(cli: &Cli, api: &str, pacer: &mut ApiPacer) -> Result<(bool, Option<St
             let user = cli.user.as_ref().expect("validated");
             // Allowlist mode: when prefer_repos is set, ONLY poll those repos.
             if let Some(pref) = cli.prefer_repos.as_ref() {
-                for name in pref.split(',').map(|x| x.trim()).filter(|x| !x.is_empty()) {
-                    if !is_safe_repo(name) {
-                        continue;
-                    }
-                    if !name.starts_with(&format!("{user}/")) {
-                        continue;
-                    }
-                    match repo_needs_runner(cli, name, api, pacer) {
-                        Ok(true) => return Ok((true, Some(name.to_string()))),
-                        Ok(false) => {}
-                        Err(e) if is_soft_api_err(&e) => {
-                            eprintln!("listen: allowlist skip {name}: {}", redact(&e));
-                            if e.contains("rate limited") || e.contains("budget exhausted") {
-                                return Err(e);
-                            }
-                        }
-                        Err(e) => return Err(e),
-                    }
-                }
-                return Ok((false, None));
+                let repos: Vec<String> = pref
+                    .split(',')
+                    .map(|x| x.trim())
+                    .filter(|x| !x.is_empty() && is_safe_repo(x))
+                    .filter(|name| name.starts_with(&format!("{user}/")))
+                    .map(|s| s.to_string())
+                    .collect();
+                return poll_allowlist_repos(cli, api, pacer, &repos);
             }
             // Full owner list — paced + budget-capped; prefer setting GHA_PREFER_REPOS.
             eprintln!(

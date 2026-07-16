@@ -21,6 +21,7 @@
 
 - **Paced GitHub API client:** min gap between calls (`GHA_API_MIN_GAP_MS`, default 500ms), per-poll GET budget (`GHA_API_MAX_PER_POLL`, default 24), honor `X-RateLimit-*` / `Retry-After`, exponential cool-down on 403/429
 - User-batch floor poll interval 30s; warn when `GHA_PREFER_REPOS` unset
+- Note: 0.2.6 tightened operator defaults to 1000ms / 12 GETs per poll and raised the user-batch listen floor to 120s (see 0.2.6 docs and `src/lib.rs`).
 - Cap job lookups per repo; smaller runs pages; repo-list page cap
 
 ## 0.2.4

@@ -72,17 +72,17 @@ OS user gha-agent (nologin, no sudo)
 * Instance env under `/home/gha-agent/.local/share/gha-runner-ctl/`.
 * See [SECURITY](SECURITY.md) and [HOST_OPS](HOST_OPS.md).
 
-### B. Micro-agent container (Alpine-style surface, **cannot spawn**)
+### B. Micro-agent container (Ubuntu-minimal stripped, cannot spawn)
 
 ```text
 podman run --read-only --cap-drop=ALL  gha-runner-ctl-agent
-  = binary + CA certs only
+  = Ubuntu 24.04 base stripped to binary + CA certs only
   = no shell, no sudo, no podman CLI, no runtime socket
   → can talk to GitHub API if given a token
   → cannot allocate work containers (by design)
 ```
 
-* Image: [packaging/Containerfile.agent](../packaging/Containerfile.agent).
+* Image: [packaging/Containerfile.agent](../packaging/Containerfile.agent) (build installs ca-certificates, then removes shell/apt surface).
 * Runner: [scripts/run-agent-micro.sh](../scripts/run-agent-micro.sh) (drops all caps, read-only, refuses socket env).
 * **Never** mount `podman.sock` / `docker.sock` into this image — that would undo the model.
 * Full `listen`/`warm`/`up` that need Podman: use path A (host binary as `gha-agent`).
