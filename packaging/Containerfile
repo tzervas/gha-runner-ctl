@@ -17,8 +17,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     RUNNER_USER=runner
 
 # Install HTTPS transport and CA certificates first to support secure updates.
-RUN apt-get update
-RUN DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+RUN apt-get update \
+      && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       ca-certificates \
       apt-transport-https
 RUN rm -rf /var/lib/apt/lists/*
@@ -31,11 +31,11 @@ RUN sed -i 's|http://|https://|g' /etc/apt/sources.list 2>/dev/null \
 
 # Always refresh indexes and apply upgrades before installing packages so the
 # snapshot is not baked from a stale base layer.
-RUN apt-get update
-RUN DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
+RUN apt-get update \
+      && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
       -o Dpkg::Options::="--force-confdef" \
-      -o Dpkg::Options::="--force-confold"
-RUN DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      -o Dpkg::Options::="--force-confold" \
+      && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       curl \
       git \
       jq \
