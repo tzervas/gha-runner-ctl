@@ -86,6 +86,65 @@ fn test_is_safe_repo_parameterized() {
     }
 }
 
+#[test]
+fn test_case_insensitive_wake_auth_headers() {
+    let token = "SomeTokenCasePreserved123";
+    // Check Authorization: Bearer variations
+    assert!(wake_request_line_authorized(
+        &format!("Authorization: Bearer {token}"),
+        token
+    ));
+    assert!(wake_request_line_authorized(
+        &format!("authorization: bearer {token}"),
+        token
+    ));
+    assert!(wake_request_line_authorized(
+        &format!("AUTHORIZATION: BEARER {token}"),
+        token
+    ));
+    assert!(wake_request_line_authorized(
+        &format!("AuThOrIzAtIoN: bEaReR {token}"),
+        token
+    ));
+
+    // Check X-Wake-Token variations
+    assert!(wake_request_line_authorized(
+        &format!("X-Wake-Token: {token}"),
+        token
+    ));
+    assert!(wake_request_line_authorized(
+        &format!("x-wake-token: {token}"),
+        token
+    ));
+    assert!(wake_request_line_authorized(
+        &format!("X-WAKE-TOKEN: {token}"),
+        token
+    ));
+    assert!(wake_request_line_authorized(
+        &format!("X-WaKe-ToKeN: {token}"),
+        token
+    ));
+}
+
+#[test]
+fn test_multiple_secret_redactions() {
+    let raw =
+        "Here are two secrets: Bearer ghp_ABC123 and another Bearer ghp_XYZ789 in the same string.";
+    let redacted_str = redact(raw);
+    assert!(!redacted_str.contains("ABC123"));
+    assert!(!redacted_str.contains("XYZ789"));
+    assert!(redacted_str.matches("***REDACTED***").count() >= 2);
+}
+
+#[test]
+fn test_redact_multibyte_truncation_safety() {
+    // Large string of multibyte chars (e.g. '🦀' which is 4 bytes).
+    let raw = "🦀".repeat(150);
+    let redacted_str = redact(&raw);
+    // Ensure no panic during truncation (does not slice char boundaries)
+    assert!(redacted_str.ends_with('…') || redacted_str.ends_with('🦀'));
+}
+
 /// Parameterized test case structure for parse_github_remote
 struct RemoteTestCase {
     url: &'static str,
