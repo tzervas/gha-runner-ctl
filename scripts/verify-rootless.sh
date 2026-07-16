@@ -77,12 +77,26 @@ then
 fi
 echo "verify-rootless: rootless=true"
 
+# Optional smoke container. Prefer a local image; pin tag via env for airgap.
+# Skip entirely with GHA_SKIP_PULL_TEST=1 (offline CI).
 if [[ "${GHA_SKIP_PULL_TEST:-}" != "1" ]]
 then
-  podman run --rm docker.io/library/alpine:3.20 \
+  # Default tag only; override with full ref including digest, e.g.
+  # GHA_VERIFY_IMAGE=docker.io/library/alpine:3.20@sha256:…
+  VERIFY_IMAGE="${GHA_VERIFY_IMAGE:-docker.io/library/alpine:3.20}"
+  if ! podman image exists "$VERIFY_IMAGE" 2>/dev/null
+  then
+    echo "verify-rootless: pulling smoke image ${VERIFY_IMAGE} (set GHA_SKIP_PULL_TEST=1 to skip)"
+    if ! podman pull "$VERIFY_IMAGE"
+    then
+      echo "verify-rootless: FAIL — cannot pull smoke image (offline?). Set GHA_SKIP_PULL_TEST=1 or GHA_VERIFY_IMAGE to a local image." >&2
+      exit 1
+    fi
+  fi
+  podman run --rm "$VERIFY_IMAGE" \
     sh -c 'echo "container-ok host_mapped_as=$(id -u)"; test ! -u /bin/su; test ! -e /usr/bin/sudo; echo no-sudo-in-image-ok'
 else
-  echo "verify-rootless: skipping alpine pull test (GHA_SKIP_PULL_TEST=1)"
+  echo "verify-rootless: skipping container smoke test (GHA_SKIP_PULL_TEST=1)"
 fi
 
 ROOTFUL_SOCK="unix:///run/podman/podman.sock"

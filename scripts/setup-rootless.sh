@@ -34,6 +34,15 @@ then
   exit 1
 fi
 
+# Cross-process lock: parallel setup-rootless races on useradd/subuid.
+SETUP_LOCK="${TMPDIR:-/tmp}/gha-runner-ctl-setup-rootless.lock"
+exec 9>"${SETUP_LOCK}"
+if ! flock -n 9
+then
+  echo "setup-rootless: another setup-rootless holds ${SETUP_LOCK}; exit" >&2
+  exit 1
+fi
+
 echo "setup-rootless: serial orchestrator (one phase shell at a time)"
 
 # ── 01 packages (fresh shell after apt so new binaries are visible) ──────────

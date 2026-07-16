@@ -272,6 +272,29 @@ ${script_q}
   GHA_PHASE_BUSY="${name}"
   export GHA_PHASE_BUSY
 
+  # Cross-process busy marker (parallel setup-rootless / phase runners on one host).
+  # Best-effort: create_new file; if exists and PID still alive, refuse.
+  local host_busy="${TMPDIR:-/tmp}/gha-runner-ctl-phase-busy.lock"
+  if [[ -f "$host_busy" ]]
+  then
+    local old_pid
+    old_pid="$(cat "$host_busy" 2>/dev/null || true)"
+    if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null
+    then
+      echo "gha_run_phase: host phase busy (pid ${old_pid}); sequential only" >&2
+      return 1
+    fi
+    rm -f "$host_busy" 2>/dev/null \
+      || true
+  fi
+  if ! (set -o noclobber; echo "$$" >"$host_busy") 2>/dev/null
+  then
+    echo "gha_run_phase: could not claim host phase lock ${host_busy}" >&2
+    return 1
+  fi
+  _GHA_PHASE_LOCK_HELD="$host_busy"
+  export _GHA_PHASE_LOCK_HELD
+
   local ec=0
   if [[ -n "$run_user" ]]
   then
@@ -292,18 +315,19 @@ ${script_q}
       || true
     tmp_q="$(printf '%q' "$tmp")"
 
-    local -a run_bash
+    # Avoid word-splitting bash argv: single quoted path via printf %q only.
+    local su_inner
     case "${GHA_PHASE_LOGIN:-1}" in
       0|false|no|NO)
-        run_bash=(bash --noprofile --norc)
+        su_inner="exec /bin/bash --noprofile --norc -- ${tmp_q}"
         ;;
       *)
-        run_bash=(bash -l)
+        su_inner="exec /bin/bash -l -- ${tmp_q}"
         ;;
     esac
 
     if ! env "${env_pass[@]}" \
-      su -s /bin/bash "$run_user" -c "exec ${run_bash[*]} ${tmp_q}"
+      su -s /bin/bash "$run_user" -c "${su_inner}"
     then
       ec=$?
     fi
@@ -318,6 +342,13 @@ ${script_q}
   fi
 
   unset GHA_PHASE_BUSY
+  # Drop cross-process busy marker if we hold it.
+  if [[ -n "${_GHA_PHASE_LOCK_HELD:-}" ]]
+  then
+    rm -f "${_GHA_PHASE_LOCK_HELD}" 2>/dev/null \
+      || true
+    unset _GHA_PHASE_LOCK_HELD
+  fi
   echo "── phase reaped: ${name} (next shell may open) exit=${ec} ──"
   return "${ec}"
 }
