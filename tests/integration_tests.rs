@@ -25,10 +25,11 @@ fn redacts_bearer() {
 }
 
 #[test]
-fn redacts_first_ghp_secret() {
-    // redact() currently replaces the first match per key prefix (not all occurrences).
-    let s = redact("Here is token1 ghp_ABCDEFGHIJKLMNOP and more text.");
+fn redacts_multiple_ghp_secrets() {
+    // redact() replaces all occurrences of secret key prefixes in a loop.
+    let s = redact("Here is token1 ghp_ABCDEFGHIJKLMNOP and more ghp_QRSTUVWX text.");
     assert!(!s.contains("ABCDEFGHIJKLMNOP"));
+    assert!(!s.contains("QRSTUVWX"));
     assert!(s.contains("ghp_***REDACTED***"));
 }
 

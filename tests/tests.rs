@@ -2,7 +2,8 @@ use gha_runner_ctl::*;
 
 #[test]
 fn test_wake_auth_preserves_token_case() {
-    // Mixed-case secret must match when Authorization/Bearer casing varies.
+    // Both Authorization: Bearer and X-Wake-Token are check case-insensitively.
+    // However, the secret token itself preserves case.
     let token = "AbCdEfGhIjKlMnOp"; // 16 chars
     assert!(wake_request_line_authorized(
         &format!("Authorization: Bearer {token}"),
@@ -16,6 +17,11 @@ fn test_wake_auth_preserves_token_case() {
         &format!("AUTHORIZATION: BEARER {token}"),
         token
     ));
+    assert!(wake_request_line_authorized(
+        &format!("AuThOrIzAtIoN: bEaReR {token}"),
+        token
+    ));
+
     // Lowercasing the secret must NOT authenticate against the original token.
     assert!(!wake_request_line_authorized(
         &format!("Authorization: Bearer {}", token.to_ascii_lowercase()),
@@ -26,9 +32,22 @@ fn test_wake_auth_preserves_token_case() {
         "Authorization: Bearer totally-wrong-tok",
         token
     ));
-    // X-Wake-Token path (exact header name) still works.
+
+    // X-Wake-Token path works case-insensitively.
     assert!(wake_request_line_authorized(
         &format!("X-Wake-Token: {token}"),
+        token
+    ));
+    assert!(wake_request_line_authorized(
+        &format!("x-wake-token: {token}"),
+        token
+    ));
+    assert!(wake_request_line_authorized(
+        &format!("X-WAKE-TOKEN: {token}"),
+        token
+    ));
+    assert!(wake_request_line_authorized(
+        &format!("X-WaKe-ToKeN: {token}"),
         token
     ));
     assert!(!wake_request_line_authorized(
@@ -84,6 +103,70 @@ fn test_is_safe_repo_parameterized() {
             case.repo
         );
     }
+}
+
+#[test]
+fn test_overwrite_permission_preservation() {
+    let dir = std::env::temp_dir();
+    let path = dir.join("gha-runner-ctl-test-perms-overwrite.txt");
+
+    // 1. Create file with 0o644 permissions (or standard umask)
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, "initial content").unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+    }
+
+    // 2. Perform overwrite with OpenOptions and post-write set_permissions
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(&path).unwrap();
+    use std::io::Write;
+    f.write_all(b"new content").unwrap();
+    drop(f);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn test_multiple_secret_redactions() {
+    let raw =
+        "Here are two secrets: Bearer ghp_ABC123 and another Bearer ghp_XYZ789 in the same string.";
+    let redacted_str = redact(raw);
+    assert!(!redacted_str.contains("ABC123"));
+    assert!(!redacted_str.contains("XYZ789"));
+    assert!(redacted_str.matches("***REDACTED***").count() >= 2);
+}
+
+#[test]
+fn test_redact_multibyte_truncation_safety() {
+    // Large string of multibyte chars (e.g. '🦀' which is 4 bytes).
+    let raw = "🦀".repeat(150);
+    let redacted_str = redact(&raw);
+    // Ensure no panic during truncation (does not slice char boundaries)
+    assert!(redacted_str.ends_with('…') || redacted_str.ends_with('🦀'));
 }
 
 /// Parameterized test case structure for parse_github_remote

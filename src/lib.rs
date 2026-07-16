@@ -719,6 +719,7 @@ pub fn is_safe_memory(s: &str) -> bool {
 
 pub fn redact(s: &str) -> String {
     let mut out = s.to_string();
+    const REDACTED_SUFFIX: &str = "***REDACTED***";
     for key in [
         "ghp_",
         "gho_",
@@ -729,19 +730,43 @@ pub fn redact(s: &str) -> String {
         "Bearer ",
         "RUNNER_TOKEN=",
     ] {
-        if let Some(i) = out.find(key) {
-            let rest = &out[i + key.len()..];
-            let take = rest
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
-                .count()
-                .min(200);
-            let end = i + key.len() + take;
-            out.replace_range(i..end, &format!("{key}***REDACTED***"));
+        let mut start_search_idx = 0;
+        while start_search_idx < out.len() {
+            if let Some(offset) = out[start_search_idx..].find(key) {
+                let i = start_search_idx + offset;
+                let rest_idx = i + key.len();
+                let rest = &out[rest_idx..];
+
+                let mut chars_taken = 0;
+                let mut secret_len_bytes = 0;
+                for (idx, c) in rest.char_indices() {
+                    if chars_taken >= 200 {
+                        break;
+                    }
+                    if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') {
+                        chars_taken += 1;
+                        secret_len_bytes = idx + c.len_utf8();
+                    } else {
+                        break;
+                    }
+                }
+
+                out.replace_range(
+                    i..(rest_idx + secret_len_bytes),
+                    &format!("{key}{REDACTED_SUFFIX}"),
+                );
+                start_search_idx = i + key.len() + REDACTED_SUFFIX.len();
+            } else {
+                break;
+            }
         }
     }
     if out.len() > 400 {
-        out = format!("{}…", &out[..400]);
+        let mut truncate_at = 400;
+        while truncate_at > 0 && !out.is_char_boundary(truncate_at) {
+            truncate_at -= 1;
+        }
+        out = format!("{}…", &out[..truncate_at]);
     }
     out
 }
@@ -876,6 +901,21 @@ fn registration_api(cli: &Cli) -> String {
     }
 }
 
+pub fn current_username() -> String {
+    let raw = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "default".to_string());
+    let sanitized: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if sanitized.is_empty() {
+        "default".to_string()
+    } else {
+        sanitized
+    }
+}
+
 // --- Per-container instance lock (allows multi-runner horizontal scale) ------
 
 struct InstanceLock {
@@ -899,16 +939,19 @@ impl InstanceLock {
                 }
             })
             .collect();
-        let path = dir.join(format!("gha-runner-ctl-{kind}-{safe}.lock"));
+        let user_suffix = current_username();
+        let path = dir.join(format!("gha-runner-ctl-{kind}-{safe}-{user_suffix}.lock"));
         for attempt in 0..2 {
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
+            let mut opts = OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            match opts.open(&path) {
                 Ok(mut f) => {
                     let _ = writeln!(f, "{}", std::process::id());
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
-                    }
                     return Ok(Self { path });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -980,7 +1023,19 @@ fn save_config(config: &Config) -> Result<(), String> {
     let path = dir.join("config.json");
     let content = serde_json::to_string_pretty(config)
         .map_err(|e| format!("Failed to serialize config: {e}"))?;
-    fs::write(&path, content).map_err(|e| format!("Failed to write config file: {e}"))?;
+
+    let mut opts = OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
+        .open(&path)
+        .map_err(|e| format!("Failed to open config file for writing: {e}"))?;
+    f.write_all(content.as_bytes())
+        .map_err(|e| format!("Failed to write config file: {e}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1460,9 +1515,10 @@ fn reg_pace_paths() -> (PathBuf, PathBuf) {
     let dir = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
+    let user_suffix = current_username();
     (
-        dir.join("gha-runner-ctl-reg-pace.lock"),
-        dir.join("gha-runner-ctl-reg-pace.json"),
+        dir.join(format!("gha-runner-ctl-reg-pace-{user_suffix}.lock")),
+        dir.join(format!("gha-runner-ctl-reg-pace-{user_suffix}.json")),
     )
 }
 
@@ -1952,7 +2008,12 @@ fn private_env_path() -> PathBuf {
     let dir = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    dir.join(format!("gha-runner-ctl-{}.env", std::process::id()))
+    let user_suffix = current_username();
+    dir.join(format!(
+        "gha-runner-ctl-{}-{}.env",
+        std::process::id(),
+        user_suffix
+    ))
 }
 
 fn volume_has_runner_config(cli: &Cli) -> bool {
@@ -1960,11 +2021,15 @@ fn volume_has_runner_config(cli: &Cli) -> bool {
     // We cannot inspect volume contents without a container; prefer retain path
     // and let entrypoint skip config when .runner exists.
     // Marker file on host tracks last successful retain target.
+    let user_suffix = current_username();
     let marker = reg_pace_paths()
         .0
         .parent()
         .unwrap_or(Path::new("/tmp"))
-        .join(format!("gha-runner-ctl-retain-{}.ok", cli.container));
+        .join(format!(
+            "gha-runner-ctl-retain-{}-{}.ok",
+            cli.container, user_suffix
+        ));
     if !marker.is_file() {
         return false;
     }
@@ -1975,22 +2040,28 @@ fn volume_has_runner_config(cli: &Cli) -> bool {
 }
 
 fn mark_retain_ok(cli: &Cli) {
+    let user_suffix = current_username();
     let marker = reg_pace_paths()
         .0
         .parent()
         .unwrap_or(Path::new("/tmp"))
-        .join(format!("gha-runner-ctl-retain-{}.ok", cli.container));
+        .join(format!(
+            "gha-runner-ctl-retain-{}-{}.ok",
+            cli.container, user_suffix
+        ));
     let _ = fs::write(&marker, github_url(cli));
 }
 
 fn write_env_file(path: &Path, reg_token: &str, cli: &Cli) -> Result<(), String> {
     let ephemeral = effective_ephemeral(cli);
-    let mut f = File::create(path).map_err(|e| format!("env file: {e}"))?;
+    let mut opts = OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
     }
+    let mut f = opts.open(path).map_err(|e| format!("env file: {e}"))?;
     writeln!(
         f,
         "REPO_URL={}\nRUNNER_NAME={}\nRUNNER_LABELS={}\nRUNNER_EPHEMERAL={}\nRUNNER_RETAIN={}\nRUNNER_TOKEN={}",
@@ -2002,6 +2073,11 @@ fn write_env_file(path: &Path, reg_token: &str, cli: &Cli) -> Result<(), String>
         reg_token
     )
     .map_err(|e| format!("env write: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
     Ok(())
 }
 
@@ -2021,12 +2097,25 @@ fn active_target_path(cli: &Cli) -> PathBuf {
     let dir = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    dir.join(format!("gha-runner-ctl-active-{}.txt", cli.container))
+    let user_suffix = current_username();
+    dir.join(format!(
+        "gha-runner-ctl-active-{}-{}.txt",
+        cli.container, user_suffix
+    ))
 }
 
 fn set_active_target(cli: &Cli, repo: &str) {
     let p = active_target_path(cli);
-    let _ = fs::write(&p, repo);
+    let mut opts = OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    if let Ok(mut f) = opts.open(&p) {
+        let _ = f.write_all(repo.as_bytes());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -2301,7 +2390,8 @@ fn repos_round_robin_state_path(container: &str) -> PathBuf {
             }
         })
         .collect();
-    dir.join(format!("gha-runner-ctl-rr-{safe}.txt"))
+    let user_suffix = current_username();
+    dir.join(format!("gha-runner-ctl-rr-{safe}-{user_suffix}.txt"))
 }
 
 /// Subset of allowlisted repos for this demand tick (`repos_per_tick`; 0 = all).
@@ -2927,14 +3017,19 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 /// The secret token bytes themselves are **never** lowercased before compare — mixed-case
 /// `GHA_WAKE_TOKEN` values must still authenticate.
 pub fn wake_request_line_authorized(line: &str, token: &str) -> bool {
-    // ASCII-only prefix; byte length equals character length.
-    const BEARER_PREFIX: &str = "authorization: bearer ";
+    // Both header types (Authorization: Bearer and X-Wake-Token) are checked case-insensitively.
+    // However, the secret token values themselves are compared exactly preserving casing.
     let lower = line.to_ascii_lowercase();
-    if lower.starts_with(BEARER_PREFIX) {
+    const BEARER_PREFIX: &str = "authorization: bearer ";
+    if lower.starts_with(BEARER_PREFIX) && line.len() >= BEARER_PREFIX.len() {
+        // Find the boundary in the original line using the lowercase prefix length to preserve token's case.
         let rest = &line[BEARER_PREFIX.len()..];
         return constant_time_eq(rest.trim(), token);
     }
-    if let Some(rest) = line.strip_prefix("X-Wake-Token:") {
+
+    const WAKE_TOKEN_PREFIX: &str = "x-wake-token:";
+    if lower.starts_with(WAKE_TOKEN_PREFIX) && line.len() >= WAKE_TOKEN_PREFIX.len() {
+        let rest = &line[WAKE_TOKEN_PREFIX.len()..];
         return constant_time_eq(rest.trim(), token);
     }
     false
@@ -2954,6 +3049,9 @@ fn wake_server(port: u16, snap: CliSnap, token: String) {
     };
     for stream in listener.incoming().flatten() {
         let mut s = stream;
+        let timeout = Some(Duration::from_secs(5));
+        let _ = s.set_read_timeout(timeout);
+        let _ = s.set_write_timeout(timeout);
         let mut buf = [0_u8; 2048];
         let n = s.read(&mut buf).unwrap_or(0);
         let req = String::from_utf8_lossy(&buf[..n]);
