@@ -22,7 +22,7 @@ const DEFAULT_CONTAINER: &str = "gha-runner-ctl";
 const DEFAULT_VOLUME: &str = "gha-runner-ctl-data";
 const DEFAULT_LABELS: &str = "self-hosted,linux,x64,podman";
 const DEFAULT_NAME: &str = "shared-podman-1";
-const UA: &str = "gha-runner-ctl/0.2.2";
+const UA: &str = "gha-runner-ctl/0.2.3";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 const MIN_POLL_SECS: u64 = 5;
 const MAX_POLL_SECS: u64 = 3600;
@@ -93,6 +93,11 @@ pub struct Cli {
 
     #[arg(long, env = "GHA_MEMORY", default_value = "8g", global = true)]
     memory: String,
+
+    /// Attach WSL/host GPU into the runner container (Podman --gpus + /dev/dxg).
+    /// Pair with a `gpu` runner label so only GPU jobs schedule here.
+    #[arg(long, env = "GHA_GPU", default_value_t = false, global = true)]
+    gpu: bool,
 
     #[arg(long, env = "GHA_BUILD_DIR", global = true)]
     build_dir: Option<PathBuf>,
@@ -213,7 +218,7 @@ pub fn run() -> Result<(), String> {
             skip_host_update,
         } => prepare(&cli, with_container, skip_host_update),
         Cmd::Up => {
-            let _lock = InstanceLock::acquire("up")?;
+            let _lock = InstanceLock::acquire("up", &cli.container)?;
             up(&cli)
         }
         Cmd::Down { rm } => down(&cli, rm),
@@ -229,7 +234,7 @@ pub fn run() -> Result<(), String> {
         } => {
             let interval = interval.clamp(MIN_POLL_SECS, MAX_POLL_SECS);
             let idle_secs = idle_secs.clamp(MIN_IDLE_SECS, MAX_IDLE_SECS);
-            let _lock = InstanceLock::acquire("listen")?;
+            let _lock = InstanceLock::acquire("listen", &cli.container)?;
             listen(&cli, interval, idle_secs, wake_port)
         }
     }
@@ -611,18 +616,30 @@ fn registration_api(cli: &Cli) -> String {
     }
 }
 
-// --- Single-instance lock ----------------------------------------------------
+// --- Per-container instance lock (allows multi-runner horizontal scale) ------
 
 struct InstanceLock {
     path: PathBuf,
 }
 
 impl InstanceLock {
-    fn acquire(kind: &str) -> Result<Self, String> {
+    /// `kind` is `up` / `listen`; `container` namespaces the lock so multiple
+    /// controller processes can run (cpu vs gpu instances).
+    fn acquire(kind: &str, container: &str) -> Result<Self, String> {
         let dir = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
-        let path = dir.join(format!("gha-runner-ctl-{kind}.lock"));
+        let safe: String = container
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let path = dir.join(format!("gha-runner-ctl-{kind}-{safe}.lock"));
         for attempt in 0..2 {
             match OpenOptions::new().write(true).create_new(true).open(&path) {
                 Ok(mut f) => {
@@ -640,7 +657,7 @@ impl InstanceLock {
                         continue;
                     }
                     return Err(format!(
-                        "another gha-runner-ctl {kind} is already running (lock {})",
+                        "another gha-runner-ctl {kind} for container '{container}' is already running (lock {})",
                         path.display()
                     ));
                 }
@@ -1291,7 +1308,7 @@ fn up(cli: &Cli) -> Result<(), String> {
     let eph_kv = format!("RUNNER_EPHEMERAL={eph}");
     let ret_kv = format!("RUNNER_RETAIN={ret}");
 
-    let args = [
+    let mut args: Vec<&str> = vec![
         "run",
         "-d",
         "--name",
@@ -1318,8 +1335,21 @@ fn up(cli: &Cli) -> Result<(), String> {
         ret_kv.as_str(),
         "-v",
         vol.as_str(),
-        cli.image.as_str(),
     ];
+    // WSL2 GPU: nvidia toolkit + /dev/dxg + host WSL lib mount (verified on this host).
+    if cli.gpu {
+        args.extend_from_slice(&[
+            "--gpus",
+            "all",
+            "--device",
+            "/dev/dxg",
+            "-e",
+            "LD_LIBRARY_PATH=/usr/lib/wsl/lib",
+            "-v",
+            "/usr/lib/wsl:/usr/lib/wsl:ro",
+        ]);
+    }
+    args.push(cli.image.as_str());
     let result = podman(&args);
     shred_env_file(&env_path);
     result?;
@@ -1691,6 +1721,7 @@ impl Cli {
             labels: self.labels.clone(),
             cpus: self.cpus.clone(),
             memory: self.memory.clone(),
+            gpu: self.gpu,
             build_dir: self.build_dir.clone(),
             mode: self.mode.clone(),
             wake_token: self.wake_token.clone(),
@@ -1716,6 +1747,7 @@ struct CliSnap {
     labels: String,
     cpus: String,
     memory: String,
+    gpu: bool,
     mode: Mode,
     wake_token: Option<String>,
     full_auto: bool,
@@ -1739,6 +1771,7 @@ fn cli_snapshot(cli: &Cli) -> CliSnap {
         labels: cli.labels.clone(),
         cpus: cli.cpus.clone(),
         memory: cli.memory.clone(),
+        gpu: cli.gpu,
         mode: cli.mode.clone(),
         wake_token: cli.wake_token.clone(),
         full_auto: cli.full_auto,
@@ -1764,6 +1797,7 @@ fn snap_to_cli(s: &CliSnap) -> Cli {
         labels: s.labels.clone(),
         cpus: s.cpus.clone(),
         memory: s.memory.clone(),
+        gpu: s.gpu,
         build_dir: None,
         mode: s.mode.clone(),
         wake_token: s.wake_token.clone(),

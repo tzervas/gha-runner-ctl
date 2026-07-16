@@ -63,3 +63,19 @@ gha-runner-ctl --scope repo --auto listen --interval 30 --idle-secs 180
 - [ ] `prepare` completed (image + volume present)
 - [ ] `listen` running for intended scope (`repo` / `user` / `org`)
 - [ ] Consumer workflows use labels `self-hosted,linux,x64,podman` (or your custom set)
+
+## Multi-instance (CPU + GPU) on WSL
+
+Locks are **per `--container`**, so two `listen` processes can run:
+
+| Instance | Labels | Resources | GPU |
+|----------|--------|-----------|-----|
+| cpu | `self-hosted,linux,x64,podman` | 4 CPU / 4g | no |
+| gpu | `self-hosted,linux,x64,podman,gpu` | 4 CPU / 4g | `--gpu` |
+
+Canonical host layout: `~/.local/share/gha-runner-ctl/` + `systemctl --user start gha-runner-ctl@cpu gha-runner-ctl@gpu`.
+
+```bash
+# GPU jobs only
+runs-on: [self-hosted, linux, x64, podman, gpu]
+```

@@ -8,7 +8,7 @@ on:
 jobs:
   build:
     # Prefer the shared self-hosted runner when available; otherwise GitHub-hosted.
-    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && fromJSON('["self-hosted","linux","x64","podman"]') || 'ubuntu-latest' }}
+    runs-on: [self-hosted, linux, x64, podman]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.96
