@@ -22,6 +22,22 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@1.96
 
+      - name: Ensure GitHub CLI
+        run: |
+          set -euo pipefail
+          if command -v gh >/dev/null 2>&1; then
+            gh --version
+            exit 0
+          fi
+          GH_VERSION="2.65.0"
+          gh_dir="${RUNNER_TEMP}/gh"
+          mkdir -p "${gh_dir}"
+          curl -fsSL \
+            "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" \
+            | tar -xz -C "${gh_dir}" --strip-components=1
+          echo "${gh_dir}/bin" >> "${GITHUB_PATH}"
+          "${gh_dir}/bin/gh" --version
+
       - name: Build dist tarball
         run: bash scripts/dist.sh
 
