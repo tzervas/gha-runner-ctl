@@ -184,7 +184,7 @@ dependencies = [
 
 [[package]]
 name = "gha_runner_ctl"
-version = "0.2.4"
+version = "0.2.6"
 dependencies = [
  "clap",
  "rpassword",

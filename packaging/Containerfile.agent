@@ -1,0 +1,52 @@
+# Fleet-agent micro image: long-lived control plane ONLY.
+#
+# Hardening goals:
+#   - no interactive shell, no package manager, no sudo, no root user at runtime
+#   - nonroot UID 65532
+#   - NO Podman binary and NO Podman socket
+#
+# Build: bash scripts/build-agent-image.sh
+# Style: one logical step per RUN (no && chains). Shell strip is last.
+
+FROM docker.io/library/ubuntu:24.04 AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+COPY target/release/gha-runner-ctl /usr/local/bin/gha-runner-ctl
+
+RUN apt-get update \
+      && apt-get install -y --no-install-recommends ca-certificates
+RUN rm -rf /var/lib/apt/lists/*
+RUN useradd --system --uid 65532 --gid nogroup --home-dir /home/nonroot \
+      --create-home --shell /usr/sbin/nologin nonroot
+RUN chmod 0555 /usr/local/bin/gha-runner-ctl
+RUN chown root:root /usr/local/bin/gha-runner-ctl
+RUN mkdir -p /home/nonroot
+RUN chown -R 65532:65534 /home/nonroot
+# Privilege / interactive surface removed last (subsequent RUNs need /bin/sh).
+RUN rm -f \
+      /usr/bin/sudo \
+      /usr/bin/sudoedit \
+      /bin/su \
+      /usr/bin/passwd \
+      /usr/bin/chsh \
+      /usr/bin/chfn \
+      /usr/bin/newgrp \
+      /bin/bash \
+      /bin/sh \
+      /bin/dash \
+      /usr/bin/bash \
+      /usr/bin/sh \
+      /usr/bin/dash \
+      /usr/bin/rbash
+RUN rm -rf /var/cache/apt /var/lib/apt /usr/share/doc /usr/share/man
+
+LABEL org.opencontainers.image.title="gha-runner-ctl-agent" \
+      org.opencontainers.image.description="Hardened fleet agent (no podman, no shell, no root, no sudo)" \
+      org.opencontainers.image.source="https://github.com/tzervas/gha-runner-ctl"
+
+USER 65532:65534
+WORKDIR /home/nonroot
+
+ENTRYPOINT ["/usr/local/bin/gha-runner-ctl"]
+CMD ["--help"]

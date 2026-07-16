@@ -22,12 +22,30 @@ const DEFAULT_CONTAINER: &str = "gha-runner-ctl";
 const DEFAULT_VOLUME: &str = "gha-runner-ctl-data";
 const DEFAULT_LABELS: &str = "self-hosted,linux,x64,podman";
 const DEFAULT_NAME: &str = "shared-podman-1";
-const UA: &str = "gha-runner-ctl/0.2.4";
+const UA: &str = "gha-runner-ctl/0.2.6";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 const MIN_POLL_SECS: u64 = 5;
 const MAX_POLL_SECS: u64 = 3600;
 const MIN_IDLE_SECS: u64 = 30;
 const MAX_IDLE_SECS: u64 = 86_400;
+/// Default gap between GitHub API calls within one process (ms).
+const DEFAULT_API_MIN_GAP_MS: u64 = 1000;
+/// Default cap on API GETs per demand tick (allowlist of ~3 repos fits comfortably).
+const DEFAULT_API_MAX_PER_POLL: u32 = 12;
+/// Initial backoff when rate-limited (seconds).
+const DEFAULT_API_BACKOFF_SECS: u64 = 90;
+const MAX_API_BACKOFF_SECS: u64 = 900;
+/// Default listen interval for scale-up demand polling (seconds). 2–5 min band.
+const DEFAULT_LISTEN_INTERVAL_SECS: u64 = 180;
+/// Floor for user-batch demand interval (seconds).
+const USER_BATCH_MIN_INTERVAL_SECS: u64 = 120;
+/// Default: check this many allowlisted repos per tick (round-robin stagger).
+/// 0 = all allowlisted repos each tick (still paced by min-gap).
+const DEFAULT_REPOS_PER_TICK: u32 = 1;
+/// Min seconds between registration-token POSTs (shared across processes on host).
+const DEFAULT_REG_MIN_GAP_SECS: u64 = 5;
+/// Max registration-token POSTs per rolling hour (shared host budget).
+const DEFAULT_REG_MAX_PER_HOUR: u32 = 30;
 
 #[derive(Debug, Clone, ValueEnum)]
 pub enum Mode {
@@ -48,7 +66,7 @@ pub enum Scope {
 #[derive(Debug, Parser)]
 #[command(
     name = "gha-runner-ctl",
-    about = "One hardened self-hosted GHA runner on Podman (auto / batch capable)"
+    about = "Fleet agent for self-hosted GHA on Podman: long-lived control plane, ephemeral work containers"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -124,7 +142,7 @@ pub struct Cli {
     #[arg(long, env = "GHA_WAKE_TOKEN", global = true)]
     wake_token: Option<String>,
 
-    /// Automatically prepare, poll, and register (loose 60s polling, 500s timeout)
+    /// Automatically prepare, poll, and register (gentle demand poll ~3 min; idle 500s)
     #[arg(long, env = "GHA_FULL_AUTO", default_value_t = false, global = true)]
     full_auto: bool,
 
@@ -143,6 +161,39 @@ pub struct Cli {
     /// Target both public and private repositories
     #[arg(long, env = "GHA_ALL_REPOS", default_value_t = false, global = true)]
     all_repos: bool,
+
+    /// Comma-separated `owner/repo` for user-batch demand poll.
+    /// When set, **only** these repos are polled (allowlist) — avoids burning the
+    /// GitHub API rate limit across hundreds of owned repos.
+    /// Example: `tzervas/gha-runner-ctl,tzervas/tg-agent-relay,tzervas/agent-harness`
+    #[arg(long, env = "GHA_PREFER_REPOS", global = true)]
+    prefer_repos: Option<String>,
+
+    /// Minimum milliseconds between GitHub API calls in this process (paced batching).
+    #[arg(long, env = "GHA_API_MIN_GAP_MS", default_value_t = DEFAULT_API_MIN_GAP_MS, global = true)]
+    api_min_gap_ms: u64,
+
+    /// Max GitHub API GETs per demand poll cycle (then wait for next --interval).
+    #[arg(long, env = "GHA_API_MAX_PER_POLL", default_value_t = DEFAULT_API_MAX_PER_POLL, global = true)]
+    api_max_per_poll: u32,
+
+    /// Initial backoff seconds after a rate-limit / secondary 403 (doubles up to 15m).
+    #[arg(long, env = "GHA_API_BACKOFF_SECS", default_value_t = DEFAULT_API_BACKOFF_SECS, global = true)]
+    api_backoff_secs: u64,
+
+    /// Allowlisted repos checked **per listen tick** (round-robin). `1` = stagger one
+    /// repo every interval (each of N repos ~ every N×interval). `0` = whole allowlist
+    /// each tick (still paced by `api_min_gap_ms`). Default 1.
+    #[arg(long, env = "GHA_REPOS_PER_TICK", default_value_t = DEFAULT_REPOS_PER_TICK, global = true)]
+    repos_per_tick: u32,
+
+    /// Min seconds between registration-token POSTs (host-wide file lock). Default 5.
+    #[arg(long, env = "GHA_REG_MIN_GAP_SECS", default_value_t = DEFAULT_REG_MIN_GAP_SECS, global = true)]
+    reg_min_gap_secs: u64,
+
+    /// Max registration-token POSTs per rolling hour (host-wide). Default 30.
+    #[arg(long, env = "GHA_REG_MAX_PER_HOUR", default_value_t = DEFAULT_REG_MAX_PER_HOUR, global = true)]
+    reg_max_per_hour: u32,
 }
 
 #[derive(Debug, Subcommand, Clone)]
@@ -165,14 +216,177 @@ pub enum Cmd {
     /// Print resolved registration target (repo/org/user batch) without starting
     Detect,
     /// Poll for demand; up/down. With scope=user, re-targets registration per repo.
+    /// Prefer retain + warm for steady state (GitHub pushes jobs; little API needed).
     Listen {
-        #[arg(long, default_value_t = 30)]
+        #[arg(long, default_value_t = DEFAULT_LISTEN_INTERVAL_SECS)]
         interval: u64,
         #[arg(long, default_value_t = 180)]
         idle_secs: u64,
         #[arg(long, env = "GHA_WAKE_PORT")]
         wake_port: Option<u16>,
     },
+    /// Gently batch-register **retain** runners for `GHA_PREFER_REPOS` (or one --repo).
+    /// One container/volume/name per repo; paced registration-token POSTs.
+    /// After warm, runners stay online and GitHub **pushes** jobs (no demand storm).
+    Warm {
+        /// Seconds between registration-token mints (default: max of reg_min_gap and 8).
+        #[arg(long, default_value_t = 8)]
+        gap_secs: u64,
+        /// If true, also start containers after register (default true).
+        #[arg(long, default_value_t = true)]
+        start: bool,
+    },
+}
+
+/// Dump troubleshooting context after a failure (no secrets).
+///
+/// Enabled when `GHA_DEBUG=1` or `GHA_DEBUG_ON_ERR` is unset/`1` (default on).
+/// Disable with `GHA_DEBUG_ON_ERR=0` once the stack is stable.
+pub fn debug_dump_on_error(err: &str) {
+    let always = env_truthy("GHA_DEBUG");
+    let on_err = match std::env::var("GHA_DEBUG_ON_ERR") {
+        Ok(v) => matches!(v.as_str(), "1" | "true" | "yes" | "YES" | ""),
+        // Default ON while stabilizing the fleet agent / rootless path.
+        Err(_) => true,
+    };
+    if !always && !on_err {
+        return;
+    }
+    eprintln!("========== gha-runner-ctl DEBUG ON ERROR ==========");
+    eprintln!("error:      {err}");
+    eprintln!(
+        "user:       {} euid_root={}",
+        std::env::var("USER").unwrap_or_else(|_| "?".into()),
+        effective_uid_is_root()
+    );
+    if let Ok(cwd) = std::env::current_dir() {
+        eprintln!("pwd:        {}", cwd.display());
+    }
+    for key in [
+        "HOME",
+        "XDG_RUNTIME_DIR",
+        "CONTAINER_HOST",
+        "GHA_ALLOW_ROOT",
+        "GHA_SCOPE",
+        "GHA_USER",
+        "GHA_REPO",
+        "GHA_PREFER_REPOS",
+        "GHA_MODE",
+        "GHA_CONTAINER",
+        "GHA_VOLUME",
+        "GHA_IMAGE",
+        "GHA_GPU",
+    ] {
+        if let Ok(v) = std::env::var(key) {
+            // Never dump tokens.
+            if key.contains("TOKEN") || key.contains("SECRET") {
+                continue;
+            }
+            eprintln!("{key}={v}");
+        }
+    }
+    // Best-effort podman snapshot (stdout/stderr redacted).
+    match Command::new("podman")
+        .args([
+            "info",
+            "--format",
+            "rootless={{.Host.Security.Rootless}} runtime={{.Host.OCIRuntime.Name}}",
+        ])
+        .output()
+    {
+        Ok(o) => {
+            let s = String::from_utf8_lossy(&o.stdout);
+            let e = String::from_utf8_lossy(&o.stderr);
+            if !s.trim().is_empty() {
+                eprintln!("podman:     {}", redact(s.trim()));
+            }
+            if !o.status.success() && !e.trim().is_empty() {
+                eprintln!("podman_err: {}", redact(e.trim()));
+            }
+        }
+        Err(e) => eprintln!("podman:     not runnable ({e})"),
+    }
+    if let Ok(o) = Command::new("podman")
+        .args([
+            "ps",
+            "-a",
+            "--format",
+            "{{.Names}}\t{{.Status}}\t{{.Image}}",
+        ])
+        .output()
+    {
+        let s = String::from_utf8_lossy(&o.stdout);
+        for (i, line) in s.lines().take(15).enumerate() {
+            if i == 0 {
+                eprintln!("--- podman ps -a (max 15) ---");
+            }
+            eprintln!("{}", redact(line));
+        }
+    }
+    eprintln!("hint:       GHA_DEBUG=1 for more; GHA_DEBUG_ON_ERR=0 to silence");
+    eprintln!("===================================================");
+}
+
+fn env_truthy(key: &str) -> bool {
+    std::env::var(key)
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+/// Fleet agent must not run as root in production.
+///
+/// WSL / ephemeral dev containers often start as root — set `GHA_ALLOW_ROOT=1` only
+/// for bootstrap there. Production path: dedicated `gha-agent` user + rootless Podman
+/// (`scripts/setup-rootless.sh`). No sudoer, shell=nologin.
+pub fn refuse_root_unless_allowed() {
+    if !effective_uid_is_root() {
+        return;
+    }
+    let allow = std::env::var("GHA_ALLOW_ROOT")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "YES"))
+        .unwrap_or(false);
+    if allow {
+        eprintln!(
+            "gha-runner-ctl: WARNING running as root (GHA_ALLOW_ROOT set) — \
+             use only in ephemeral WSL/dev bootstrap; production = gha-agent + rootless"
+        );
+        return;
+    }
+    eprintln!(
+        "gha-runner-ctl ERROR: refusing to run as root.\n\
+         Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.\n\
+         Bootstrap once:  sudo bash scripts/setup-rootless.sh\n\
+         Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …\n\
+         Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …"
+    );
+    std::process::exit(78); // EX_CONFIG
+}
+
+/// Effective UID without `unsafe` (crate forbids unsafe_code). Parses `/proc/self/status`.
+fn effective_uid_is_root() -> bool {
+    #[cfg(unix)]
+    {
+        if let Ok(s) = fs::read_to_string("/proc/self/status") {
+            for line in s.lines() {
+                // Uid: real effective saved fs
+                if let Some(rest) = line.strip_prefix("Uid:") {
+                    let mut parts = rest.split_whitespace();
+                    let _real = parts.next();
+                    if let Some(euid) = parts.next() {
+                        return euid == "0";
+                    }
+                }
+            }
+            // Parsed status but no Uid line — fail-closed (treat as root).
+            return true;
+        }
+        // Unreadable /proc — fail-closed: refuse unless GHA_ALLOW_ROOT.
+        true
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 /// Checks for raw token patterns in CLI arguments. If found, prints an error message and exits.
@@ -216,7 +430,7 @@ pub fn run() -> Result<(), String> {
             if cli.full_auto {
                 eprintln!("full-auto: initiating automated listener/handler...");
                 Cmd::Listen {
-                    interval: 60,
+                    interval: DEFAULT_LISTEN_INTERVAL_SECS,
                     idle_secs: 500,
                     wake_port: None,
                 }
@@ -253,6 +467,7 @@ pub fn run() -> Result<(), String> {
             let _lock = InstanceLock::acquire("listen", &cli.container)?;
             listen(&cli, interval, idle_secs, wake_port)
         }
+        Cmd::Warm { gap_secs, start } => warm(&cli, gap_secs, start),
     }
 }
 
@@ -534,14 +749,24 @@ pub fn redact(s: &str) -> String {
 fn validate_cli(cli: &Cli) -> Result<(), String> {
     match cli.scope {
         Scope::Repo => {
-            let Some(repo) = cli.repo.as_ref() else {
-                return Err(
-                    "repo scope requires --repo owner/name, GHA_REPO, or --auto in a git checkout"
-                        .into(),
-                );
-            };
-            if !is_safe_repo(repo) {
-                return Err("invalid --repo".into());
+            if cli.repo.is_none() {
+                // `warm` uses prefer_repos only (no single --repo).
+                if cli
+                    .prefer_repos
+                    .as_ref()
+                    .is_some_and(|p| !p.trim().is_empty())
+                {
+                    // ok
+                } else {
+                    return Err(
+                        "repo scope requires --repo owner/name, GHA_REPO, --auto, or --prefer-repos for warm"
+                            .into(),
+                    );
+                }
+            } else if let Some(repo) = &cli.repo {
+                if !is_safe_repo(repo) {
+                    return Err("invalid --repo".into());
+                }
             }
         }
         Scope::Org => {
@@ -559,11 +784,21 @@ fn validate_cli(cli: &Cli) -> Result<(), String> {
             if !is_safe_ident(user) {
                 return Err("invalid --user".into());
             }
+            // retain + user is OK only for a sticky single-repo unit (prefer one entry
+            // or explicit --repo). Multi-repo user-batch still needs ephemeral re-target.
             if matches!(cli.mode, Mode::Retain) {
-                return Err(
-                    "scope=user requires --mode ephemeral (re-register per repo; retain is single-target)"
-                        .into(),
-                );
+                let multi = cli
+                    .prefer_repos
+                    .as_ref()
+                    .map(|p| p.split(',').filter(|x| !x.trim().is_empty()).count() > 1)
+                    .unwrap_or(true);
+                if multi && cli.repo.is_none() {
+                    return Err(
+                        "scope=user + retain needs a single sticky --repo (or one-entry GHA_PREFER_REPOS). \
+                         For multi-repo: use `warm` (one retain runner per allowlist repo) or ephemeral user-batch."
+                            .into(),
+                    );
+                }
             }
         }
     }
@@ -1015,24 +1250,384 @@ fn http_agent() -> ureq::Agent {
         .build()
 }
 
+/// Paces GitHub API calls: min gap, per-poll budget, honor rate-limit headers / backoff.
+struct ApiPacer {
+    min_gap: Duration,
+    max_per_poll: u32,
+    calls_this_poll: u32,
+    last_call: Option<Instant>,
+    backoff: Duration,
+    max_backoff: Duration,
+    /// When set, skip further API until this instant (rate-limit cool-down).
+    cool_until: Option<Instant>,
+}
+
+impl ApiPacer {
+    fn from_cli(cli: &Cli) -> Self {
+        let gap_ms = cli.api_min_gap_ms.clamp(50, 60_000);
+        let max_per = cli.api_max_per_poll.clamp(2, 500);
+        let backoff = Duration::from_secs(cli.api_backoff_secs.clamp(5, MAX_API_BACKOFF_SECS));
+        Self {
+            min_gap: Duration::from_millis(gap_ms),
+            max_per_poll: max_per,
+            calls_this_poll: 0,
+            last_call: None,
+            backoff,
+            max_backoff: Duration::from_secs(MAX_API_BACKOFF_SECS),
+            cool_until: None,
+        }
+    }
+
+    fn begin_poll(&mut self) {
+        self.calls_this_poll = 0;
+    }
+
+    fn cooling(&self) -> Option<Duration> {
+        self.cool_until.and_then(|u| {
+            let now = Instant::now();
+            if u > now {
+                Some(u.saturating_duration_since(now))
+            } else {
+                None
+            }
+        })
+    }
+
+    fn wait_turn(&mut self) -> Result<(), String> {
+        if let Some(wait) = self.cooling() {
+            eprintln!(
+                "api: cooling {}s (rate-limit / secondary limit)",
+                wait.as_secs().max(1)
+            );
+            thread::sleep(wait);
+            self.cool_until = None;
+        }
+        if self.calls_this_poll >= self.max_per_poll {
+            return Err(format!(
+                "api: per-poll budget exhausted ({}/{}) — wait for next listen interval",
+                self.calls_this_poll, self.max_per_poll
+            ));
+        }
+        if let Some(last) = self.last_call {
+            let elapsed = last.elapsed();
+            if elapsed < self.min_gap {
+                thread::sleep(self.min_gap - elapsed);
+            }
+        }
+        self.last_call = Some(Instant::now());
+        self.calls_this_poll += 1;
+        Ok(())
+    }
+
+    fn note_success(&mut self, remaining: Option<u32>, reset_unix: Option<u64>) {
+        // Soft throttle when primary quota is low (still leave headroom).
+        if let Some(rem) = remaining {
+            if rem < 30 {
+                if let Some(reset) = reset_unix {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let wait = reset.saturating_sub(now).clamp(5, MAX_API_BACKOFF_SECS);
+                    eprintln!("api: X-RateLimit-Remaining={rem} — cool {wait}s until reset");
+                    self.cool_until = Some(Instant::now() + Duration::from_secs(wait));
+                    self.backoff = (self.backoff * 2).min(self.max_backoff);
+                } else {
+                    self.cool_until = Some(Instant::now() + self.backoff);
+                    self.backoff = (self.backoff * 2).min(self.max_backoff);
+                }
+            } else if rem > 200 {
+                // Recover toward configured minimum after healthy period.
+                // (keep at least min_gap-driven pacing)
+            }
+        }
+    }
+
+    fn note_rate_limited(&mut self, retry_after: Option<u64>, reset_unix: Option<u64>) {
+        let mut secs = self.backoff.as_secs();
+        if let Some(ra) = retry_after {
+            secs = secs.max(ra).min(MAX_API_BACKOFF_SECS);
+        } else if let Some(reset) = reset_unix {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            secs = secs
+                .max(reset.saturating_sub(now))
+                .min(MAX_API_BACKOFF_SECS);
+        }
+        secs = secs.max(5);
+        eprintln!("api: rate-limited — backing off {secs}s (then resume paced calls)");
+        self.cool_until = Some(Instant::now() + Duration::from_secs(secs));
+        self.backoff = (self.backoff * 2).min(self.max_backoff);
+    }
+
+    fn get(&mut self, url: &str, api: &str) -> Result<ureq::Response, String> {
+        self.wait_turn()?;
+        let result = http_agent()
+            .get(url)
+            .set("Authorization", &format!("Bearer {api}"))
+            .set("Accept", "application/vnd.github+json")
+            .set("X-GitHub-Api-Version", "2022-11-28")
+            .call();
+        match result {
+            Ok(resp) => {
+                let remaining: Option<u32> = resp
+                    .header("x-ratelimit-remaining")
+                    .and_then(|s| s.parse().ok());
+                let reset: Option<u64> = resp
+                    .header("x-ratelimit-reset")
+                    .and_then(|s| s.parse().ok());
+                let retry_after: Option<u64> =
+                    resp.header("retry-after").and_then(|s| s.parse().ok());
+                let status = resp.status();
+                if status == 429 {
+                    self.note_rate_limited(retry_after, reset);
+                    return Err(format!("status code {status} (rate limited)"));
+                }
+                if status == 403 {
+                    let body_snip = resp.into_string().unwrap_or_default();
+                    let body_ref = if body_snip.is_empty() {
+                        None
+                    } else {
+                        Some(body_snip.as_str())
+                    };
+                    if api_status_is_hard_rate_limit(status, remaining, body_ref) {
+                        self.note_rate_limited(retry_after, reset);
+                        return Err(format!("status code {status} (rate limited)"));
+                    }
+                    return Err(format!("status code {status}"));
+                }
+                if status == 401 || status == 404 {
+                    return Err(format!("status code {status}"));
+                }
+                if !(200..300).contains(&status) {
+                    return Err(format!("status code {status}"));
+                }
+                self.note_success(remaining, reset);
+                Ok(resp)
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                let remaining: Option<u32> = resp
+                    .header("x-ratelimit-remaining")
+                    .and_then(|s| s.parse().ok());
+                let reset: Option<u64> = resp
+                    .header("x-ratelimit-reset")
+                    .and_then(|s| s.parse().ok());
+                let retry_after: Option<u64> =
+                    resp.header("retry-after").and_then(|s| s.parse().ok());
+                let body_snip = resp.into_string().unwrap_or_default();
+                let body_ref = if body_snip.is_empty() {
+                    None
+                } else {
+                    Some(body_snip.as_str())
+                };
+                if code == 429
+                    || (code == 403 && api_status_is_hard_rate_limit(code, remaining, body_ref))
+                {
+                    self.note_rate_limited(retry_after, reset);
+                    return Err(format!("status code {code} (rate limited)"));
+                }
+                Err(format!("status code {code}"))
+            }
+            Err(e) => Err(redact(&e.to_string())),
+        }
+    }
+}
+
+/// True when GitHub indicates a hard API rate limit (not a soft permission 403).
+fn api_status_is_hard_rate_limit(status: u16, remaining: Option<u32>, body: Option<&str>) -> bool {
+    if status == 429 {
+        return true;
+    }
+    if status != 403 {
+        return false;
+    }
+    if remaining == Some(0) {
+        return true;
+    }
+    if let Some(b) = body {
+        let lower = b.to_ascii_lowercase();
+        if lower.contains("secondary rate limit") || lower.contains("secondary_rate_limit") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Host-wide registration pacing (shared by all gha-runner-ctl processes).
+fn reg_pace_paths() -> (PathBuf, PathBuf) {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    (
+        dir.join("gha-runner-ctl-reg-pace.lock"),
+        dir.join("gha-runner-ctl-reg-pace.json"),
+    )
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct RegPaceState {
+    /// Unix seconds of last successful registration-token POST.
+    last_unix: u64,
+    /// Successful POST timestamps in the last hour (unix secs).
+    recent: Vec<u64>,
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Wait for host-wide registration budget (min gap + max per hour).
+fn pace_registration(cli: &Cli) -> Result<(), String> {
+    let (lock_path, state_path) = reg_pace_paths();
+    let min_gap = cli.reg_min_gap_secs.clamp(1, 600);
+    let max_hour = cli.reg_max_per_hour.clamp(1, 500);
+    // Spin gently: registration is rare if retain; ephemeral must not stampede.
+    for attempt in 0..120 {
+        let _ = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path);
+        // Best-effort exclusive via create_new retry on companion lock.
+        let exclusive = lock_path.with_extension("exclusive");
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&exclusive)
+        {
+            Ok(mut f) => {
+                let _ = writeln!(f, "{}", std::process::id());
+                let mut state: RegPaceState = fs::read_to_string(&state_path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default();
+                let now = now_unix();
+                state.recent.retain(|t| now.saturating_sub(*t) < 3600);
+                if state.recent.len() as u32 >= max_hour {
+                    let _ = fs::remove_file(&exclusive);
+                    let wait = 30u64;
+                    eprintln!(
+                        "register: host budget {max_hour}/hour reached — wait {wait}s (attempt {attempt})"
+                    );
+                    thread::sleep(Duration::from_secs(wait));
+                    continue;
+                }
+                if state.last_unix > 0 {
+                    let elapsed = now.saturating_sub(state.last_unix);
+                    if elapsed < min_gap {
+                        let wait = min_gap - elapsed;
+                        let _ = fs::remove_file(&exclusive);
+                        eprintln!("register: pacing {wait}s before next registration-token POST");
+                        thread::sleep(Duration::from_secs(wait));
+                        continue;
+                    }
+                }
+                // Budget enforced here; slot committed only after successful token mint.
+                let _ = fs::remove_file(&exclusive);
+                return Ok(());
+            }
+            Err(_) => {
+                thread::sleep(Duration::from_millis(200 + (attempt as u64 % 5) * 100));
+            }
+        }
+    }
+    Err("register: could not acquire registration pace lock".into())
+}
+
+/// Record a successful registration-token mint in the host-wide hourly budget.
+fn commit_registration_slot() {
+    let (lock_path, state_path) = reg_pace_paths();
+    let exclusive = lock_path.with_extension("exclusive");
+    if OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&exclusive)
+        .is_ok()
+    {
+        let mut state: RegPaceState = fs::read_to_string(&state_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        let now = now_unix();
+        state.recent.retain(|t| now.saturating_sub(*t) < 3600);
+        state.last_unix = now;
+        state.recent.push(now);
+        if let Ok(s) = serde_json::to_string(&state) {
+            let _ = fs::write(&state_path, s);
+        }
+        let _ = fs::remove_file(&exclusive);
+    }
+}
+
+fn note_registration_failure_backoff(secs: u64) {
+    let (lock_path, state_path) = reg_pace_paths();
+    let exclusive = lock_path.with_extension("exclusive");
+    if OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&exclusive)
+        .is_ok()
+    {
+        let mut state: RegPaceState = fs::read_to_string(&state_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        // Push last_unix forward to force min gap = backoff.
+        state.last_unix = now_unix().saturating_add(secs.saturating_sub(1));
+        if let Ok(s) = serde_json::to_string(&state) {
+            let _ = fs::write(&state_path, s);
+        }
+        let _ = fs::remove_file(&exclusive);
+    }
+    eprintln!("register: backing off {secs}s after failed registration-token POST");
+    thread::sleep(Duration::from_secs(secs));
+}
+
 fn registration_token(cli: &Cli, api_token: &str) -> Result<String, String> {
+    pace_registration(cli)?;
     let url = registration_api(cli);
     let resp = http_agent()
         .post(&url)
         .set("Authorization", &format!("Bearer {api_token}"))
         .set("Accept", "application/vnd.github+json")
         .set("X-GitHub-Api-Version", "2022-11-28")
-        .call()
-        .map_err(|e| {
-            format!(
+        .call();
+    let resp = match resp {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, r)) => {
+            if code == 403 || code == 429 {
+                let retry: u64 = r
+                    .header("retry-after")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(cli.api_backoff_secs.max(60));
+                note_registration_failure_backoff(retry.min(MAX_API_BACKOFF_SECS));
+            }
+            return Err(format!("registration-token request failed: HTTP {code}"));
+        }
+        Err(e) => {
+            return Err(format!(
                 "registration-token request failed: {}",
                 redact(&e.to_string())
-            )
-        })?;
-    if !(200..300).contains(&resp.status()) {
+            ));
+        }
+    };
+    let status = resp.status();
+    if status == 403 || status == 429 {
+        let retry: u64 = resp
+            .header("retry-after")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(cli.api_backoff_secs.max(60));
+        note_registration_failure_backoff(retry.min(MAX_API_BACKOFF_SECS));
+        return Err(format!("registration-token HTTP {status} (rate limited)"));
+    }
+    if !(200..300).contains(&status) {
         return Err(format!(
-            "registration-token HTTP {} (admin rights on target?)",
-            resp.status()
+            "registration-token HTTP {status} (admin rights on target?)"
         ));
     }
     let body: RegistrationTokenResponse = resp
@@ -1041,12 +1636,63 @@ fn registration_token(cli: &Cli, api_token: &str) -> Result<String, String> {
     if body.token.is_empty() || body.token.len() > 512 {
         return Err("registration token empty or implausible length".into());
     }
+    commit_registration_slot();
+    eprintln!(
+        "register: minted registration-token for {}",
+        github_url(cli)
+    );
     Ok(body.token)
+}
+
+/// Ephemeral only when we must re-bind to a different repo (user multi-target).
+/// Retain keeps the runner online so GitHub pushes jobs without new tokens.
+fn effective_ephemeral(cli: &Cli) -> bool {
+    if matches!(cli.mode, Mode::Retain) {
+        return false;
+    }
+    if matches!(cli.scope, Scope::User) {
+        // Forced re-target path: ephemeral so config.sh rebinds cleanly.
+        return true;
+    }
+    matches!(cli.mode, Mode::Ephemeral)
 }
 
 // --- Podman ------------------------------------------------------------------
 
+/// Refuse rootful system sockets and remote daemons unless explicitly allowed.
+/// Rootless `unix:///run/user/…/podman.sock` (or path containing both) is permitted.
+fn refuse_container_host_misconfig() -> Option<String> {
+    let host = std::env::var("CONTAINER_HOST").ok()?;
+    let allow = std::env::var("GHA_ALLOW_ROOTFUL_SOCKET")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "YES"))
+        .unwrap_or(false);
+    if allow {
+        return None;
+    }
+    let rootless_podman = host.contains("/run/user/") && host.contains("podman.sock");
+    if rootless_podman {
+        return None;
+    }
+    let risky = host.contains("docker.sock")
+        || host.contains("podman.sock")
+        || host.starts_with("tcp://")
+        || host.starts_with("unix://");
+    if risky {
+        return Some(
+            "refusing CONTAINER_HOST (system/remote podman or docker socket). \
+             Use rootless socket under /run/user/…/podman.sock, or set GHA_ALLOW_ROOTFUL_SOCKET=1 only if intentional."
+                .into(),
+        );
+    }
+    None
+}
+
 fn podman(args: &[&str]) -> Result<String, String> {
+    // Never point work-plane ops at a rootful / remote socket from an agent process
+    // that was expected to be rootless (misconfiguration guard).
+    if let Some(msg) = refuse_container_host_misconfig() {
+        return Err(msg);
+    }
     let out = Command::new("podman")
         .args(args)
         .output()
@@ -1158,6 +1804,84 @@ fn update_host_packages() -> Result<(), String> {
 }
 
 #[allow(clippy::needless_pass_by_value)]
+/// Paced batch warm: one retain runner per allowlisted repo (or single --repo).
+/// After this, GitHub pushes jobs to online runners — no demand registration storm.
+fn warm(cli: &Cli, gap_secs: u64, start: bool) -> Result<(), String> {
+    let repos: Vec<String> = if let Some(pref) = cli.prefer_repos.as_ref() {
+        pref.split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect()
+    } else if let Some(r) = cli.repo.as_ref() {
+        vec![r.clone()]
+    } else {
+        return Err(
+            "warm requires --prefer-repos a/b,c/d or --scope repo --repo owner/name".into(),
+        );
+    };
+    if repos.is_empty() {
+        return Err("warm: empty repo list".into());
+    }
+    let gap = gap_secs.max(cli.reg_min_gap_secs).max(3);
+    eprintln!(
+        "warm: {} repo(s), gap={gap}s, start={start}, mode=retain (GitHub will push jobs once online)",
+        repos.len()
+    );
+    for (i, repo) in repos.iter().enumerate() {
+        if !is_safe_repo(repo) {
+            eprintln!("warm: skip invalid repo {repo}");
+            continue;
+        }
+        let slug = repo.replace('/', "-");
+        let mut unit = cli.clone_for_listen();
+        unit.scope = Scope::Repo;
+        unit.repo = Some(repo.clone());
+        unit.mode = Mode::Retain;
+        unit.container = format!("{}-{}", cli.container, slug);
+        unit.volume = format!("{}-{}", cli.volume, slug);
+        unit.runner_name = format!("{}-{}", cli.runner_name, slug);
+        // Safe truncate names
+        if unit.container.len() > 60 {
+            unit.container = unit.container.chars().take(60).collect();
+        }
+        if unit.runner_name.len() > 60 {
+            unit.runner_name = unit.runner_name.chars().take(60).collect();
+        }
+        eprintln!(
+            "warm: [{}/{}] {} → container={} runner={}",
+            i + 1,
+            repos.len(),
+            repo,
+            unit.container,
+            unit.runner_name
+        );
+        if !volume_exists(&unit.volume) {
+            eprintln!("warm: preparing volume {}", unit.volume);
+            prepare(&unit, true, true)?;
+        }
+        if start {
+            if let Err(e) = up(&unit) {
+                eprintln!("warm: up failed for {repo}: {}", redact(&e));
+            }
+        } else {
+            // Mint token only to prove registration rights (still paced); do not start.
+            let api = github_token()?;
+            match registration_token(&unit, &api) {
+                Ok(_) => eprintln!("warm: token mint OK for {repo} (not starting)"),
+                Err(e) => eprintln!("warm: token mint failed for {repo}: {}", redact(&e)),
+            }
+        }
+        if i + 1 < repos.len() {
+            eprintln!("warm: waiting {gap}s before next registration…");
+            thread::sleep(Duration::from_secs(gap));
+        }
+    }
+    eprintln!(
+        "warm: done — online retain runners receive jobs via GitHub push (no poll for assign)"
+    );
+    Ok(())
+}
+
 fn prepare(cli: &Cli, with_container: bool, skip_host_update: bool) -> Result<(), String> {
     // Host refresh first so build tools / podman stack are current before we snapshot.
     if !skip_host_update {
@@ -1231,8 +1955,36 @@ fn private_env_path() -> PathBuf {
     dir.join(format!("gha-runner-ctl-{}.env", std::process::id()))
 }
 
+fn volume_has_runner_config(cli: &Cli) -> bool {
+    // Heuristic: volume was used before; entrypoint will detect .runner.
+    // We cannot inspect volume contents without a container; prefer retain path
+    // and let entrypoint skip config when .runner exists.
+    // Marker file on host tracks last successful retain target.
+    let marker = reg_pace_paths()
+        .0
+        .parent()
+        .unwrap_or(Path::new("/tmp"))
+        .join(format!("gha-runner-ctl-retain-{}.ok", cli.container));
+    if !marker.is_file() {
+        return false;
+    }
+    let Ok(s) = fs::read_to_string(&marker) else {
+        return false;
+    };
+    s.trim() == github_url(cli)
+}
+
+fn mark_retain_ok(cli: &Cli) {
+    let marker = reg_pace_paths()
+        .0
+        .parent()
+        .unwrap_or(Path::new("/tmp"))
+        .join(format!("gha-runner-ctl-retain-{}.ok", cli.container));
+    let _ = fs::write(&marker, github_url(cli));
+}
+
 fn write_env_file(path: &Path, reg_token: &str, cli: &Cli) -> Result<(), String> {
-    let ephemeral = matches!(cli.mode, Mode::Ephemeral);
+    let ephemeral = effective_ephemeral(cli);
     let mut f = File::create(path).map_err(|e| format!("env file: {e}"))?;
     #[cfg(unix)]
     {
@@ -1295,7 +2047,10 @@ fn clear_active_target(cli: &Cli) {
 
 fn up(cli: &Cli) -> Result<(), String> {
     if container_running(&cli.container) {
-        eprintln!("up: already running ({})", cli.container);
+        eprintln!(
+            "up: already running ({}) — GitHub pushes jobs to this session (no re-register)",
+            cli.container
+        );
         return Ok(());
     }
     if !volume_exists(&cli.volume) {
@@ -1308,24 +2063,35 @@ fn up(cli: &Cli) -> Result<(), String> {
         return Err("user batch: no active repo with demand (listen selects it)".into());
     }
 
-    let api = github_token()?;
-    let reg = registration_token(cli, &api)?;
+    let ephemeral = effective_ephemeral(cli);
+    // Retain reuse: if we already have runner config on the volume for this repo,
+    // skip minting a registration-token (biggest API saver).
+    let can_reuse = !ephemeral && volume_has_runner_config(cli);
     let env_path = private_env_path();
-    write_env_file(&env_path, &reg, cli)?;
-    drop(reg);
-    drop(api);
+    if can_reuse {
+        eprintln!(
+            "up: reusing retained registration on volume for {} (no registration-token POST)",
+            github_url(cli)
+        );
+        write_env_file(&env_path, "REUSE", cli)?;
+    } else {
+        let api = github_token()?;
+        let reg = registration_token(cli, &api)?;
+        write_env_file(&env_path, &reg, cli)?;
+        drop(reg);
+        drop(api);
+    }
 
     if container_exists(&cli.container) {
         let _ = podman(&["rm", "-f", &cli.container]);
     }
 
     eprintln!(
-        "up: scope={:?} mode={:?} url={}",
+        "up: scope={:?} mode={:?} ephemeral={ephemeral} url={}",
         cli.scope,
         cli.mode,
         github_url(cli)
     );
-    let ephemeral = matches!(cli.mode, Mode::Ephemeral) || matches!(cli.scope, Scope::User);
     let env_path_str = env_path.to_str().ok_or("env path not utf-8")?.to_string();
     let vol = format!("{}:/opt/actions-runner:Z", cli.volume);
     let eph = if ephemeral { "true" } else { "false" };
@@ -1348,10 +2114,13 @@ fn up(cli: &Cli) -> Result<(), String> {
         "4096",
         "--security-opt",
         "no-new-privileges",
+        "--cap-drop",
+        "ALL",
         "--pull",
         "never",
         "--user",
         "1001:1001",
+        // Work endpoints never receive a container runtime socket (no nested spawn).
         "--env-file",
         env_path_str.as_str(),
         "-e",
@@ -1401,6 +2170,9 @@ fn up(cli: &Cli) -> Result<(), String> {
     if let Some(repo) = cli.repo.as_ref() {
         set_active_target(cli, repo);
     }
+    if !ephemeral {
+        mark_retain_ok(cli);
+    }
     eprintln!(
         "up: container {} gpu={} slice={:?}",
         cli.container, cli.gpu, cli.gpu_slice
@@ -1426,7 +2198,7 @@ fn down(cli: &Cli, rm: bool) -> Result<(), String> {
             eprintln!("down: no GPU runner containers running — GPU returned to host (idle)");
         }
     }
-    let ephemeral = matches!(cli.mode, Mode::Ephemeral) || matches!(cli.scope, Scope::User);
+    let ephemeral = effective_ephemeral(cli);
     if ephemeral {
         let vol = format!("{}:/opt/actions-runner:Z", cli.volume);
         let _ = podman(&[
@@ -1515,8 +2287,74 @@ struct NamedRepo {
     private: Option<bool>,
 }
 
+fn repos_round_robin_state_path(container: &str) -> PathBuf {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let safe: String = container
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    dir.join(format!("gha-runner-ctl-rr-{safe}.txt"))
+}
+
+/// Subset of allowlisted repos for this demand tick (`repos_per_tick`; 0 = all).
+fn select_repos_for_tick(cli: &Cli, repos: &[String]) -> Vec<String> {
+    if repos.is_empty() {
+        return Vec::new();
+    }
+    if cli.repos_per_tick == 0 {
+        return repos.to_vec();
+    }
+    let n = cli.repos_per_tick as usize;
+    let len = repos.len();
+    let path = repos_round_robin_state_path(&cli.container);
+    let mut offset: usize = fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+        % len;
+    let take = n.min(len);
+    let mut out = Vec::with_capacity(take);
+    for i in 0..take {
+        out.push(repos[(offset + i) % len].clone());
+    }
+    offset = (offset + take) % len;
+    let _ = fs::write(&path, offset.to_string());
+    out
+}
+
+fn poll_allowlist_repos(
+    cli: &Cli,
+    api: &str,
+    pacer: &mut ApiPacer,
+    repos: &[String],
+) -> Result<(bool, Option<String>), String> {
+    for name in select_repos_for_tick(cli, repos) {
+        match repo_needs_runner(cli, &name, api, pacer) {
+            Ok(true) => return Ok((true, Some(name))),
+            Ok(false) => {}
+            Err(e) if is_soft_api_err(&e) => {
+                eprintln!("listen: allowlist skip {name}: {}", redact(&e));
+                if e.contains("rate limited") || e.contains("budget exhausted") {
+                    return Err(e);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok((false, None))
+}
+
 /// Returns (need_runner, optional active_repo_for_registration).
-fn demand(cli: &Cli, api: &str) -> Result<(bool, Option<String>), String> {
+fn demand(cli: &Cli, api: &str, pacer: &mut ApiPacer) -> Result<(bool, Option<String>), String> {
+    pacer.begin_poll();
     let mut filter_private = false;
     let mut filter_public = false;
 
@@ -1531,13 +2369,25 @@ fn demand(cli: &Cli, api: &str) -> Result<(bool, Option<String>), String> {
 
     match cli.scope {
         Scope::Repo => {
-            let repo = cli.repo.as_ref().expect("validated").clone();
-            Ok((repo_needs_runner(cli, &repo, api)?, Some(repo)))
+            if let Some(repo) = cli.repo.as_ref() {
+                let repo = repo.clone();
+                return Ok((repo_needs_runner(cli, &repo, api, pacer)?, Some(repo)));
+            }
+            if let Some(pref) = cli.prefer_repos.as_ref() {
+                let repos: Vec<String> = pref
+                    .split(',')
+                    .map(|x| x.trim())
+                    .filter(|x| !x.is_empty() && is_safe_repo(x))
+                    .map(|s| s.to_string())
+                    .collect();
+                return poll_allowlist_repos(cli, api, pacer, &repos);
+            }
+            Err("repo scope: missing --repo or --prefer-repos".into())
         }
         Scope::Org => {
             let owner = cli.owner.as_ref().expect("validated");
             let url = format!("https://api.github.com/orgs/{owner}/repos?per_page=100&type=all");
-            let repos = list_repos_paginated(&url, api)?;
+            let repos = list_repos_paginated(&url, api, pacer)?;
             for r in repos {
                 if r.archived.unwrap_or(false) || !is_safe_repo(&r.full_name) {
                     continue;
@@ -1549,20 +2399,43 @@ fn demand(cli: &Cli, api: &str) -> Result<(bool, Option<String>), String> {
                 if filter_public && is_private {
                     continue;
                 }
-                if repo_needs_runner(cli, &r.full_name, api)? {
-                    // Org runner registration is org-level; active repo is informational.
-                    return Ok((true, Some(r.full_name)));
+                match repo_needs_runner(cli, &r.full_name, api, pacer) {
+                    Ok(true) => return Ok((true, Some(r.full_name))),
+                    Ok(false) => {}
+                    Err(e) if is_soft_api_err(&e) => {
+                        eprintln!("listen: skip {}: {}", r.full_name, redact(&e));
+                        if e.contains("rate limited") {
+                            return Err(e);
+                        }
+                    }
+                    Err(e) => return Err(e),
                 }
             }
             Ok((false, None))
         }
         Scope::User => {
             let user = cli.user.as_ref().expect("validated");
-            // Owner repos only (not collaborator noise). Paginate.
+            // Allowlist mode: when prefer_repos is set, ONLY poll those repos.
+            if let Some(pref) = cli.prefer_repos.as_ref() {
+                let repos: Vec<String> = pref
+                    .split(',')
+                    .map(|x| x.trim())
+                    .filter(|x| !x.is_empty() && is_safe_repo(x))
+                    .filter(|name| name.starts_with(&format!("{user}/")))
+                    .map(|s| s.to_string())
+                    .collect();
+                return poll_allowlist_repos(cli, api, pacer, &repos);
+            }
+            // Full owner list — paced + budget-capped; prefer setting GHA_PREFER_REPOS.
+            eprintln!(
+                "listen: user-batch without GHA_PREFER_REPOS scans owned repos (budget {} GETs/poll, gap {}ms)",
+                pacer.max_per_poll,
+                pacer.min_gap.as_millis()
+            );
             let url = format!(
                 "https://api.github.com/users/{user}/repos?type=owner&per_page=100&sort=updated"
             );
-            let repos = list_repos_paginated(&url, api)?;
+            let repos = list_repos_paginated(&url, api, pacer)?;
             for r in repos {
                 if r.archived.unwrap_or(false) || r.fork.unwrap_or(false) {
                     continue;
@@ -1570,7 +2443,6 @@ fn demand(cli: &Cli, api: &str) -> Result<(bool, Option<String>), String> {
                 if !is_safe_repo(&r.full_name) {
                     continue;
                 }
-                // Only this user's namespace
                 if !r.full_name.starts_with(&format!("{user}/")) {
                     continue;
                 }
@@ -1581,8 +2453,16 @@ fn demand(cli: &Cli, api: &str) -> Result<(bool, Option<String>), String> {
                 if filter_public && is_private {
                     continue;
                 }
-                if repo_needs_runner(cli, &r.full_name, api)? {
-                    return Ok((true, Some(r.full_name)));
+                match repo_needs_runner(cli, &r.full_name, api, pacer) {
+                    Ok(true) => return Ok((true, Some(r.full_name))),
+                    Ok(false) => {}
+                    Err(e) if is_soft_api_err(&e) => {
+                        eprintln!("listen: skip {}: {}", r.full_name, redact(&e));
+                        if e.contains("rate limited") || e.contains("budget exhausted") {
+                            return Err(e);
+                        }
+                    }
+                    Err(e) => return Err(e),
                 }
             }
             Ok((false, None))
@@ -1590,22 +2470,34 @@ fn demand(cli: &Cli, api: &str) -> Result<(bool, Option<String>), String> {
     }
 }
 
-fn list_repos_paginated(first_url: &str, api: &str) -> Result<Vec<NamedRepo>, String> {
+fn is_soft_api_err(e: &str) -> bool {
+    e.contains("403")
+        || e.contains("404")
+        || e.contains("401")
+        || e.contains("429")
+        || e.contains("rate limit")
+        || e.contains("rate limited")
+        || e.contains("budget exhausted")
+}
+
+fn list_repos_paginated(
+    first_url: &str,
+    api: &str,
+    pacer: &mut ApiPacer,
+) -> Result<Vec<NamedRepo>, String> {
     let mut out = Vec::new();
     let mut url = Some(first_url.to_string());
     let mut pages = 0;
     while let Some(u) = url {
         pages += 1;
-        if pages > 20 {
-            break; // cap: 2000 repos
+        if pages > 5 {
+            // Hard cap: prefer allowlist; never walk 100+ pages mid-poll.
+            eprintln!("listen: repo list capped at {pages} pages this poll");
+            break;
         }
-        let resp = http_agent()
-            .get(&u)
-            .set("Authorization", &format!("Bearer {api}"))
-            .set("Accept", "application/vnd.github+json")
-            .set("X-GitHub-Api-Version", "2022-11-28")
-            .call()
-            .map_err(|e| format!("list repos: {}", redact(&e.to_string())))?;
+        let resp = pacer
+            .get(&u, api)
+            .map_err(|e| format!("list repos: {}", redact(&e)))?;
         let link = resp.header("link").map(|s| s.to_string());
         let batch: Vec<NamedRepo> = resp.into_json().map_err(|e| format!("parse repos: {e}"))?;
         out.extend(batch);
@@ -1626,14 +2518,40 @@ fn parse_next_link(link: &str) -> Option<String> {
     None
 }
 
-fn repo_needs_runner(cli: &Cli, repo: &str, api: &str) -> Result<bool, String> {
+fn repo_needs_runner(
+    cli: &Cli,
+    repo: &str,
+    api: &str,
+    pacer: &mut ApiPacer,
+) -> Result<bool, String> {
+    // Only probe "queued" first (cheaper); check in_progress only if needed for sticky.
     for status in ["queued", "in_progress"] {
         let url =
-            format!("https://api.github.com/repos/{repo}/actions/runs?status={status}&per_page=10");
-        let runs = fetch_runs(&url, api)?;
-        for run in runs {
-            if job_matches_listener(cli, repo, run.id, api)? {
-                return Ok(true);
+            format!("https://api.github.com/repos/{repo}/actions/runs?status={status}&per_page=5");
+        let runs = match fetch_runs(&url, api, pacer) {
+            Ok(r) => r,
+            Err(e) if is_soft_api_err(&e) => {
+                eprintln!("listen: skip {repo} runs ({status}): {}", redact(&e));
+                if e.contains("rate limited") || e.contains("budget exhausted") {
+                    return Err(e);
+                }
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        // Cap job lookups per repo (stop after first match or few runs).
+        for run in runs.into_iter().take(3) {
+            match job_matches_listener(cli, repo, run.id, api, pacer) {
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(e) if is_soft_api_err(&e) => {
+                    eprintln!("listen: skip {repo} jobs: {}", redact(&e));
+                    if e.contains("rate limited") || e.contains("budget exhausted") {
+                        return Err(e);
+                    }
+                    break;
+                }
+                Err(e) => return Err(e),
             }
         }
     }
@@ -1681,27 +2599,25 @@ fn labels_match_demand(cli: &Cli, job_labels: &[String]) -> bool {
     true
 }
 
-fn fetch_runs(url: &str, api: &str) -> Result<Vec<WorkflowRun>, String> {
-    let resp = http_agent()
-        .get(url)
-        .set("Authorization", &format!("Bearer {api}"))
-        .set("Accept", "application/vnd.github+json")
-        .set("X-GitHub-Api-Version", "2022-11-28")
-        .call()
-        .map_err(|e| format!("list runs: {}", redact(&e.to_string())))?;
+fn fetch_runs(url: &str, api: &str, pacer: &mut ApiPacer) -> Result<Vec<WorkflowRun>, String> {
+    let resp = pacer
+        .get(url, api)
+        .map_err(|e| format!("list runs: {url}: {}", redact(&e)))?;
     let body: WorkflowRuns = resp.into_json().map_err(|e| format!("parse runs: {e}"))?;
     Ok(body.workflow_runs)
 }
 
-fn job_matches_listener(cli: &Cli, repo: &str, run_id: u64, api: &str) -> Result<bool, String> {
+fn job_matches_listener(
+    cli: &Cli,
+    repo: &str,
+    run_id: u64,
+    api: &str,
+    pacer: &mut ApiPacer,
+) -> Result<bool, String> {
     let url = format!("https://api.github.com/repos/{repo}/actions/runs/{run_id}/jobs");
-    let resp = http_agent()
-        .get(&url)
-        .set("Authorization", &format!("Bearer {api}"))
-        .set("Accept", "application/vnd.github+json")
-        .set("X-GitHub-Api-Version", "2022-11-28")
-        .call()
-        .map_err(|e| format!("list jobs: {}", redact(&e.to_string())))?;
+    let resp = pacer
+        .get(&url, api)
+        .map_err(|e| format!("list jobs: {}", redact(&e)))?;
     let body: JobsResp = resp.into_json().map_err(|e| format!("parse jobs: {e}"))?;
     for j in body.jobs {
         if j.status == "completed" {
@@ -1715,15 +2631,33 @@ fn job_matches_listener(cli: &Cli, repo: &str, run_id: u64, api: &str) -> Result
 }
 
 /// True if active registration still has incomplete matching jobs (sticky; do not recycle).
-fn active_repo_still_busy(cli: &Cli, repo: &str, api: &str) -> Result<bool, String> {
-    repo_needs_runner(cli, repo, api)
+fn active_repo_still_busy(
+    cli: &Cli,
+    repo: &str,
+    api: &str,
+    pacer: &mut ApiPacer,
+) -> Result<bool, String> {
+    repo_needs_runner(cli, repo, api, pacer)
 }
 
 fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> Result<(), String> {
+    let interval = if matches!(cli.scope, Scope::User) {
+        interval.max(USER_BATCH_MIN_INTERVAL_SECS)
+    } else {
+        interval
+    };
     eprintln!(
-        "listen: scope={:?} poll={interval}s idle={idle_secs}s mode={:?}",
-        cli.scope, cli.mode
+        "listen: scope={:?} poll={interval}s idle={idle_secs}s mode={:?} api_gap={}ms max_per_poll={}",
+        cli.scope,
+        cli.mode,
+        cli.api_min_gap_ms,
+        cli.api_max_per_poll
     );
+    if matches!(cli.scope, Scope::User) && cli.prefer_repos.is_none() {
+        eprintln!(
+            "listen: warning: set GHA_PREFER_REPOS=owner/r1,owner/r2 (allowlist) to stay within API budgets"
+        );
+    }
     if !volume_exists(&cli.volume) {
         eprintln!("listen: snapshot missing — prepare…");
         prepare(cli, true, false)?;
@@ -1743,8 +2677,16 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
 
     let mut idle_since: Option<Instant> = None;
     let mut cli = cli.clone_for_listen();
+    let mut pacer = ApiPacer::from_cli(&cli);
 
     loop {
+        if let Some(wait) = pacer.cooling() {
+            let secs = wait.as_secs().max(1);
+            eprintln!("listen: API cool-down {secs}s before next poll");
+            thread::sleep(wait);
+            continue;
+        }
+
         let api = match github_token() {
             Ok(t) => t,
             Err(e) => {
@@ -1754,15 +2696,18 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
             }
         };
 
-        let (need, target_repo) = match demand(&cli, &api) {
+        let (need, target_repo) = match demand(&cli, &api, &mut pacer) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("listen: poll: {}", redact(&e));
-                thread::sleep(Duration::from_secs(interval));
+                let wait = pacer
+                    .cooling()
+                    .map(|d| d.max(Duration::from_secs(interval)))
+                    .unwrap_or(Duration::from_secs(interval));
+                thread::sleep(wait);
                 continue;
             }
         };
-        drop(api);
 
         // User batch: pin registration target to the repo that needs work.
         // Never recycle while the active repo still has matching in-flight jobs.
@@ -1772,12 +2717,7 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
                 if active.as_deref() != Some(r.as_str()) {
                     let busy = active
                         .as_ref()
-                        .map(|a| {
-                            github_token()
-                                .ok()
-                                .and_then(|tok| active_repo_still_busy(&cli, a, &tok).ok())
-                                .unwrap_or(false)
-                        })
+                        .map(|a| active_repo_still_busy(&cli, a, &api, &mut pacer).unwrap_or(false))
                         .unwrap_or(false);
                     if container_running(&cli.container) && busy {
                         eprintln!("listen: sticky on {active:?} (still busy); defer move to {r}");
@@ -1796,6 +2736,7 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
                 }
             }
         }
+        drop(api);
 
         let running = container_running(&cli.container);
 
@@ -1846,6 +2787,13 @@ impl Cli {
             gpu_slice: self.gpu_slice.clone(),
             demand_require_labels: self.demand_require_labels.clone(),
             demand_exclude_labels: self.demand_exclude_labels.clone(),
+            prefer_repos: self.prefer_repos.clone(),
+            api_min_gap_ms: self.api_min_gap_ms,
+            api_max_per_poll: self.api_max_per_poll,
+            api_backoff_secs: self.api_backoff_secs,
+            repos_per_tick: self.repos_per_tick,
+            reg_min_gap_secs: self.reg_min_gap_secs,
+            reg_max_per_hour: self.reg_max_per_hour,
             build_dir: self.build_dir.clone(),
             mode: self.mode.clone(),
             wake_token: self.wake_token.clone(),
@@ -1875,6 +2823,13 @@ struct CliSnap {
     gpu_slice: Option<String>,
     demand_require_labels: Option<String>,
     demand_exclude_labels: Option<String>,
+    prefer_repos: Option<String>,
+    api_min_gap_ms: u64,
+    api_max_per_poll: u32,
+    api_backoff_secs: u64,
+    repos_per_tick: u32,
+    reg_min_gap_secs: u64,
+    reg_max_per_hour: u32,
     mode: Mode,
     wake_token: Option<String>,
     full_auto: bool,
@@ -1902,6 +2857,13 @@ fn cli_snapshot(cli: &Cli) -> CliSnap {
         gpu_slice: cli.gpu_slice.clone(),
         demand_require_labels: cli.demand_require_labels.clone(),
         demand_exclude_labels: cli.demand_exclude_labels.clone(),
+        prefer_repos: cli.prefer_repos.clone(),
+        api_min_gap_ms: cli.api_min_gap_ms,
+        api_max_per_poll: cli.api_max_per_poll,
+        api_backoff_secs: cli.api_backoff_secs,
+        repos_per_tick: cli.repos_per_tick,
+        reg_min_gap_secs: cli.reg_min_gap_secs,
+        reg_max_per_hour: cli.reg_max_per_hour,
         mode: cli.mode.clone(),
         wake_token: cli.wake_token.clone(),
         full_auto: cli.full_auto,
@@ -1931,6 +2893,13 @@ fn snap_to_cli(s: &CliSnap) -> Cli {
         gpu_slice: s.gpu_slice.clone(),
         demand_require_labels: s.demand_require_labels.clone(),
         demand_exclude_labels: s.demand_exclude_labels.clone(),
+        prefer_repos: s.prefer_repos.clone(),
+        api_min_gap_ms: s.api_min_gap_ms,
+        api_max_per_poll: s.api_max_per_poll,
+        api_backoff_secs: s.api_backoff_secs,
+        repos_per_tick: s.repos_per_tick,
+        reg_min_gap_secs: s.reg_min_gap_secs,
+        reg_max_per_hour: s.reg_max_per_hour,
         build_dir: None,
         mode: s.mode.clone(),
         wake_token: s.wake_token.clone(),

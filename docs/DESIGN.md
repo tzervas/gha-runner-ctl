@@ -1,68 +1,171 @@
-# Architecture & Design Details
+# Architecture & Design
 
-This document explains the core architectural decisions, design choices, and security considerations behind `gha-runner-ctl`.
+This document is the source of truth for how **gha-runner-ctl** is shaped.
+Product name stays `gha-runner-ctl`; the long-lived process is the **fleet agent**.
 
 ---
 
-## 1. Core Architecture: On-Demand Scaling
+## 1. Two planes (preferred model)
 
-`gha-runner-ctl` is designed to provide high-performance, single-instance self-hosted execution.
-
+```text
+  ┌─────────────────────────────────────────────────────────────┐
+  │  FLEET AGENT  (long-lived)                                  │
+  │  gha-runner-ctl binary — hardened control plane             │
+  │                                                             │
+  │  • GitHub API (paced, allowlisted, registration budget)     │
+  │  • Owns registration lifecycle + REUSE / warm               │
+  │  • Allocates / tears down work containers                   │
+  │  • systemd unit, bare host, or micro-agent image            │
+  └───────────────────────────┬─────────────────────────────────┘
+                              │ podman run / stop / rm
+                              ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │  WORK ENDPOINT  (ephemeral or warm-retain)                  │
+  │  Official actions/runner inside a job container             │
+  │                                                             │
+  │  • Heavy surface: toolchains, checkout, build, GPU          │
+  │  • Spun for real job allocation                             │
+  │  • Not the control plane; not where PATs live long-term     │
+  └─────────────────────────────────────────────────────────────┘
 ```
-  +--------------------------------------------------+
-  |              gha-runner-ctl listen               |
-  |  (Continuous lightweight Rust polling loop)      |
-  +---------------------------------------+----------+
-                                          |
-                                          | (If jobs queued)
-                                          v
-                         +---------------------------------+
-                         |  Ephemerally spins up Runner    |
-                         |  (Podman Container, UID 1001)   |
-                         +---------------------------------+
+
+| Piece | Lifetime | What it is | Deploy as |
+|-------|----------|------------|-----------|
+| **Fleet agent** | Long-lived | Rust binary; intelligence + lifecycle | Host install **or** hardened micro-container |
+| **Work endpoint** | Job-scoped (or warm retain) | `actions/runner` + CI tools image | Fat work image / volume snapshot |
+
+**Why this split helps security and ops**
+
+* The agent surface is tiny and purpose-built (no compiler, no npm, no broad package set).
+* Work containers stay the large, mutable attack surface — and they can die with the job.
+* Registration tokens and PAT material stay under agent control (short-lived env files, shred, redaction).
+* GitHub **pushes** jobs once a runner is registered and online; the agent’s job is to keep that path intelligent (warm retain / REUSE), not to hammer the API.
+
+### Honest protocol boundary
+
+GitHub Actions still speaks to the **official `actions/runner`** process for job assignment.
+The fleet agent does **not** replace that wire protocol. It **owns** when that process is registered, where it runs, and when containers exist:
+
+* Agent mints / reuses registration; paces POSTs.
+* Work container runs `config.sh` / `run.sh` (or reuses `.runner` on the volume).
+* Agent decides up/down, labels, GPU attach, multi-instance locks.
+
+Future hardening can shrink the work image further or add nested isolation; the agent remains the durable control plane either way.
+
+---
+
+## 2. Dual deployment of the fleet agent
+
+Both are first-class. Same binary; different packaging.
+
+### A. Host binary as `gha-agent` + rootless Podman (**production default**)
+
+```text
+OS user gha-agent (nologin, no sudo)
+  └── gha-runner-ctl (fleet agent binary)
+        └── rootless podman → work containers (mapped UIDs, not host root)
 ```
 
-### The "Why"
-* **Traditional Runners:** Usually run 24/7 as full system services, wasting RAM and CPU, and maintaining persistent authentication tokens that pose a long-term target for attackers.
-* **On-Demand ephemeral model:** By polling the GitHub API and dynamically checking if self-hosted jobs are queued or in progress, `gha-runner-ctl` only starts the heavy container when compute is actually needed. Once the job completes, the container is destroyed and unregistered.
+* Bootstrap once from the privileged WSL/dev shell: `scripts/setup-rootless.sh`.
+* Agent refuses euid 0 unless `GHA_ALLOW_ROOT=1` (ephemeral WSL/dev only).
+* Refuses rootful `CONTAINER_HOST` system sockets unless `GHA_ALLOW_ROOTFUL_SOCKET=1`.
+* Instance env under `/home/gha-agent/.local/share/gha-runner-ctl/`.
+* See [SECURITY](SECURITY.md) and [HOST_OPS](HOST_OPS.md).
+
+### B. Micro-agent container (Ubuntu-minimal stripped, cannot spawn)
+
+```text
+podman run --read-only --cap-drop=ALL  gha-runner-ctl-agent
+  = Ubuntu 24.04 base stripped to binary + CA certs only
+  = no shell, no sudo, no podman CLI, no runtime socket
+  → can talk to GitHub API if given a token
+  → cannot allocate work containers (by design)
+```
+
+* Image: [packaging/Containerfile.agent](../packaging/Containerfile.agent) (build installs ca-certificates, then removes shell/apt surface).
+* Runner: [scripts/run-agent-micro.sh](../scripts/run-agent-micro.sh) (drops all caps, read-only, refuses socket env).
+* **Never** mount `podman.sock` / `docker.sock` into this image — that would undo the model.
+* Full `listen`/`warm`/`up` that need Podman: use path A (host binary as `gha-agent`).
+
+Build:
+
+```bash
+bash scripts/build-agent-image.sh
+```
 
 ---
 
-## 2. Token Security & Process Isolation
+## 3. Registration intelligence (not demand thrash)
 
-We apply strict security boundaries to token management:
+Preferred steady state for a small personal allowlist:
 
-### Command Line Interception & Masking
-To prevent secrets from leaking into shell command histories (`.bash_history`, `.zsh_history`), system logging (`syslog`), or standard process lists (`ps aux`), we intercept and reject any raw token strings passed as arguments.
-Users can never pass `ghp_...` in CLI parameters. Instead:
-1. We query **Git Credential Manager** or the standard configured helper via secure stdin pipes.
-2. We fallback to **GitHub CLI** authenticated tokens.
-3. We securely read from `~/.config/gha-runner-ctl/config.json` with `0600` permissions.
-4. If all else fails, we use **masked interactive entry** (`rpassword`).
+```text
+warm --prefer-repos a/r1,a/r2,a/r3
+  → one retain registration per repo (paced registration-token POSTs)
+  → runners online; GitHub pushes jobs
+  → REUSE skips new POSTs when volume already holds .runner for that repo
+```
 
-### Staged Env File Isolation
-When starting the runner:
-1. A temporary file containing the generated short-lived registration token is created under `XDG_RUNTIME_DIR`.
-2. Permissions are restricted to `0600` (readable/writeable only by the owner).
-3. We pass this file to Podman using `--env-file`.
-4. As soon as the container begins initialization, the host process overwrites the temp file with random noise (shredding) and deletes (unlinks) it.
+| Mode | API cost | Use when |
+|------|----------|----------|
+| **warm + retain** | One paced POST per repo; then almost none | Steady CI on allowlist (recommended) |
+| **listen + demand** | Gentle GETs (2–5+ min); POST only if work needs up | Recovery / scale / GPU wake |
+| **user-batch ephemeral re-target** | New registration when demand switches repos | Ad-hoc many repos; still allowlist + pace |
 
----
-
-## 3. Container Mirror Hardening
-
-The base runner image (built from Ubuntu 24.04) is configured to enforce secure connections for package management:
-* **The "Why":** Standard container environments often perform `apt-get update` over plain HTTP. In compromised or shared networks, this allows man-in-the-middle package tampering or vulnerability injection.
-* **The Mitigation:** We pre-install `ca-certificates` and `apt-transport-https` first, and rewrite the default mirror sources in `/etc/apt/sources.list.d/ubuntu.sources` to enforce secure `https://` URIs for all Ubuntu repository fetches.
+Host-wide registration budget: `GHA_REG_MIN_GAP_SECS`, `GHA_REG_MAX_PER_HOUR`.
+API pacing: `GHA_API_MIN_GAP_MS`, `GHA_API_MAX_PER_POLL`, backoff on 403/429.
 
 ---
 
-## 4. Multi-Repository Polling & User-level Batch Scope
+## 4. Work containers (the endpoint)
 
-Using standard GitHub Org or Repo scopes is simple. However, personal developer accounts cannot register an "org-wide" runner for multiple distinct repositories.
+* **Image:** Ubuntu-based snapshot with official runner + common CI tools ([packaging/Containerfile](../packaging/Containerfile)).
+* **Ephemeral mode:** register with `--ephemeral`, die after one job, wipe credentials on down.
+* **Retain mode:** stay registered; container can restart with `RUNNER_TOKEN=REUSE` if `.runner` is on the volume for the same `REPO_URL`.
+* **GPU soft-slices:** labels + demand filters; idle down returns GPU to the host (no MIG on consumer GeForce/WSL).
 
-To solve this, `gha-runner-ctl` implements **User Batch Scope**:
-1. It polls all owned personal repositories.
-2. If Repository A gets a queued job, it registers the runner dynamically to Repository A.
-3. If demand shifts to Repository B, it automatically terminates the container, unregisters from A, and launches a fresh registration for B.
-This allows a developer to service 100 personal repositories with a single, resource-efficient local worker!
+The agent allocates these containers; they are not the long-lived control plane.
+
+---
+
+## 5. Token security & process isolation
+
+* Reject raw `ghp_` / `github_pat_` on CLI argv (history / `ps`).
+* Resolve tokens via GCM, `gh`, config `0600`, env, or masked prompt.
+* Registration env file: `XDG_RUNTIME_DIR`, `0600`, shred + unlink after `up`.
+* Entrypoint never logs tokens; identity fields charset-validated.
+* Podman: `no-new-privileges`, non-root UID 1001 in work image, `--pull=never` on hot path.
+
+See [SECURITY](SECURITY.md).
+
+---
+
+## 6. Multi-repo personal accounts
+
+Personal accounts cannot register one user-wide runner for all repos.
+
+* **Preferred:** `warm` fleet — one retain work endpoint per allowlisted repo; agent stays one process (or one agent unit) managing many containers.
+* **Legacy / ad-hoc:** `scope=user` listen re-targets registration (ephemeral) when demand moves — higher registration cost; always set `GHA_PREFER_REPOS`.
+
+---
+
+## 7. Hardening roadmap (agent + model)
+
+Already in tree or in progress:
+
+* [x] Fail-closed validation, redaction, instance locks
+* [x] API + registration pacing / budgets
+* [x] REUSE retain registration; `warm` batch
+* [x] Dual packaging path: host binary + micro-agent image scaffold
+* [x] Release profile: LTO, strip, single codegen unit
+
+Follow-on (security model work):
+
+* [ ] Tighten agent image: read-only root, dropped caps, no socket when not needed
+* [ ] Explicit agent subcommand / `--role agent` messaging and health endpoint (auth’d)
+* [ ] Separate “thin online listener” vs “fat job” images if push + isolation need both
+* [ ] Rootless-only path docs; deny docker.sock; seccomp/apparmor profiles
+* [ ] Audit token scopes and prefer fine-grained PATs / short-lived credentials
+* [ ] Optional: sign agent releases; SBOM for agent + work images
+
+The binary must stay **stout**: small dependency set, `unsafe_code = forbid`, audited release path (`scripts/security-scan.sh`).
