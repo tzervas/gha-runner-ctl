@@ -129,3 +129,5 @@ When idle, containers exit — `down: no GPU runner containers running — GPU r
 | Ephemeral race | If logs say “registration has been deleted”, wait ~5s and `up` again (or let `listen` retry) |
 | Private repos | `GHA_ALL_REPOS=true` + token with repo admin |
 | Host upgrades | `prepare` without `--skip-host-update` (human-gated apt/dnf) |
+| **API rate limits** | **Never** poll all owned repos every few seconds. Set `GHA_PREFER_REPOS` to an **allowlist** of CI repos only (e.g. three products). Core REST quota can look fine while Actions list endpoints return 403 secondary limits after a scan storm. Use `listen --interval 60`+ and at most a few listeners. |
+| Registration without list | `up` (registration-token) often still works when `actions/runs` is secondary-limited — force `up` to pick queued jobs |
