@@ -53,7 +53,7 @@ Match labels exactly (order does not matter; all listed labels must be present o
 |---|---|---|
 | Organization | `--scope org --owner my-org` | All **org** repos (one registration; GitHub dispatches) |
 | Repository | `--scope repo --repo owner/name` or `--auto` | That repository only |
-| User batch | `--scope user --user tzervas` | Any **owned** personal repo: the fleet agent re-registers ephemerally to the repo that has demand (still one process) |
+| User batch | `--scope user --user github-user` | Any **owned** personal repo: the fleet agent re-registers ephemerally to the repo that has demand (still one process) |
 
 Personal accounts cannot use a single org-level registration for `user/*` repos
 outside the org. Use **user batch** (re-target) or move CI-heavy repos into the org.
