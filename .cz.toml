@@ -1,0 +1,22 @@
+# Commitizen configuration (commitizen-tools).
+# Install (optional): pip install commitizen  OR  uv tool install commitizen
+# This file is valid without the CLI: agents and humans follow docs/RELEASE.md for the same rules.
+
+[tool.commitizen]
+name = "cz_conventional_commits"
+version = "0.2.6"
+tag_format = "v$version"
+version_scheme = "semver"
+major_version_zero = true
+
+# Keep these files lockstep on every release bump (see docs/RELEASE.md § Version files).
+version_files = [
+    "VERSION",
+    "Cargo.toml:version",
+    "src/lib.rs:gha-runner-ctl/",
+]
+
+update_changelog_on_bump = true
+changelog_file = "CHANGELOG.md"
+changelog_incremental = true
+# cz bump: prefer `cz bump --increment PATCH|MINOR|MAJOR` (see docs/RELEASE.md).

@@ -11,12 +11,79 @@ log() { printf 'runner: %s\n' "$*" >&2; }
 # Reject shell metacharacters / traversal in controller-supplied identity fields.
 safe_ident() {
     local s="${1:-}"
-    [[ -n "$s" ]] || return 1
-    [[ ${#s} -le 128 ]] || return 1
+    if [[ -z "$s" ]]
+    then
+        return 1
+    fi
+    if [[ ${#s} -gt 128 ]]
+    then
+        return 1
+    fi
     case "$s" in
         *..* | *[!A-Za-z0-9._-]* ) return 1 ;;
     esac
     return 0
+}
+
+normalize_repo_url() {
+    local u="${1:-}"
+    while [[ -n "$u" ]]
+    do
+        if [[ "$u" == */ ]]
+        then
+            u="${u%/}"
+        else
+            break
+        fi
+    done
+    printf '%s' "$u"
+}
+
+runner_repo_url_from_file() {
+    local path="${1:-.runner}"
+    local url=""
+    if [[ ! -f "$path" ]]
+    then
+        return 1
+    fi
+    if command -v python3 >/dev/null 2>&1
+    then
+        url="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('gitHubUrl') or d.get('githubUrl') or '')" "$path" 2>/dev/null || true)"
+    fi
+    if [[ -z "$url" ]]
+    then
+        url="$(sed -n 's/.*"[gG]it[Hh]ubUrl"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$path" 2>/dev/null | head -1 || true)"
+    fi
+    if [[ -z "$url" ]]
+    then
+        url="$(grep -Eo 'https://github.com/[A-Za-z0-9._/-]+' "$path" 2>/dev/null | head -1 || true)"
+    fi
+    if [[ -z "$url" ]]
+    then
+        return 1
+    fi
+    if ! safe_url "$url"
+    then
+        return 1
+    fi
+    normalize_repo_url "$url"
+    return 0
+}
+
+check_reuse_runner_matches_repo() {
+    local stored=""
+    local want=""
+    want="$(normalize_repo_url "$REPO_URL")"
+    if ! stored="$(runner_repo_url_from_file ".runner")"
+    then
+        log "ERROR: REUSE but cannot read gitHubUrl from .runner — fail closed"
+        exit 1
+    fi
+    if [[ "$stored" != "$want" ]]
+    then
+        log "ERROR: REUSE repo mismatch: .runner is for ${stored} but REPO_URL is ${want}"
+        exit 1
+    fi
 }
 
 safe_url() {
@@ -25,7 +92,10 @@ safe_url() {
     case "$u" in
         https://github.com/*)
             local path="${u#https://github.com/}"
-            [[ -n "$path" ]] || return 1
+            if [[ -z "$path" ]]
+            then
+                return 1
+            fi
             case "$path" in
                 *..* | *[!A-Za-z0-9._/-]* | /* | */) return 1 ;;
             esac
@@ -35,11 +105,16 @@ safe_url() {
     esac
 }
 
-if [[ ! -x "${HOME_DIR}/run.sh" ]]; then
-    if [[ -x "${SEED}/run.sh" ]]; then
+if [[ ! -x "${HOME_DIR}/run.sh" ]]
+then
+    if [[ -x "${SEED}/run.sh" ]]
+    then
         log "seeding runner binaries from image snapshot"
         cp -a "${SEED}/." "${HOME_DIR}/"
-        chmod -R go-w "${HOME_DIR}" 2>/dev/null || true
+        if ! chmod -R go-w "${HOME_DIR}" 2>/dev/null
+        then
+            :
+        fi
     else
         log "ERROR: runner binaries missing"
         exit 1
@@ -67,10 +142,15 @@ if ! safe_ident "$RUNNER_NAME"; then
 fi
 # Labels: comma-separated safe idents
 IFS=',' read -r -a _labs <<<"$RUNNER_LABELS"
-for lab in "${_labs[@]}"; do
+for lab in "${_labs[@]}"
+do
     lab="${lab// /}"
-    [[ -z "$lab" ]] && continue
-    if ! safe_ident "$lab"; then
+    if [[ -z "$lab" ]]
+    then
+        continue
+    fi
+    if ! safe_ident "$lab"
+    then
         log "ERROR: invalid label"
         exit 1
     fi
@@ -86,17 +166,66 @@ if ! safe_ident "$WORK_DIR"; then
 fi
 
 need_register=0
-if [[ "$RUNNER_EPHEMERAL" == "true" || "$RUNNER_EPHEMERAL" == "1" ]]; then
+# REUSE: controller says volume already has a retain registration for this REPO_URL.
+if [[ "${RUNNER_TOKEN:-}" == "REUSE" ]]
+then
+    if [[ -f .runner ]]
+    then
+        check_reuse_runner_matches_repo
+        log "reusing retained registration (.runner present) — no config.sh"
+        need_register=0
+        unset RUNNER_TOKEN
+    else
+        log "REUSE requested but .runner missing — will require a real token"
+        need_register=1
+    fi
+elif [[ "${RUNNER_TOKEN:-}" == "reuse" ]]
+then
+    if [[ -f .runner ]]
+    then
+        check_reuse_runner_matches_repo
+        log "reusing retained registration (.runner present) — no config.sh"
+        need_register=0
+        unset RUNNER_TOKEN
+    else
+        log "REUSE requested but .runner missing — will require a real token"
+        need_register=1
+    fi
+elif [[ "$RUNNER_EPHEMERAL" == "true" ]]
+then
     need_register=1
-    rm -f .runner .credentials .credentials_rsaparams 2>/dev/null || true
-elif [[ ! -f .runner ]]; then
+    rm -f .runner .credentials .credentials_rsaparams 2>/dev/null \
+      || true
+elif [[ "$RUNNER_EPHEMERAL" == "1" ]]
+then
     need_register=1
-elif [[ "$RUNNER_RETAIN" != "true" && "$RUNNER_RETAIN" != "1" ]]; then
+    rm -f .runner .credentials .credentials_rsaparams 2>/dev/null \
+      || true
+elif [[ ! -f .runner ]]
+then
     need_register=1
+elif [[ "$RUNNER_RETAIN" != "true" ]]
+then
+    if [[ "$RUNNER_RETAIN" != "1" ]]
+    then
+        need_register=1
+    fi
 fi
 
-if (( need_register == 1 )); then
-    if [[ -z "$RUNNER_TOKEN" ]]; then
+if (( need_register == 1 ))
+then
+    if [[ -z "${RUNNER_TOKEN:-}" ]]
+    then
+        log "ERROR: RUNNER_TOKEN required to register"
+        exit 1
+    fi
+    if [[ "$RUNNER_TOKEN" == "REUSE" ]]
+    then
+        log "ERROR: RUNNER_TOKEN required to register"
+        exit 1
+    fi
+    if [[ "$RUNNER_TOKEN" == "reuse" ]]
+    then
         log "ERROR: RUNNER_TOKEN required to register"
         exit 1
     fi
@@ -112,12 +241,21 @@ if (( need_register == 1 )); then
         --runnergroup "$RUNNER_GROUP"
         --replace
     )
-    if [[ "$RUNNER_EPHEMERAL" == "true" || "$RUNNER_EPHEMERAL" == "1" ]]; then
+    if [[ "$RUNNER_EPHEMERAL" == "true" ]]
+    then
+        config_args+=(--ephemeral)
+    elif [[ "$RUNNER_EPHEMERAL" == "1" ]]
+    then
         config_args+=(--ephemeral)
     fi
     ./config.sh "${config_args[@]}"
     # Best-effort wipe of token from this shell
-    RUNNER_TOKEN="$(head -c 64 /dev/urandom | base64 2>/dev/null || true)"
+    if RUNNER_TOKEN="$(head -c 64 /dev/urandom | base64 2>/dev/null)"
+    then
+        :
+    else
+        RUNNER_TOKEN=""
+    fi
     unset RUNNER_TOKEN
 else
     log "using retained registration on snapshot volume"
