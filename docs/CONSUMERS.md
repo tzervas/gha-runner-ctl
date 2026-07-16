@@ -4,13 +4,13 @@
 
 ```
   repo A  ──┐
-  repo B  ──┼── labels: self-hosted,linux,x64,podman ──►  one gha-runner-ctl host
+  repo B  ──┼── labels: self-hosted,linux,x64,podman ──►  one fleet agent host (`gha-runner-ctl`)
   repo C  ──┘                                                      │
                                                                    ▼
                                                          GitHub job queue
 ```
 
-1. Run **one** `gha-runner-ctl listen` (or `up`) on the workstation.  
+1. Run **one** fleet agent process (`gha-runner-ctl listen` or `up`) on the workstation.  
 2. Register at **organization** scope when possible so every org repo can schedule jobs.  
 3. In each consumer repo, set `runs-on` to those labels.  
 4. Do **not** install a runner per repository.
@@ -53,14 +53,14 @@ Match labels exactly (order does not matter; all listed labels must be present o
 |---|---|---|
 | Organization | `--scope org --owner my-org` | All **org** repos (one registration; GitHub dispatches) |
 | Repository | `--scope repo --repo owner/name` or `--auto` | That repository only |
-| User batch | `--scope user --user tzervas` | Any **owned** personal repo: controller re-registers ephemerally to the repo that has demand (still one process) |
+| User batch | `--scope user --user tzervas` | Any **owned** personal repo: the fleet agent re-registers ephemerally to the repo that has demand (still one process) |
 
 Personal accounts cannot use a single org-level registration for `user/*` repos
 outside the org. Use **user batch** (re-target) or move CI-heavy repos into the org.
 
 ## Checklist for a new consumer repo
 
-- [ ] Runner host is online (`gha-runner-ctl status` → `online` or `listen` running)  
+- [ ] Fleet agent host is online (`gha-runner-ctl status` → `online` or `listen` running)
 - [ ] Workflow `runs-on` includes the shared labels  
 - [ ] No duplicate self-hosted install in that repo  
 - [ ] Secrets/permissions for the job are set on the **consumer** repo (the runner only provides compute)  

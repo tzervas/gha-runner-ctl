@@ -1,6 +1,6 @@
 [package]
 name = "gha_runner_ctl"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 rust-version = "1.96"
 license = "MIT"
@@ -31,3 +31,11 @@ unsafe_code = "forbid"
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# Stout release binary for host install and the micro-agent image.
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = 3

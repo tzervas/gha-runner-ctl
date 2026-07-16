@@ -1,6 +1,6 @@
 # gha-runner-ctl
 
-**Hardened Rust controller** for GitHub Actions self-hosted runners on Podman: pre-seeded snapshots, short-lived registration, on-demand up/down, multi-instance CPU + soft GPU slices (WSL).
+**Hardened Rust fleet agent** for GitHub Actions self-hosted runners on Podman: long-lived control plane, ephemeral (or warm-retain) work containers, paced registration, multi-instance CPU + soft GPU slices (WSL).
 
 [![CI](https://github.com/tzervas/gha-runner-ctl/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tzervas/gha-runner-ctl/actions/workflows/ci.yml?query=branch%3Amain)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -31,11 +31,13 @@ Real host snapshot text: [docs/assets/setup-status.txt](docs/assets/setup-status
 
 | Goal | Approach |
 |---|---|
-| Fast start | Image + volume snapshot (`prepare`) — no tarball download on the hot path |
-| Secure register | Mint registration token via API / `gh` / GCM / interactive prompt; private `0600` env file shredded after start |
-| Idle cost | Ephemeral mode + idle timeout tears the container down (**GPU freed** when no GPU workers remain) |
-| Many repos | **user** batch (poll owned repos, re-register per demand) or **org** registration |
-| Horizontal | Multiple `listen` processes (locks per `--container`): e.g. 1× CPU + 2× GPU soft-slices |
+| Long-lived control plane | **Fleet agent** (`gha-runner-ctl`) stays up; work containers are the job surface |
+| Dual agent deploy | Host binary + systemd **or** distroless micro-agent image (`Containerfile.agent`) |
+| Fast work start | Work image + volume snapshot (`prepare`) — no tarball download on the hot path |
+| Secure / intelligent register | Paced registration-token POSTs; REUSE retain; `warm` for allowlist; private `0600` env shred |
+| Idle cost | Ephemeral work + idle timeout (**GPU freed** when no GPU workers remain); or warm retain for push |
+| Many repos | Prefer `warm` one retain endpoint per allowlisted repo; else **user** batch / **org** |
+| Horizontal | Multiple agent units (locks per `--container`): e.g. 1× CPU + 2× GPU soft-slices |
 | GPU (WSL) | `--gpu` + optional `--gpu-slice a\|b` (time-share on consumer GeForce; no MIG) |
 
 ---
@@ -122,7 +124,7 @@ gha-runner-ctl --scope repo --auto detect
 
 ### Batch all personal repos (`scope=user`)
 
-One process. When a self-hosted job is queued on any **owned** personal repo (subject to visibility flags), the controller ephemerally re-registers to **that** repo, runs the job, then can retarget the next.
+One process. When a self-hosted job is queued on any **owned** personal repo (subject to visibility flags), the fleet agent ephemerally re-registers to **that** repo, runs the job, then can retarget the next.
 
 ```bash
 gha-runner-ctl --scope user --user YOUR_LOGIN listen --interval 30 --idle-secs 180

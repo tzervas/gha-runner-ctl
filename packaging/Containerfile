@@ -3,6 +3,8 @@
 # Pin: https://github.com/actions/runner/releases/tag/v2.335.1
 #
 # Runs as non-root UID 1001 (trivy DS-0002). Snapshot volume must be owned by 1001.
+# Style: one logical step per RUN (no && chains).
+
 FROM docker.io/library/ubuntu:24.04
 
 ARG RUNNER_VERSION=2.335.1
@@ -15,46 +17,63 @@ ENV DEBIAN_FRONTEND=noninteractive \
     RUNNER_USER=runner
 
 # Install HTTPS transport and CA certificates first to support secure updates.
-RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        ca-certificates apt-transport-https \
-    && rm -rf /var/lib/apt/lists/*
+RUN apt-get update
+RUN DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      ca-certificates \
+      apt-transport-https
+RUN rm -rf /var/lib/apt/lists/*
 
 # Enforce HTTPS-only trusted mirrors for Ubuntu repositories
-RUN sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true \
-    && sed -i 's|http://|https://|g' /etc/apt/sources.list 2>/dev/null || true
+RUN sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null \
+      || true
+RUN sed -i 's|http://|https://|g' /etc/apt/sources.list 2>/dev/null \
+      || true
 
 # Always refresh indexes and apply upgrades before installing packages so the
 # snapshot is not baked from a stale base layer.
-RUN apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
-        -o Dpkg::Options::="--force-confdef" \
-        -o Dpkg::Options::="--force-confold" \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        curl git jq tar gzip libicu74 libssl3 \
-        python3 python3-venv bash build-essential coreutils \
-        sudo \
-    && rm -rf /var/lib/apt/lists/* \
-    && useradd -m -u "${RUNNER_UID}" -s /bin/bash "${RUNNER_USER}"
+RUN apt-get update
+RUN DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
+      -o Dpkg::Options::="--force-confdef" \
+      -o Dpkg::Options::="--force-confold"
+RUN DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      curl \
+      git \
+      jq \
+      tar \
+      gzip \
+      libicu74 \
+      libssl3 \
+      python3 \
+      python3-venv \
+      bash \
+      build-essential \
+      coreutils \
+      sudo
+RUN rm -rf /var/lib/apt/lists/*
+RUN useradd -m -u "${RUNNER_UID}" -s /bin/bash "${RUNNER_USER}"
 
 # uv on PATH for all users (local-ci jobs)
-RUN curl -fsSL https://astral.sh/uv/install.sh | sh \
-    && install -m 755 /root/.local/bin/uv /usr/local/bin/uv \
-    && rm -rf /root/.local
+RUN curl -fsSL https://astral.sh/uv/install.sh -o /tmp/uv-install.sh
+RUN sh /tmp/uv-install.sh
+RUN install -m 755 /root/.local/bin/uv /usr/local/bin/uv
+RUN rm -rf /root/.local /tmp/uv-install.sh
 
 # Seed dir holds extracted runner; snapshot volume mounts over RUNNER_HOME at runtime.
-RUN mkdir -p /opt/actions-runner-seed "${RUNNER_HOME}" \
-    && cd /opt/actions-runner-seed \
-    && curl -fsSL -o actions-runner.tar.gz \
-      "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-${TARGETARCH}-${RUNNER_VERSION}.tar.gz" \
-    && echo "${RUNNER_SHA256}  actions-runner.tar.gz" | sha256sum -c - \
-    && tar xzf actions-runner.tar.gz \
-    && rm actions-runner.tar.gz \
-    && ./bin/installdependencies.sh \
-    && rm -rf /var/lib/apt/lists/* \
-    && chown -R "${RUNNER_USER}:${RUNNER_USER}" /opt/actions-runner-seed "${RUNNER_HOME}"
+RUN mkdir -p /opt/actions-runner-seed "${RUNNER_HOME}"
+WORKDIR /opt/actions-runner-seed
+RUN curl -fsSL -o actions-runner.tar.gz \
+      "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-${TARGETARCH}-${RUNNER_VERSION}.tar.gz"
+RUN echo "${RUNNER_SHA256}  actions-runner.tar.gz" \
+      | sha256sum -c -
+RUN tar xzf actions-runner.tar.gz
+RUN rm actions-runner.tar.gz
+RUN ./bin/installdependencies.sh
+RUN rm -rf /var/lib/apt/lists/*
+RUN chown -R "${RUNNER_USER}:${RUNNER_USER}" /opt/actions-runner-seed "${RUNNER_HOME}"
 
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod 755 /entrypoint.sh && chown "${RUNNER_USER}:${RUNNER_USER}" /entrypoint.sh
+RUN chmod 755 /entrypoint.sh
+RUN chown "${RUNNER_USER}:${RUNNER_USER}" /entrypoint.sh
 
 USER runner
 WORKDIR /opt/actions-runner

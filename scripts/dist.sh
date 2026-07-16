@@ -7,8 +7,10 @@
 #   bash scripts/dist.sh 0.1.1 --upload  # gh release upload to v0.1.1
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT"
+SCRIPT_DIR="$(dirname "${BASH_SOURCE[0]}")"
+cd "$SCRIPT_DIR"
+cd ..
+ROOT="$(pwd)"
 
 VER="${1:-}"
 UPLOAD=0
@@ -62,7 +64,9 @@ cat >"${STAGE}/install.sh" <<'EOS'
 #!/bin/bash
 # Install gha-runner-ctl from a release tarball into ~/.local/bin (or --prefix).
 set -euo pipefail
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HERE="$(dirname "${BASH_SOURCE[0]}")"
+cd "${HERE}"
+HERE="$(pwd)"
 PREFIX="${HOME}/.local"
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -73,8 +77,11 @@ done
 mkdir -p "${PREFIX}/bin"
 install -m 755 "${HERE}/gha-runner-ctl" "${PREFIX}/bin/gha-runner-ctl"
 echo "Installed ${PREFIX}/bin/gha-runner-ctl"
-command -v gha-runner-ctl >/dev/null 2>&1 || echo "Add to PATH: export PATH=\"${PREFIX}/bin:\$PATH\""
-echo "Next: gha-runner-ctl prepare && gha-runner-ctl --help"
+if ! command -v gha-runner-ctl >/dev/null 2>&1; then
+  echo "Add to PATH: export PATH=\"${PREFIX}/bin:\$PATH\""
+fi
+echo "Next: gha-runner-ctl prepare"
+echo "      gha-runner-ctl --help"
 EOS
 chmod 755 "${STAGE}/install.sh"
 

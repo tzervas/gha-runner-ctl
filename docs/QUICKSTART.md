@@ -4,30 +4,53 @@ Target layout on this workstation (WSL2):
 
 | Piece | Path / unit |
 |-------|-------------|
-| Binary | `~/.local/bin/gha-runner-ctl` |
+| **Fleet agent** (binary) | `~/.local/bin/gha-runner-ctl` |
 | Instance env | `~/.local/share/gha-runner-ctl/instances/{cpu,gpu-a,gpu-b}.env` |
 | Logs | `~/.local/share/gha-runner-ctl/logs/` |
 | systemd | `systemctl --user status 'gha-runner-ctl@*'` |
+| Work image | `localhost/gha-runner-ctl:latest` (Ubuntu + actions/runner) |
+| Agent image (optional) | `localhost/gha-runner-ctl-agent:latest` (distroless control plane) |
 
-## Architecture
+## Architecture: fleet agent + work endpoints
+
+Call the long-lived Rust process the **fleet agent**. It is **not** the fat CI image.
+
+| Plane | Lifetime | Role |
+|-------|----------|------|
+| **Fleet agent** | Always on | Registration intelligence, pacing, allocate/tear down work containers |
+| **Work endpoint** | Job / warm retain | Official `actions/runner` + toolchains inside a Podman container |
+
+Deploy the agent two ways (same binary):
+
+1. **Host binary + systemd** (recommended on single-user WSL) — this quickstart.
+2. **Micro-agent container** — distroless image: binary + CA certs only (`packaging/Containerfile.agent`). **No** Podman socket — cannot spawn work containers; full `listen`/`warm`/`up` use the host binary as `gha-agent` (see [DESIGN](DESIGN.md) / [SECURITY](SECURITY.md)).
+
+Once a work runner is **registered and online**, GitHub **pushes** jobs. You do **not** need aggressive API polling for assignment.
+
+| Approach | API cost | When to use |
+|----------|----------|-------------|
+| **`warm` + retain** (recommended) | One registration-token POST per repo, paced | Steady CI for a small allowlist |
+| **User-batch ephemeral + listen** | New registration-token every scale-up / repo switch | Ad-hoc many repos (use allowlist + pacing) |
+| **Org runner** | One registration for the org | Best if CI lives under an org |
 
 ```text
-  GitHub Actions (runs-on labels)
-           │
-           ├─ self-hosted,linux,x64,podman          ──►  wsl-cpu-1   (4 CPU / 4g, no GPU)
-           ├─ …,gpu  or  …,gpu,gpu-slice-a         ──►  wsl-gpu-a   (4 CPU / 4g + soft GPU slice A)
-           └─ …,gpu  or  …,gpu,gpu-slice-b         ──►  wsl-gpu-b   (4 CPU / 4g + soft GPU slice B)
+  Preferred fleet (personal repos):
+    [fleet agent] warm --prefer-repos a/r1,a/r2,a/r3
+         → paced registration-token POSTs
+         → one work container per repo (retain online)
+         → GitHub pushes jobs; almost no further registration API
 
-  Listeners (always on, cheap):  gha-runner-ctl listen  ×3
-  Heavy containers:              Podman up only when demand; down on idle → GPU free
+  Demand listen (optional scale / recovery):
+    [fleet agent] poll allowlist every 2–5 min, paced GETs
+         → only mint tokens / spin work containers if needed
 ```
 
-**GPU slices (consumer GeForce / WSL):** there is no hardware MIG. Two workers **time-share** the same GPU with labels `gpu-slice-a` / `gpu-slice-b` and env `GHA_GPU_SLICE`. When **both** GPU containers are down, the device is free for the Windows host / other apps.
+**GPU slices (consumer GeForce / WSL):** no hardware MIG. Soft slices `gpu-slice-a|b` time-share; idle tear-down frees the GPU for the host.
 
 ## 1. Clean old installs
 
 ```bash
-# stop controllers (avoid pkill -f self-match)
+# stop fleet agent units (avoid pkill -f self-match)
 systemctl --user stop 'gha-runner-ctl@*' 2>/dev/null || true
 podman rm -f gha-runner-cpu gha-runner-gpu gha-runner-gpu-a gha-runner-gpu-b 2>/dev/null || true
 # optional: archive old /root/running tarballs → ~/.local/share/gha-runner-ctl/archive/
