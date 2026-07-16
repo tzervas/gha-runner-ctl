@@ -750,11 +750,9 @@ pub fn redact(s: &str) -> String {
                     }
                 }
 
-                out.replace_range(
-                    i..(rest_idx + secret_len_bytes),
-                    &format!("{key}***REDACTED***"),
-                );
-                start_search_idx = i + key.len() + 12; // Length of key + "***REDACTED***"
+                let replacement = format!("{key}***REDACTED***");
+                out.replace_range(i..(rest_idx + secret_len_bytes), &replacement);
+                start_search_idx = i + replacement.len();
             } else {
                 break;
             }
@@ -999,6 +997,17 @@ struct Config {
     github_token: Option<String>,
 }
 
+#[cfg(unix)]
+fn chmod_0600(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = fs::metadata(path)
+        .map_err(|e| format!("Failed to read metadata for {}: {e}", path.display()))?
+        .permissions();
+    perms.set_mode(0o600);
+    fs::set_permissions(path, perms)
+        .map_err(|e| format!("Failed to set permissions on {}: {e}", path.display()))
+}
+
 fn load_config() -> Option<Config> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
     let path = home
@@ -1035,6 +1044,8 @@ fn save_config(config: &Config) -> Result<(), String> {
         .map_err(|e| format!("Failed to open config file for writing: {e}"))?;
     f.write_all(content.as_bytes())
         .map_err(|e| format!("Failed to write config file: {e}"))?;
+    #[cfg(unix)]
+    chmod_0600(&path)?;
     Ok(())
 }
 
@@ -2067,6 +2078,8 @@ fn write_env_file(path: &Path, reg_token: &str, cli: &Cli) -> Result<(), String>
         reg_token
     )
     .map_err(|e| format!("env write: {e}"))?;
+    #[cfg(unix)]
+    chmod_0600(path)?;
     Ok(())
 }
 
@@ -2103,7 +2116,10 @@ fn set_active_target(cli: &Cli, repo: &str) {
         opts.mode(0o600);
     }
     if let Ok(mut f) = opts.open(&p) {
-        let _ = f.write_all(repo.as_bytes());
+        if f.write_all(repo.as_bytes()).is_ok() {
+            #[cfg(unix)]
+            let _ = chmod_0600(&p);
+        }
     }
 }
 
