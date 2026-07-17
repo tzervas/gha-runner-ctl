@@ -1,5 +1,10 @@
 # gha-runner-ctl
 
+<!-- FLEET-BADGES:BEGIN -->
+[![CI](https://github.com/tzervas/gha-runner-ctl/actions/workflows/fleet-ci.yml/badge.svg?branch=main)](https://github.com/tzervas/gha-runner-ctl/actions/workflows/fleet-ci.yml?query=branch%3Amain)
+[![Security](https://github.com/tzervas/gha-runner-ctl/actions/workflows/fleet-security.yml/badge.svg?branch=main)](https://github.com/tzervas/gha-runner-ctl/actions/workflows/fleet-security.yml?query=branch%3Amain)
+<!-- FLEET-BADGES:END -->
+
 Hardened Rust fleet agent for GitHub Actions self-hosted runners on Podman: long-lived control plane, ephemeral (or warm-retain) work containers, paced registration, multi-instance CPU + soft GPU slices (WSL).
 
 [![CI](https://github.com/tzervas/gha-runner-ctl/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tzervas/gha-runner-ctl/actions/workflows/ci.yml?query=branch%3Amain)
