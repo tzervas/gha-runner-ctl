@@ -6,7 +6,16 @@
 //! - **user** — batch personal account: poll all owned repos; ephemeral-register
 //!   the single runner to whichever repo has queued self-hosted work
 //!
-//! GitHub queues jobs; one runner process handles one job at a time.
+//! GitHub queues jobs. With **pool mode** (default), a listen process can spawn
+//! multiple ephemeral workers sized from job complexity within a host budget
+//! (default 8 CPU / 8 GiB shared across all managers).
+
+mod pool;
+
+pub use pool::{
+    fit_to_budget, format_cpus, format_memory_mib, parse_cpus_f64, parse_memory_mib,
+    resources_for_tier, size_for_job, ResourcePool, SizeTier,
+};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
@@ -22,7 +31,7 @@ const DEFAULT_CONTAINER: &str = "gha-runner-ctl";
 const DEFAULT_VOLUME: &str = "gha-runner-ctl-data";
 const DEFAULT_LABELS: &str = "self-hosted,linux,x64,podman";
 const DEFAULT_NAME: &str = "shared-podman-1";
-const UA: &str = "gha-runner-ctl/0.2.6";
+const UA: &str = "gha-runner-ctl/0.2.7";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 const MIN_POLL_SECS: u64 = 5;
 const MAX_POLL_SECS: u64 = 3600;
@@ -194,6 +203,22 @@ pub struct Cli {
     /// Max registration-token POSTs per rolling hour (host-wide). Default 30.
     #[arg(long, env = "GHA_REG_MAX_PER_HOUR", default_value_t = DEFAULT_REG_MAX_PER_HOUR, global = true)]
     reg_max_per_hour: u32,
+
+    /// Host pool: total CPUs for all ephemeral workers (shared file lock). Default 8.
+    #[arg(long, env = "GHA_POOL_CPUS", default_value = "8", global = true)]
+    pool_cpus: String,
+
+    /// Host pool: total memory for all ephemeral workers (e.g. 8g). Default 8g.
+    #[arg(long, env = "GHA_POOL_MEMORY", default_value = "8g", global = true)]
+    pool_memory: String,
+
+    /// Max concurrent ephemeral workers this listen process may own. Default 16.
+    #[arg(long, env = "GHA_POOL_MAX_WORKERS", default_value_t = 16, global = true)]
+    pool_max_workers: u32,
+
+    /// Enable dynamic multi-worker pool sizing (default true).
+    #[arg(long, env = "GHA_POOL_MODE", default_value = "dynamic", global = true)]
+    pool_mode: String,
 }
 
 #[derive(Debug, Subcommand, Clone)]
@@ -2366,6 +2391,17 @@ struct JobsResp {
 struct Job {
     status: String,
     labels: Vec<String>,
+    /// GitHub job display name (used for automatic size heuristics).
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// Queued/in-progress self-hosted job that matches this listener.
+#[derive(Debug, Clone)]
+struct DemandJob {
+    repo: String,
+    job_name: String,
+    labels: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2704,20 +2740,119 @@ fn job_matches_listener(
     api: &str,
     pacer: &mut ApiPacer,
 ) -> Result<bool, String> {
+    Ok(!collect_jobs_for_run(cli, repo, run_id, api, pacer)?.is_empty())
+}
+
+fn collect_jobs_for_run(
+    cli: &Cli,
+    repo: &str,
+    run_id: u64,
+    api: &str,
+    pacer: &mut ApiPacer,
+) -> Result<Vec<DemandJob>, String> {
     let url = format!("https://api.github.com/repos/{repo}/actions/runs/{run_id}/jobs");
     let resp = pacer
         .get(&url, api)
         .map_err(|e| format!("list jobs: {}", redact(&e)))?;
     let body: JobsResp = resp.into_json().map_err(|e| format!("parse jobs: {e}"))?;
+    let mut out = Vec::new();
     for j in body.jobs {
         if j.status == "completed" {
             continue;
         }
         if labels_match_demand(cli, &j.labels) {
-            return Ok(true);
+            out.push(DemandJob {
+                repo: repo.to_string(),
+                job_name: j.name.unwrap_or_else(|| format!("job-{run_id}")),
+                labels: j.labels,
+            });
         }
     }
-    Ok(false)
+    Ok(out)
+}
+
+/// Collect matching queued/in_progress jobs (for multi-worker + sizing). Cap for API budget.
+fn list_demand_jobs(
+    cli: &Cli,
+    api: &str,
+    pacer: &mut ApiPacer,
+    max_jobs: usize,
+) -> Result<Vec<DemandJob>, String> {
+    let mut out = Vec::new();
+    let repos: Vec<String> = if let Some(pref) = cli.prefer_repos.as_ref() {
+        pref.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| is_safe_repo(s))
+            .collect()
+    } else if let Some(r) = cli.repo.as_ref() {
+        vec![r.clone()]
+    } else {
+        return Ok(out);
+    };
+    let tick = select_repos_for_tick(cli, &repos);
+    // When pool-scaling, scan more repos per tick if allowlist is large.
+    let scan = if pool_mode_on(cli) {
+        if cli.repos_per_tick == 0 {
+            repos.clone()
+        } else {
+            // up to 8 repos/tick when dynamic, still staggered
+            let mut extra = select_repos_for_tick(cli, &repos);
+            if extra.len() < 8 && repos.len() > extra.len() {
+                for r in &repos {
+                    if !extra.contains(r) {
+                        extra.push(r.clone());
+                    }
+                    if extra.len() >= 8 {
+                        break;
+                    }
+                }
+            }
+            extra
+        }
+    } else {
+        tick
+    };
+    for name in scan {
+        if out.len() >= max_jobs {
+            break;
+        }
+        for status in ["queued", "in_progress"] {
+            if out.len() >= max_jobs {
+                break;
+            }
+            let url = format!(
+                "https://api.github.com/repos/{name}/actions/runs?status={status}&per_page=5"
+            );
+            let runs = match fetch_runs(&url, api, pacer) {
+                Ok(r) => r,
+                Err(e) if is_soft_api_err(&e) => {
+                    if e.contains("rate limited") || e.contains("budget exhausted") {
+                        return Err(e);
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            for run in runs.into_iter().take(3) {
+                if out.len() >= max_jobs {
+                    break;
+                }
+                match collect_jobs_for_run(cli, &name, run.id, api, pacer) {
+                    Ok(mut jobs) => out.append(&mut jobs),
+                    Err(e) if is_soft_api_err(&e) => {
+                        if e.contains("rate limited") || e.contains("budget exhausted") {
+                            return Err(e);
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+    }
+    // Dedupe by repo+job_name
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|j| seen.insert(format!("{}::{}", j.repo, j.job_name)));
+    Ok(out)
 }
 
 /// True if active registration still has incomplete matching jobs (sticky; do not recycle).
@@ -2730,18 +2865,148 @@ fn active_repo_still_busy(
     repo_needs_runner(cli, repo, api, pacer)
 }
 
+fn pool_mode_on(cli: &Cli) -> bool {
+    matches!(
+        cli.pool_mode.to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on" | "dynamic"
+    )
+}
+
+fn ensure_worker_volume(base_volume: &str, worker_volume: &str, image: &str) -> Result<(), String> {
+    if volume_exists(worker_volume) {
+        return Ok(());
+    }
+    if !volume_exists(base_volume) {
+        return Err(format!(
+            "base volume {base_volume} missing — run prepare first"
+        ));
+    }
+    eprintln!("pool: seeding worker volume {worker_volume} from {base_volume}");
+    podman(&["volume", "create", worker_volume])?;
+    podman(&[
+        "run",
+        "--rm",
+        "--security-opt",
+        "no-new-privileges",
+        "--entrypoint",
+        "/bin/bash",
+        "-v",
+        &format!("{base_volume}:/from:ro,Z"),
+        "-v",
+        &format!("{worker_volume}:/to:Z"),
+        image,
+        "-c",
+        r"set -euo pipefail; cp -a /from/. /to/; chown -R 1001:1001 /to 2>/dev/null || true; rm -f /to/.runner /to/.credentials /to/.credentials_rsaparams 2>/dev/null; true",
+    ])?;
+    Ok(())
+}
+
+fn reap_pool_workers(cli: &Cli, pool: &ResourcePool) {
+    let Ok(claims) = pool.claims() else {
+        return;
+    };
+    for c in claims {
+        // Only reap workers owned by this listen base name prefix
+        if !c.container.starts_with(&cli.container) {
+            continue;
+        }
+        if !container_running(&c.container) {
+            eprintln!(
+                "pool: reap {} (tier={} repo={:?})",
+                c.container, c.tier, c.repo
+            );
+            let mut dead = cli.clone_for_listen();
+            dead.container = c.container.clone();
+            dead.volume = format!("{}-data", c.container);
+            dead.runner_name = c.worker_id.clone();
+            let _ = down(&dead, true);
+            let _ = pool.release(&c.worker_id);
+        }
+    }
+}
+
+fn spawn_sized_worker(
+    base: &Cli,
+    pool: &ResourcePool,
+    slot: u32,
+    job: &DemandJob,
+) -> Result<(), String> {
+    let tier = size_for_job(&job.job_name, &job.labels, base.gpu);
+    let (want_c_s, want_m_s) = resources_for_tier(tier);
+    let want_c = parse_cpus_f64(&want_c_s).unwrap_or(1.0);
+    let want_m = parse_memory_mib(&want_m_s).unwrap_or(2048);
+    let (used_c, used_m, _) = pool.usage()?;
+    let free_c = (pool.max_cpus - used_c).max(0.0);
+    let free_m = pool.max_memory_mib.saturating_sub(used_m);
+    let Some((c, m)) = fit_to_budget(want_c, want_m, free_c, free_m, 0.25, 256) else {
+        eprintln!(
+            "pool: no budget for {} tier={} (free={free_c:.2}c/{free_m}MiB)",
+            job.job_name,
+            tier.as_str()
+        );
+        return Ok(());
+    };
+    let worker_id = format!("{}-w{slot}", base.runner_name);
+    let container = format!("{}-w{slot}", base.container);
+    let volume = format!("{container}-data");
+    if !pool.try_claim(
+        &worker_id,
+        &container,
+        c,
+        m,
+        tier,
+        Some(job.repo.as_str()),
+    )? {
+        eprintln!("pool: claim failed for {container}");
+        return Ok(());
+    }
+    ensure_worker_volume(&base.volume, &volume, &base.image)?;
+    let mut unit = base.clone_for_listen();
+    unit.repo = Some(job.repo.clone());
+    unit.container = container.clone();
+    unit.volume = volume;
+    unit.runner_name = worker_id.clone();
+    unit.cpus = format_cpus(c);
+    unit.memory = format_memory_mib(m);
+    eprintln!(
+        "pool: up {container} tier={} cpus={} mem={} repo={} job={}",
+        tier.as_str(),
+        unit.cpus,
+        unit.memory,
+        job.repo,
+        job.job_name
+    );
+    if let Err(e) = up(&unit) {
+        let _ = pool.release(&worker_id);
+        return Err(e);
+    }
+    Ok(())
+}
+
 fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> Result<(), String> {
     let interval = if matches!(cli.scope, Scope::User) {
         interval.max(USER_BATCH_MIN_INTERVAL_SECS)
     } else {
         interval
     };
+    // Apply pool env from CLI for ResourcePool::from_env
+    std::env::set_var("GHA_POOL_CPUS", &cli.pool_cpus);
+    std::env::set_var("GHA_POOL_MEMORY", &cli.pool_memory);
+    std::env::set_var("GHA_POOL_MAX_WORKERS", cli.pool_max_workers.to_string());
+    std::env::set_var("GHA_POOL_MODE", &cli.pool_mode);
+
+    let pool = ResourcePool::from_env();
+    let dynamic = pool_mode_on(cli);
     eprintln!(
-        "listen: scope={:?} poll={interval}s idle={idle_secs}s mode={:?} api_gap={}ms max_per_poll={}",
+        "listen: scope={:?} poll={interval}s idle={idle_secs}s mode={:?} api_gap={}ms max_per_poll={} pool={} ({:.0}c/{}MiB max_workers={})",
         cli.scope,
         cli.mode,
         cli.api_min_gap_ms,
-        cli.api_max_per_poll
+        cli.api_max_per_poll,
+        if dynamic { "dynamic" } else { "single" },
+        pool.max_cpus,
+        pool.max_memory_mib,
+        pool.max_workers.min(cli.pool_max_workers),
     );
     if matches!(cli.scope, Scope::User) && cli.prefer_repos.is_none() {
         eprintln!(
@@ -2768,6 +3033,7 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
     let mut idle_since: Option<Instant> = None;
     let mut cli = cli.clone_for_listen();
     let mut pacer = ApiPacer::from_cli(&cli);
+    let max_local = cli.pool_max_workers.min(pool.max_workers).max(1);
 
     loop {
         if let Some(wait) = pacer.cooling() {
@@ -2775,6 +3041,11 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
             eprintln!("listen: API cool-down {secs}s before next poll");
             thread::sleep(wait);
             continue;
+        }
+
+        // Always reap finished pool workers first (frees budget).
+        if dynamic {
+            reap_pool_workers(&cli, &pool);
         }
 
         let api = match github_token() {
@@ -2786,70 +3057,169 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
             }
         };
 
-        let (need, target_repo) = match demand(&cli, &api, &mut pacer) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("listen: poll: {}", redact(&e));
-                let wait = pacer
-                    .cooling()
-                    .map(|d| d.max(Duration::from_secs(interval)))
-                    .unwrap_or(Duration::from_secs(interval));
-                thread::sleep(wait);
-                continue;
-            }
-        };
+        if dynamic {
+            let jobs = match list_demand_jobs(&cli, &api, &mut pacer, max_local as usize * 2) {
+                Ok(j) => j,
+                Err(e) => {
+                    eprintln!("listen: poll: {}", redact(&e));
+                    let wait = pacer
+                        .cooling()
+                        .map(|d| d.max(Duration::from_secs(interval)))
+                        .unwrap_or(Duration::from_secs(interval));
+                    drop(api);
+                    thread::sleep(wait);
+                    continue;
+                }
+            };
+            drop(api);
 
-        // User batch: pin registration target to the repo that needs work.
-        // Never recycle while the active repo still has matching in-flight jobs.
-        if matches!(cli.scope, Scope::User) {
-            if let Some(ref r) = target_repo {
-                let active = get_active_target(&cli);
-                if active.as_deref() != Some(r.as_str()) {
-                    let busy = active
-                        .as_ref()
-                        .map(|a| active_repo_still_busy(&cli, a, &api, &mut pacer).unwrap_or(false))
-                        .unwrap_or(false);
-                    if container_running(&cli.container) && busy {
-                        eprintln!("listen: sticky on {active:?} (still busy); defer move to {r}");
-                        if let Some(a) = active {
-                            cli.repo = Some(a);
+            let running_n = pool
+                .claims()
+                .map(|c| {
+                    c.iter()
+                        .filter(|x| x.container.starts_with(&cli.container) && container_running(&x.container))
+                        .count()
+                })
+                .unwrap_or(0);
+
+            if jobs.is_empty() {
+                if running_n == 0 {
+                    let since = idle_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= Duration::from_secs(idle_secs) {
+                        // nothing to down at base container in pure multi-worker mode
+                        idle_since = None;
+                    }
+                } else {
+                    idle_since = None;
+                }
+            } else {
+                idle_since = None;
+                let mut slot: u32 = 0;
+                let mut spawned = 0u32;
+                for job in &jobs {
+                    // GPU listener only takes gpu-tier jobs; CPU skips gpu.
+                    let tier = size_for_job(&job.job_name, &job.labels, cli.gpu);
+                    if cli.gpu && tier != SizeTier::Gpu {
+                        continue;
+                    }
+                    if !cli.gpu && tier == SizeTier::Gpu {
+                        continue;
+                    }
+                    // find free slot id
+                    while slot < max_local {
+                        let cname = format!("{}-w{slot}", cli.container);
+                        if !container_running(&cname) {
+                            break;
                         }
-                    } else if container_running(&cli.container) {
-                        eprintln!("listen: demand moved {active:?} → {r}; recycling runner");
-                        let _ = down(&cli, true);
-                        cli.repo = Some(r.clone());
+                        slot += 1;
+                    }
+                    if slot >= max_local {
+                        eprintln!("pool: local max workers {max_local} reached");
+                        break;
+                    }
+                    if let Err(e) = spawn_sized_worker(&cli, &pool, slot, job) {
+                        eprintln!("pool: spawn failed: {}", redact(&e));
+                    } else {
+                        spawned += 1;
+                    }
+                    slot += 1;
+                }
+                if spawned > 0 {
+                    let (uc, um, n) = pool.usage().unwrap_or((0.0, 0, 0));
+                    eprintln!(
+                        "pool: spawned={spawned} usage={uc:.2}/{:.0}c {um}/{}MiB claims={n}",
+                        pool.max_cpus, pool.max_memory_mib
+                    );
+                }
+            }
+        } else {
+            // Legacy single-container listen path
+            let (need, target_repo) = match demand(&cli, &api, &mut pacer) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("listen: poll: {}", redact(&e));
+                    let wait = pacer
+                        .cooling()
+                        .map(|d| d.max(Duration::from_secs(interval)))
+                        .unwrap_or(Duration::from_secs(interval));
+                    drop(api);
+                    thread::sleep(wait);
+                    continue;
+                }
+            };
+
+            if matches!(cli.scope, Scope::User) {
+                if let Some(ref r) = target_repo {
+                    let active = get_active_target(&cli);
+                    if active.as_deref() != Some(r.as_str()) {
+                        let busy = active
+                            .as_ref()
+                            .map(|a| {
+                                active_repo_still_busy(&cli, a, &api, &mut pacer).unwrap_or(false)
+                            })
+                            .unwrap_or(false);
+                        if container_running(&cli.container) && busy {
+                            eprintln!("listen: sticky on {active:?} (still busy); defer move to {r}");
+                            if let Some(a) = active {
+                                cli.repo = Some(a);
+                            }
+                        } else if container_running(&cli.container) {
+                            eprintln!("listen: demand moved {active:?} → {r}; recycling runner");
+                            let _ = down(&cli, true);
+                            cli.repo = Some(r.clone());
+                        } else {
+                            cli.repo = Some(r.clone());
+                        }
                     } else {
                         cli.repo = Some(r.clone());
                     }
-                } else {
-                    cli.repo = Some(r.clone());
                 }
             }
-        }
-        drop(api);
+            drop(api);
 
-        let running = container_running(&cli.container);
-
-        if need && !running {
-            eprintln!(
-                "listen: demand — up ({})",
-                cli.repo.as_deref().unwrap_or("org")
-            );
-            if let Err(e) = up(&cli) {
-                eprintln!("listen: up failed: {}", redact(&e));
+            // Vertical size for single worker from first matching job name if any
+            if need {
+                if let Ok(api2) = github_token() {
+                    if let Ok(jobs) = list_demand_jobs(&cli, &api2, &mut pacer, 1) {
+                        if let Some(j) = jobs.first() {
+                            let tier = size_for_job(&j.job_name, &j.labels, cli.gpu);
+                            let (c, m) = resources_for_tier(tier);
+                            cli.cpus = c;
+                            cli.memory = m;
+                            eprintln!(
+                                "listen: size tier={} cpus={} mem={} job={}",
+                                tier.as_str(),
+                                cli.cpus,
+                                cli.memory,
+                                j.job_name
+                            );
+                        }
+                    }
+                }
             }
-            idle_since = None;
-        } else if !need && running {
-            let since = idle_since.get_or_insert_with(Instant::now);
-            if since.elapsed() >= Duration::from_secs(idle_secs) {
-                eprintln!("listen: idle {idle_secs}s — down");
-                if let Err(e) = down(&cli, true) {
-                    eprintln!("listen: down failed: {}", redact(&e));
+
+            let running = container_running(&cli.container);
+            if need && !running {
+                eprintln!(
+                    "listen: demand — up ({})",
+                    cli.repo.as_deref().unwrap_or("org")
+                );
+                if let Err(e) = up(&cli) {
+                    eprintln!("listen: up failed: {}", redact(&e));
                 }
                 idle_since = None;
+            } else if !need && running {
+                let since = idle_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= Duration::from_secs(idle_secs) {
+                    eprintln!("listen: idle {idle_secs}s — down");
+                    if let Err(e) = down(&cli, true) {
+                        eprintln!("listen: down failed: {}", redact(&e));
+                    }
+                    idle_since = None;
+                }
+            } else {
+                idle_since = None;
             }
-        } else {
-            idle_since = None;
         }
 
         thread::sleep(Duration::from_secs(interval));
@@ -2884,6 +3254,10 @@ impl Cli {
             repos_per_tick: self.repos_per_tick,
             reg_min_gap_secs: self.reg_min_gap_secs,
             reg_max_per_hour: self.reg_max_per_hour,
+            pool_cpus: self.pool_cpus.clone(),
+            pool_memory: self.pool_memory.clone(),
+            pool_max_workers: self.pool_max_workers,
+            pool_mode: self.pool_mode.clone(),
             build_dir: self.build_dir.clone(),
             mode: self.mode.clone(),
             wake_token: self.wake_token.clone(),
@@ -2920,6 +3294,10 @@ struct CliSnap {
     repos_per_tick: u32,
     reg_min_gap_secs: u64,
     reg_max_per_hour: u32,
+    pool_cpus: String,
+    pool_memory: String,
+    pool_max_workers: u32,
+    pool_mode: String,
     mode: Mode,
     wake_token: Option<String>,
     full_auto: bool,
@@ -2954,6 +3332,10 @@ fn cli_snapshot(cli: &Cli) -> CliSnap {
         repos_per_tick: cli.repos_per_tick,
         reg_min_gap_secs: cli.reg_min_gap_secs,
         reg_max_per_hour: cli.reg_max_per_hour,
+        pool_cpus: cli.pool_cpus.clone(),
+        pool_memory: cli.pool_memory.clone(),
+        pool_max_workers: cli.pool_max_workers,
+        pool_mode: cli.pool_mode.clone(),
         mode: cli.mode.clone(),
         wake_token: cli.wake_token.clone(),
         full_auto: cli.full_auto,
@@ -2990,6 +3372,10 @@ fn snap_to_cli(s: &CliSnap) -> Cli {
         repos_per_tick: s.repos_per_tick,
         reg_min_gap_secs: s.reg_min_gap_secs,
         reg_max_per_hour: s.reg_max_per_hour,
+        pool_cpus: s.pool_cpus.clone(),
+        pool_memory: s.pool_memory.clone(),
+        pool_max_workers: s.pool_max_workers,
+        pool_mode: s.pool_mode.clone(),
         build_dir: None,
         mode: s.mode.clone(),
         wake_token: s.wake_token.clone(),
