@@ -793,7 +793,36 @@ pub fn redact(s: &str) -> String {
     out
 }
 
+/// Host `/dev/null` must be a world-writable char device (1,3). A regular file
+/// (seen when UID 1001 accidentally creates `/dev/null`) breaks fuse-overlayfs
+/// and leaves runners stuck in `Created` with all Actions jobs queued forever.
+fn assert_host_dev_null_ok() -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        let meta = fs::metadata("/dev/null").map_err(|e| format!("/dev/null: {e}"))?;
+        if !meta.file_type().is_char_device() {
+            return Err(
+                "/dev/null is not a character device (host corruption). \
+                 Repair as root: rm -f /dev/null && mknod -m 666 /dev/null c 1 3 && chown root:root /dev/null \
+                 — rootless Podman cannot start runners until this is fixed."
+                    .into(),
+            );
+        }
+        // mode should allow all read/write (0666)
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o222 == 0 {
+            return Err(format!(
+                "/dev/null mode {mode:o} is not writable — chmod 666 /dev/null"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_cli(cli: &Cli) -> Result<(), String> {
+    assert_host_dev_null_ok()?;
     match cli.scope {
         Scope::Repo => {
             if cli.repo.is_none() {
