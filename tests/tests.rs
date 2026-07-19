@@ -383,3 +383,21 @@ fn test_runner_user_and_sha_validation() {
     ));
     assert!(!is_safe_url("file:///etc/passwd"));
 }
+
+/// Regression: work image must force JS actions onto node24 via the documented
+/// runner env (FORCE_JAVASCRIPT_ACTIONS_TO_NODE24). The internal-only knob
+/// ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION does not affect JS actions.
+#[test]
+fn test_work_image_forces_js_actions_node24() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packaging/Containerfile");
+    let body =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    assert!(
+        body.contains("FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true"),
+        "Containerfile must set FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true for JS actions"
+    );
+    assert!(
+        !body.contains("ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION=node24"),
+        "do not use ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION for JS actions (internal only)"
+    );
+}

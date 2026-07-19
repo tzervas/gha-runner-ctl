@@ -5,6 +5,7 @@
 # Fleet work tools (baked in so jobs need not per-install):
 #   - gitleaks (pinned binary → /usr/local/bin)
 #   - Rust 1.96 via rustup for UID 1001 (/home/runner/.cargo)
+#   - FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true (JS actions on bundled node24)
 #
 # Runs as non-root UID 1001 (trivy DS-0002). Snapshot volume must be owned by 1001.
 # Style: one logical step per RUN (no && chains).
@@ -27,7 +28,16 @@ ENV DEBIAN_FRONTEND=noninteractive \
     RUNNER_USER=runner \
     CARGO_HOME=/home/runner/.cargo \
     RUSTUP_HOME=/home/runner/.rustup \
-    PATH=/home/runner/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    PATH=/home/runner/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true
+
+# Node runtime for JavaScript actions: the runner tarball bundles node20 and node24.
+# Actions declaring `using: node20` are upgraded to the bundled node24 when this env is set
+# (GitHub's documented transition knob — see NodeUtil.DetermineActionsNodeVersion /
+# FORCE_JAVASCRIPT_ACTIONS_TO_NODE24). Do NOT use ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION:
+# that only selects the runner's internal node (hashFiles etc.) and does not affect JS actions.
+# Node 24 is the platform default as of 2026-06-16; this env keeps the fleet on node24 even if
+# the server feature flag rolls back. Runner version pin is unchanged — runtime selection only.
 
 # Install HTTPS transport and CA certificates first to support secure updates.
 RUN apt-get update \
