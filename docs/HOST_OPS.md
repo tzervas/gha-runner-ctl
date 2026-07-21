@@ -6,7 +6,8 @@ you without explicit `--scope org` flags.
 
 ## Rootless fleet agent (required for production)
 
-WSL / ephemeral dev often opens a root shell. Bootstrap from there, then drop:
+Works the same on **native Linux** and on **optional WSL2** (Linux distro).
+Ephemeral dev / first bootstrap often uses a root shell — then drop privileges:
 
 ```bash
 # packages + user gha-agent (nologin, no sudo) + subuid + rootless config

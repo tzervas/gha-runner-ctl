@@ -1,3 +1,11 @@
+## 0.2.11
+
+### Added
+- **docs/HOST_PLATFORMS.md** — Linux-first multi-host guidance; FreeBSD/OpenBSD/Unix via Linux VM; Windows WSL2 optional (not required).
+
+### Changed
+- README: platforms summary; WSL no longer implied as primary; GPU framed as optional.
+
 ## 0.2.10 — 2026-07-21
 
 ### Changed

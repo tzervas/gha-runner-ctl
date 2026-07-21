@@ -5,7 +5,14 @@
 [![Security](https://github.com/tzervas/gha-runner-ctl/actions/workflows/fleet-security.yml/badge.svg?branch=main)](https://github.com/tzervas/gha-runner-ctl/actions/workflows/fleet-security.yml?query=branch%3Amain)
 <!-- FLEET-BADGES:END -->
 
-Hardened Rust fleet agent for GitHub Actions self-hosted runners on Podman: long-lived control plane, ephemeral (or warm-retain) work containers, paced registration, multi-instance CPU + soft GPU slices (WSL).
+Hardened Rust fleet agent for GitHub Actions self-hosted runners on **Podman**:
+long-lived control plane, ephemeral (or warm-retain) work containers, paced
+registration, multi-instance CPU + optional soft GPU slices.
+
+**Platforms:** **Linux-first** (any distro with rootless Podman). Also suitable
+for FreeBSD/OpenBSD/Unix hosts via a **Linux VM** or supported container stack.
+**Windows WSL2 is optional** — a convenient Linux userland on Windows, **not required**.
+See **[docs/HOST_PLATFORMS.md](docs/HOST_PLATFORMS.md)**.
 
 [![CI](https://github.com/tzervas/gha-runner-ctl/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tzervas/gha-runner-ctl/actions/workflows/ci.yml?query=branch%3Amain)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -14,7 +21,7 @@ Hardened Rust fleet agent for GitHub Actions self-hosted runners on Podman: long
 
 CI badge reflects self-hosted workflow status on `main` (`runs-on: [self-hosted, linux, x64, podman]`). It is only green when a host listener registers a runner and completes the job—no GitHub-hosted fallback.
 
-Docs: [QUICKSTART](docs/QUICKSTART.md) · [WORK_IMAGES](docs/WORK_IMAGES.md) · [HOST_OPS](docs/HOST_OPS.md) · [SECURITY](docs/SECURITY.md) · [CONSUMERS](docs/CONSUMERS.md) · [DESIGN](docs/DESIGN.md)
+Docs: [QUICKSTART](docs/QUICKSTART.md) · [HOST_PLATFORMS](docs/HOST_PLATFORMS.md) · [WORK_IMAGES](docs/WORK_IMAGES.md) · [HOST_OPS](docs/HOST_OPS.md) · [SECURITY](docs/SECURITY.md) · [CONSUMERS](docs/CONSUMERS.md) · [DESIGN](docs/DESIGN.md)
 
 [MIT](LICENSE) · [NOTICE](NOTICE) (cites [actions/runner](https://github.com/actions/runner), also MIT)
 
@@ -95,7 +102,18 @@ sequenceDiagram
 | Idle cost | Ephemeral work + idle timeout (GPU freed when no GPU workers remain); or warm retain for push |
 | Many repos | Prefer `warm` one retain endpoint per allowlisted repo; else user batch / org |
 | Horizontal | Multiple agent units (locks per `--container`): e.g. 1× CPU + 2× GPU soft-slices |
-| GPU (WSL) | `--gpu` + optional `--gpu-slice a\|b` (time-share on consumer GeForce; no MIG) |
+| GPU (optional) | `--gpu` + optional `--gpu-slice a\|b` (time-share on consumer GeForce; no MIG). WSL GPU plumbing is one path among others — see HOST_PLATFORMS |
+
+## Platforms (summary)
+
+| Host | How to run gha-runner-ctl |
+|------|---------------------------|
+| **Linux** (native) | **Recommended** — rootless Podman + `gha-agent` user |
+| **FreeBSD / OpenBSD / Unix** | Prefer Linux VM; or Podman where available + `--skip-host-update` |
+| **Windows** | Optional **WSL2 Linux distro** only (not Win32) |
+| **macOS** | Use a remote/local Linux VM as the fleet host |
+
+Full matrix, systemd, containers/VMs for testing: **[docs/HOST_PLATFORMS.md](docs/HOST_PLATFORMS.md)**.
 
 ## Key features
 
@@ -113,7 +131,7 @@ sequenceDiagram
 
 ## Requirements
 
-- Podman on the host
+- A **Unix-like host** with **Podman** (Linux native preferred; see [HOST_PLATFORMS](docs/HOST_PLATFORMS.md))
 - Rust 1.96+ only if building from source
 - Token that can create runner registration tokens:
   - Repo: admin on that repository  
@@ -121,6 +139,8 @@ sequenceDiagram
   - User batch: ability to register runners on each owned personal repo that will run jobs  
 
 Personal GitHub user accounts only get repo-scoped runners. For one registration across many repos under an org, use `--scope org`.
+
+**Not required:** WSL, Windows, or a GPU. Those are optional deployment details.
 
 ## Install
 
