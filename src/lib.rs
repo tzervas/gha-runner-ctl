@@ -31,7 +31,16 @@ const DEFAULT_CONTAINER: &str = "gha-runner-ctl";
 const DEFAULT_VOLUME: &str = "gha-runner-ctl-data";
 const DEFAULT_LABELS: &str = "self-hosted,linux,x64,podman";
 const DEFAULT_NAME: &str = "shared-podman-1";
-const UA: &str = "gha-runner-ctl/0.2.8";
+/// Helper used only to extract/seed the runner kit into a volume (any image with shell+curl works).
+const DEFAULT_SEED_HELPER_IMAGE: &str = "docker.io/library/ubuntu:24.04";
+/// Numeric uid:gid inside work containers (stock packaging image uses 1001).
+const DEFAULT_RUNNER_USER: &str = "1001:1001";
+/// Official actions/runner pin (overridable via GHA_RUNNER_VERSION / GHA_RUNNER_SHA256 / GHA_RUNNER_ARCH).
+const DEFAULT_RUNNER_VERSION: &str = "2.335.1";
+const DEFAULT_RUNNER_SHA256: &str =
+    "4ef2f25285f0ae4477f1fe1e346db76d2f3ebf03824e2ddd1973a2819bf6c8cf";
+const DEFAULT_RUNNER_ARCH: &str = "x64";
+const UA: &str = "gha-runner-ctl/0.2.9";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 const MIN_POLL_SECS: u64 = 5;
 const MAX_POLL_SECS: u64 = 3600;
@@ -72,6 +81,28 @@ pub enum Scope {
     User,
 }
 
+/// How the work container image is obtained.
+#[derive(Debug, Clone, ValueEnum, PartialEq, Eq)]
+pub enum ImageMode {
+    /// `build` for the default stock tag when packaging is available; otherwise `external`.
+    Auto,
+    /// Build `packaging/Containerfile` and tag as `--image`.
+    Build,
+    /// Use any OCI image as-is (pull per policy); inject actions/runner via volume + entrypoint.
+    External,
+}
+
+/// Podman `--pull` policy for work containers and prepare.
+#[derive(Debug, Clone, ValueEnum, PartialEq, Eq)]
+pub enum PullPolicy {
+    /// Never pull (stock hot path after prepare build).
+    Never,
+    /// Pull only if the image is missing locally.
+    Missing,
+    /// Always pull/refresh the image digest.
+    Always,
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "gha-runner-ctl",
@@ -100,8 +131,48 @@ pub struct Cli {
     #[arg(long, env = "GHA_AUTO", global = true, default_value_t = false)]
     auto: bool,
 
+    /// Work container image (any OCI ref: distro, custom CI image, private registry, digest).
+    /// Examples: `localhost/gha-runner-ctl:latest`, `docker.io/library/ubuntu:24.04`,
+    /// `ghcr.io/org/ci:1.2`, `registry.example.com:5000/ci@sha256:…`
     #[arg(long, env = "GHA_IMAGE", default_value = DEFAULT_IMAGE, global = true)]
     image: String,
+
+    /// How to obtain `--image`: auto | build | external (see `ImageMode`).
+    #[arg(long, env = "GHA_IMAGE_MODE", value_enum, default_value_t = ImageMode::Auto, global = true)]
+    image_mode: ImageMode,
+
+    /// Podman pull policy for prepare/up: never | missing | always.
+    /// When unset (`auto` via empty default path): `never` for build mode, `missing` for external.
+    #[arg(long, env = "GHA_PULL_POLICY", value_enum, global = true)]
+    pull_policy: Option<PullPolicy>,
+
+    /// uid:gid (or user name) for work containers. Stock image: 1001:1001.
+    #[arg(long, env = "GHA_RUNNER_USER", default_value = DEFAULT_RUNNER_USER, global = true)]
+    runner_user: String,
+
+    /// Helper image used only to seed/copy the runner kit into volumes (needs shell + curl/tar).
+    #[arg(long, env = "GHA_SEED_HELPER_IMAGE", default_value = DEFAULT_SEED_HELPER_IMAGE, global = true)]
+    seed_helper_image: String,
+
+    /// Official actions/runner version when seeding external images (or empty volume).
+    #[arg(long, env = "GHA_RUNNER_VERSION", default_value = DEFAULT_RUNNER_VERSION, global = true)]
+    runner_version: String,
+
+    /// SHA256 of the actions-runner linux tarball (must match --runner-version / --runner-arch).
+    #[arg(long, env = "GHA_RUNNER_SHA256", default_value = DEFAULT_RUNNER_SHA256, global = true)]
+    runner_sha256: String,
+
+    /// actions/runner arch segment in the release asset name (`x64`, `arm64`, …).
+    #[arg(long, env = "GHA_RUNNER_ARCH", default_value = DEFAULT_RUNNER_ARCH, global = true)]
+    runner_arch: String,
+
+    /// Optional full URL for the runner tarball (overrides version/arch URL construction).
+    #[arg(long, env = "GHA_RUNNER_SEED_URL", global = true)]
+    runner_seed_url: Option<String>,
+
+    /// Optional host path to entrypoint.sh (default: packaging/entrypoint.sh next to Containerfile).
+    #[arg(long, env = "GHA_ENTRYPOINT", global = true)]
+    entrypoint: Option<PathBuf>,
 
     #[arg(long, env = "GHA_CONTAINER", default_value = DEFAULT_CONTAINER, global = true)]
     container: String,
@@ -228,7 +299,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand, Clone)]
 pub enum Cmd {
-    /// Build image + seed volume snapshot (updates host packages first unless skipped)
+    /// Obtain work image (build packaging or pull external) + seed runner volume
     Prepare {
         #[arg(long, default_value_t = true)]
         with_container: bool,
@@ -703,12 +774,110 @@ pub fn is_safe_repo(s: &str) -> bool {
     parts.len() == 2 && parts.iter().all(|p| is_safe_ident(p))
 }
 
+/// OCI image reference safety: registry/path:tag or @sha256:hex, optional host:port.
+/// Rejects shell metacharacters and path traversal; allows common registry punctuation.
 pub fn is_safe_image(s: &str) -> bool {
+    if s.is_empty() || s.len() > 384 || s.contains("..") {
+        return false;
+    }
+    // No whitespace or shell metacharacters.
+    if s.chars().any(|c| {
+        c.is_ascii_whitespace()
+            || matches!(
+                c,
+                ';' | '|'
+                    | '&'
+                    | '$'
+                    | '`'
+                    | '('
+                    | ')'
+                    | '<'
+                    | '>'
+                    | '\''
+                    | '"'
+                    | '\\'
+                    | '\n'
+                    | '\r'
+            )
+    }) {
+        return false;
+    }
+    s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | '@'))
+}
+
+/// Stock packaging default tag (only used by `ImageMode::Auto` convenience).
+pub fn is_default_stock_image(image: &str) -> bool {
+    let img = image.trim();
+    img == DEFAULT_IMAGE
+        || img == "localhost/gha-runner-ctl"
+        || img.starts_with("localhost/gha-runner-ctl:")
+}
+
+pub fn is_safe_runner_user(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() || s.len() > 64 {
+        return false;
+    }
+    // name, uid, name:group, uid:gid
+    s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+}
+
+pub fn is_safe_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+pub fn is_safe_runner_version(s: &str) -> bool {
     !s.is_empty()
-        && s.len() <= 256
-        && !s.contains("..")
+        && s.len() <= 32
         && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':'))
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+}
+
+pub fn is_safe_url(s: &str) -> bool {
+    (s.starts_with("https://") || s.starts_with("http://"))
+        && s.len() <= 512
+        && !s.contains("..")
+        && s.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(
+                    c,
+                    '-' | '_' | '.' | '/' | ':' | '?' | '=' | '&' | '%' | '+' | '~'
+                )
+        })
+}
+
+/// Resolve auto → build|external without locking users to a single image name.
+pub fn effective_image_mode(mode: &ImageMode, image: &str) -> ImageMode {
+    match mode {
+        ImageMode::Auto => {
+            if is_default_stock_image(image) {
+                ImageMode::Build
+            } else {
+                ImageMode::External
+            }
+        }
+        other => other.clone(),
+    }
+}
+
+pub fn effective_pull_policy(cli_policy: Option<&PullPolicy>, mode: &ImageMode) -> PullPolicy {
+    if let Some(p) = cli_policy {
+        return p.clone();
+    }
+    match mode {
+        ImageMode::Build => PullPolicy::Never,
+        ImageMode::External | ImageMode::Auto => PullPolicy::Missing,
+    }
+}
+
+pub fn pull_policy_arg(p: &PullPolicy) -> &'static str {
+    match p {
+        PullPolicy::Never => "never",
+        PullPolicy::Missing => "missing",
+        PullPolicy::Always => "always",
+    }
 }
 
 pub fn is_safe_labels(s: &str) -> bool {
@@ -885,6 +1054,34 @@ fn validate_cli(cli: &Cli) -> Result<(), String> {
     }
     if !is_safe_image(&cli.image) {
         return Err("invalid --image".into());
+    }
+    if !is_safe_image(&cli.seed_helper_image) {
+        return Err("invalid --seed-helper-image".into());
+    }
+    if !is_safe_runner_user(&cli.runner_user) {
+        return Err("invalid --runner-user (expected uid:gid or name)".into());
+    }
+    if !is_safe_runner_version(&cli.runner_version) {
+        return Err("invalid --runner-version".into());
+    }
+    if !is_safe_sha256_hex(&cli.runner_sha256) {
+        return Err("invalid --runner-sha256 (64 hex chars)".into());
+    }
+    if !is_safe_ident(&cli.runner_arch) {
+        return Err("invalid --runner-arch".into());
+    }
+    if let Some(url) = cli.runner_seed_url.as_ref() {
+        if !is_safe_url(url) {
+            return Err("invalid --runner-seed-url (http/https only)".into());
+        }
+    }
+    if let Some(p) = cli.entrypoint.as_ref() {
+        if !p.is_file() {
+            return Err(format!(
+                "entrypoint not found: {} (GHA_ENTRYPOINT / --entrypoint)",
+                p.display()
+            ));
+        }
     }
     if !is_safe_ident(&cli.container) {
         return Err("invalid --container".into());
@@ -2013,10 +2210,44 @@ fn prepare(cli: &Cli, with_container: bool, skip_host_update: bool) -> Result<()
         eprintln!("prepare: skipping host update (--skip-host-update / GHA_SKIP_HOST_UPDATE)");
     }
 
-    // Drop stale image so `podman build` cannot silently reuse an old rootfs layer
-    // when only host-side packages changed (still uses cache for unchanged layers).
-    let _ = podman(&["image", "exists", &cli.image]);
+    let mode = effective_image_mode(&cli.image_mode, &cli.image);
+    let pull = effective_pull_policy(cli.pull_policy.as_ref(), &mode);
+    eprintln!(
+        "prepare: image_mode={:?} (resolved={:?}) pull={} image={}",
+        cli.image_mode,
+        mode,
+        pull_policy_arg(&pull),
+        cli.image
+    );
 
+    match mode {
+        ImageMode::Build => prepare_build_image(cli)?,
+        ImageMode::External => ensure_image_present(&cli.image, &pull)?,
+        ImageMode::Auto => unreachable!("effective_image_mode never returns Auto"),
+    }
+
+    if !volume_exists(&cli.volume) {
+        eprintln!("prepare: creating volume {}", cli.volume);
+        podman(&["volume", "create", &cli.volume])?;
+    }
+
+    match mode {
+        ImageMode::Build => seed_volume_from_stock_image(cli)?,
+        ImageMode::External => seed_volume_runner_kit(cli)?,
+        ImageMode::Auto => unreachable!("effective_image_mode never returns Auto"),
+    }
+
+    if with_container {
+        eprintln!(
+            "prepare: snapshot ready (cpus={} memory={} user={})",
+            cli.cpus, cli.memory, cli.runner_user
+        );
+    }
+    eprintln!("prepare: done");
+    Ok(())
+}
+
+fn prepare_build_image(cli: &Cli) -> Result<(), String> {
     let dir = resolve_build_dir(cli)?;
     eprintln!("prepare: building {} from {}", cli.image, dir.display());
     // --pull=always for base OS so snapshot is not stuck on an old ubuntu digest
@@ -2029,13 +2260,76 @@ fn prepare(cli: &Cli, with_container: bool, skip_host_update: bool) -> Result<()
         "Containerfile",
         dir.to_str().unwrap_or("."),
     ])?;
+    Ok(())
+}
 
-    if !volume_exists(&cli.volume) {
-        eprintln!("prepare: creating volume {}", cli.volume);
-        podman(&["volume", "create", &cli.volume])?;
+fn ensure_image_present(image: &str, pull: &PullPolicy) -> Result<(), String> {
+    let exists = podman(&["image", "exists", image]).is_ok();
+    match pull {
+        PullPolicy::Never => {
+            if !exists {
+                return Err(format!(
+                    "image {image} missing and pull policy is never — pull it, set GHA_PULL_POLICY=missing|always, or use image-mode=build"
+                ));
+            }
+            eprintln!("prepare: using local image {image} (pull=never)");
+            Ok(())
+        }
+        PullPolicy::Missing => {
+            if exists {
+                eprintln!("prepare: image {image} already present (pull=missing)");
+                Ok(())
+            } else {
+                eprintln!("prepare: pulling {image} (pull=missing)");
+                podman(&["pull", image])?;
+                Ok(())
+            }
+        }
+        PullPolicy::Always => {
+            eprintln!("prepare: pulling {image} (pull=always)");
+            podman(&["pull", image])?;
+            Ok(())
+        }
     }
+}
 
-    eprintln!("prepare: seeding volume snapshot…");
+fn chown_spec(cli: &Cli) -> String {
+    // Prefer numeric uid:gid for chown inside helper containers.
+    let u = cli.runner_user.trim();
+    if u.contains(':')
+        && u.split(':')
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+    {
+        u.to_string()
+    } else if u.chars().all(|c| c.is_ascii_digit()) {
+        format!("{u}:{u}")
+    } else {
+        // Name-only: best-effort leave ownership to entrypoint / image defaults.
+        DEFAULT_RUNNER_USER.to_string()
+    }
+}
+
+fn seed_volume_from_stock_image(cli: &Cli) -> Result<(), String> {
+    let chown = chown_spec(cli);
+    let script = format!(
+        r#"
+set -euo pipefail
+if [[ ! -x /opt/actions-runner/run.sh ]]; then
+  if [[ -x /opt/actions-runner-seed/run.sh ]]; then
+    cp -a /opt/actions-runner-seed/. /opt/actions-runner/
+  else
+    echo "stock image missing /opt/actions-runner-seed — rebuild packaging image" >&2
+    exit 1
+  fi
+fi
+chown -R {chown} /opt/actions-runner 2>/dev/null || true
+chmod -R go-w /opt/actions-runner 2>/dev/null || true
+date -u +%Y-%m-%dT%H:%M:%SZ > /opt/actions-runner/.snapshot-baseline
+chown {chown} /opt/actions-runner/.snapshot-baseline 2>/dev/null || true
+echo ok
+"#
+    );
+    eprintln!("prepare: seeding volume from stock image snapshot…");
     podman(&[
         "run",
         "--rm",
@@ -2047,28 +2341,122 @@ fn prepare(cli: &Cli, with_container: bool, skip_host_update: bool) -> Result<()
         &format!("{}:/opt/actions-runner:Z", cli.volume),
         &cli.image,
         "-c",
-        r"
-set -euo pipefail
-if [[ ! -x /opt/actions-runner/run.sh ]]; then
-  cp -a /opt/actions-runner-seed/. /opt/actions-runner/
-fi
-# Match image non-root user (UID 1001)
-chown -R 1001:1001 /opt/actions-runner 2>/dev/null || true
-chmod -R go-w /opt/actions-runner 2>/dev/null || true
-date -u +%Y-%m-%dT%H:%M:%SZ > /opt/actions-runner/.snapshot-baseline
-chown 1001:1001 /opt/actions-runner/.snapshot-baseline 2>/dev/null || true
-echo ok
-",
+        &script,
     ])?;
-
-    if with_container {
-        eprintln!(
-            "prepare: snapshot ready (cpus={} memory={})",
-            cli.cpus, cli.memory
-        );
-    }
-    eprintln!("prepare: done");
     Ok(())
+}
+
+/// Inject official (or custom-URL) actions/runner into the work volume for any rootfs image.
+fn seed_volume_runner_kit(cli: &Cli) -> Result<(), String> {
+    let chown = chown_spec(cli);
+    let url = cli.runner_seed_url.clone().unwrap_or_else(|| {
+        format!(
+            "https://github.com/actions/runner/releases/download/v{ver}/actions-runner-linux-{arch}-{ver}.tar.gz",
+            ver = cli.runner_version,
+            arch = cli.runner_arch
+        )
+    });
+    if !is_safe_url(&url) {
+        return Err("runner seed URL failed safety check".into());
+    }
+    let sha = cli.runner_sha256.clone();
+    // Idempotent: skip download when run.sh already present (user pre-seeded or re-prepare).
+    let script = format!(
+        r#"
+set -euo pipefail
+HOME_DIR=/opt/actions-runner
+if [[ -x "$HOME_DIR/run.sh" ]]; then
+  echo "runner kit already present on volume — refreshing ownership only"
+  chown -R {chown} "$HOME_DIR" 2>/dev/null || true
+  chmod -R go-w "$HOME_DIR" 2>/dev/null || true
+  date -u +%Y-%m-%dT%H:%M:%SZ > "$HOME_DIR/.snapshot-baseline"
+  chown {chown} "$HOME_DIR/.snapshot-baseline" 2>/dev/null || true
+  exit 0
+fi
+export DEBIAN_FRONTEND=noninteractive
+if command -v apt-get >/dev/null 2>&1; then
+  apt-get update -qq
+  apt-get install -y -qq --no-install-recommends ca-certificates curl tar gzip coreutils >/dev/null
+elif command -v microdnf >/dev/null 2>&1; then
+  microdnf install -y ca-certificates curl tar gzip coreutils >/dev/null
+elif command -v dnf >/dev/null 2>&1; then
+  dnf install -y ca-certificates curl tar gzip coreutils >/dev/null
+elif command -v apk >/dev/null 2>&1; then
+  apk add --no-cache ca-certificates curl tar gzip coreutils >/dev/null
+fi
+command -v curl >/dev/null
+command -v tar >/dev/null
+mkdir -p "$HOME_DIR"
+cd "$HOME_DIR"
+curl -fsSL -o actions-runner.tar.gz "{url}"
+echo "{sha}  actions-runner.tar.gz" | sha256sum -c -
+tar xzf actions-runner.tar.gz
+rm -f actions-runner.tar.gz
+# Best-effort OS deps for the runner (official script; may no-op on non-Debian).
+if [[ -x ./bin/installdependencies.sh ]]; then
+  ./bin/installdependencies.sh || true
+fi
+chown -R {chown} "$HOME_DIR" 2>/dev/null || true
+chmod -R go-w "$HOME_DIR" 2>/dev/null || true
+date -u +%Y-%m-%dT%H:%M:%SZ > "$HOME_DIR/.snapshot-baseline"
+chown {chown} "$HOME_DIR/.snapshot-baseline" 2>/dev/null || true
+echo ok
+"#
+    );
+    // Always seed via configurable helper (bash+curl+pkg manager). Work image stays the job rootfs.
+    let helper = cli.seed_helper_image.as_str();
+    eprintln!(
+        "prepare: seeding runner kit into volume via helper {} (work rootfs image remains {})",
+        helper, cli.image
+    );
+    ensure_image_present(helper, &PullPolicy::Missing)?;
+    let vol = format!("{}:/opt/actions-runner:Z", cli.volume);
+    podman(&[
+        "run",
+        "--rm",
+        "--security-opt",
+        "no-new-privileges",
+        "--entrypoint",
+        "/bin/bash",
+        "-v",
+        &vol,
+        helper,
+        "-c",
+        &script,
+    ])?;
+    Ok(())
+}
+
+fn resolve_entrypoint_path(cli: &Cli) -> Result<PathBuf, String> {
+    if let Some(p) = &cli.entrypoint {
+        let p = p.canonicalize().map_err(|e| format!("entrypoint: {e}"))?;
+        if !p.is_file() {
+            return Err(format!("entrypoint not a file: {}", p.display()));
+        }
+        return Ok(p);
+    }
+    let dir = resolve_build_dir(cli)?;
+    let p = dir.join("entrypoint.sh");
+    if p.is_file() {
+        return Ok(p);
+    }
+    Err(format!(
+        "entrypoint.sh not found under {} — set GHA_ENTRYPOINT to your runner entrypoint script",
+        dir.display()
+    ))
+}
+
+fn work_image_pull_arg(cli: &Cli) -> &'static str {
+    let mode = effective_image_mode(&cli.image_mode, &cli.image);
+    let pull = effective_pull_policy(cli.pull_policy.as_ref(), &mode);
+    pull_policy_arg(&pull)
+}
+
+fn needs_host_entrypoint(cli: &Cli) -> bool {
+    matches!(
+        effective_image_mode(&cli.image_mode, &cli.image),
+        ImageMode::External
+    )
 }
 
 fn private_env_path() -> PathBuf {
@@ -2237,10 +2625,13 @@ fn up(cli: &Cli) -> Result<(), String> {
         let _ = podman(&["rm", "-f", &cli.container]);
     }
 
+    let img_mode = effective_image_mode(&cli.image_mode, &cli.image);
+    let pull_arg = work_image_pull_arg(cli);
     eprintln!(
-        "up: scope={:?} mode={:?} ephemeral={ephemeral} url={}",
+        "up: scope={:?} mode={:?} image_mode={img_mode:?} pull={pull_arg} ephemeral={ephemeral} user={} url={}",
         cli.scope,
         cli.mode,
+        cli.runner_user,
         github_url(cli)
     );
     let env_path_str = env_path.to_str().ok_or("env path not utf-8")?.to_string();
@@ -2249,6 +2640,19 @@ fn up(cli: &Cli) -> Result<(), String> {
     let ret = if ephemeral { "false" } else { "true" };
     let eph_kv = format!("RUNNER_EPHEMERAL={eph}");
     let ret_kv = format!("RUNNER_RETAIN={ret}");
+
+    // Host entrypoint for external images (stock image already has ENTRYPOINT).
+    let entrypoint_path = if needs_host_entrypoint(cli) {
+        Some(resolve_entrypoint_path(cli)?)
+    } else {
+        None
+    };
+    let entrypoint_mount = entrypoint_path.as_ref().map(|p| {
+        format!(
+            "{}:/entrypoint.sh:ro,Z",
+            p.to_str().expect("entrypoint path utf-8")
+        )
+    });
 
     let mut args: Vec<&str> = vec![
         "run",
@@ -2268,9 +2672,9 @@ fn up(cli: &Cli) -> Result<(), String> {
         "--cap-drop",
         "ALL",
         "--pull",
-        "never",
+        pull_arg,
         "--user",
-        "1001:1001",
+        cli.runner_user.as_str(),
         // Work endpoints never receive a container runtime socket (no nested spawn).
         "--env-file",
         env_path_str.as_str(),
@@ -2281,6 +2685,12 @@ fn up(cli: &Cli) -> Result<(), String> {
         "-v",
         vol.as_str(),
     ];
+    if let Some(m) = entrypoint_mount.as_ref() {
+        args.push("-v");
+        args.push(m.as_str());
+        args.push("--entrypoint");
+        args.push("/entrypoint.sh");
+    }
     // WSL2 GPU: nvidia toolkit + /dev/dxg + host WSL lib mount (verified on this host).
     // Soft dual-slice: both workers may see the full device (GeForce has no MIG); jobs
     // cooperate via labels gpu-slice-a|b. Tear-down on idle frees device processes.
@@ -2352,18 +2762,25 @@ fn down(cli: &Cli, rm: bool) -> Result<(), String> {
     let ephemeral = effective_ephemeral(cli);
     if ephemeral {
         let vol = format!("{}:/opt/actions-runner:Z", cli.volume);
+        let pull = work_image_pull_arg(cli);
+        // Prefer seed helper (guaranteed shell) so external rootfs without bash still cleans.
+        let cleaner = if needs_host_entrypoint(cli) {
+            cli.seed_helper_image.as_str()
+        } else {
+            cli.image.as_str()
+        };
         let _ = podman(&[
             "run",
             "--rm",
             "--security-opt",
             "no-new-privileges",
             "--pull",
-            "never",
+            pull,
             "--entrypoint",
-            "/bin/bash",
+            "/bin/sh",
             "-v",
             vol.as_str(),
-            cli.image.as_str(),
+            cleaner,
             "-c",
             "rm -f /opt/actions-runner/.runner /opt/actions-runner/.credentials /opt/actions-runner/.credentials_rsaparams 2>/dev/null; true",
         ]);
@@ -2925,16 +3342,27 @@ fn pool_mode_on(cli: &Cli) -> bool {
     )
 }
 
-fn ensure_worker_volume(base_volume: &str, worker_volume: &str, image: &str) -> Result<(), String> {
+fn ensure_worker_volume(cli: &Cli, worker_volume: &str) -> Result<(), String> {
     if volume_exists(worker_volume) {
         return Ok(());
     }
+    let base_volume = cli.volume.as_str();
     if !volume_exists(base_volume) {
         return Err(format!(
             "base volume {base_volume} missing — run prepare first"
         ));
     }
-    eprintln!("pool: seeding worker volume {worker_volume} from {base_volume}");
+    let chown = chown_spec(cli);
+    // Use seed helper for external images so rootfs without bash still works.
+    let copy_image = if needs_host_entrypoint(cli) {
+        cli.seed_helper_image.as_str()
+    } else {
+        cli.image.as_str()
+    };
+    let script = format!(
+        r#"set -euo pipefail; cp -a /from/. /to/; chown -R {chown} /to 2>/dev/null || true; rm -f /to/.runner /to/.credentials /to/.credentials_rsaparams 2>/dev/null; true"#
+    );
+    eprintln!("pool: seeding worker volume {worker_volume} from {base_volume} via {copy_image}");
     podman(&["volume", "create", worker_volume])?;
     podman(&[
         "run",
@@ -2942,14 +3370,14 @@ fn ensure_worker_volume(base_volume: &str, worker_volume: &str, image: &str) -> 
         "--security-opt",
         "no-new-privileges",
         "--entrypoint",
-        "/bin/bash",
+        "/bin/sh",
         "-v",
         &format!("{base_volume}:/from:ro,Z"),
         "-v",
         &format!("{worker_volume}:/to:Z"),
-        image,
+        copy_image,
         "-c",
-        r"set -euo pipefail; cp -a /from/. /to/; chown -R 1001:1001 /to 2>/dev/null || true; rm -f /to/.runner /to/.credentials /to/.credentials_rsaparams 2>/dev/null; true",
+        &script,
     ])?;
     Ok(())
 }
@@ -3014,7 +3442,7 @@ fn spawn_sized_worker(
         eprintln!("pool: claim failed for {container}");
         return Ok(());
     }
-    ensure_worker_volume(&base.volume, &volume, &base.image)?;
+    ensure_worker_volume(base, &volume)?;
     let mut unit = base.clone_for_listen();
     unit.repo = Some(job.repo.clone());
     unit.container = container.clone();
@@ -3298,6 +3726,15 @@ impl Cli {
             user: self.user.clone(),
             auto: self.auto,
             image: self.image.clone(),
+            image_mode: self.image_mode.clone(),
+            pull_policy: self.pull_policy.clone(),
+            runner_user: self.runner_user.clone(),
+            seed_helper_image: self.seed_helper_image.clone(),
+            runner_version: self.runner_version.clone(),
+            runner_sha256: self.runner_sha256.clone(),
+            runner_arch: self.runner_arch.clone(),
+            runner_seed_url: self.runner_seed_url.clone(),
+            entrypoint: self.entrypoint.clone(),
             container: self.container.clone(),
             volume: self.volume.clone(),
             runner_name: self.runner_name.clone(),
@@ -3338,6 +3775,15 @@ struct CliSnap {
     user: Option<String>,
     auto: bool,
     image: String,
+    image_mode: ImageMode,
+    pull_policy: Option<PullPolicy>,
+    runner_user: String,
+    seed_helper_image: String,
+    runner_version: String,
+    runner_sha256: String,
+    runner_arch: String,
+    runner_seed_url: Option<String>,
+    entrypoint: Option<PathBuf>,
     container: String,
     volume: String,
     runner_name: String,
@@ -3376,6 +3822,15 @@ fn cli_snapshot(cli: &Cli) -> CliSnap {
         user: cli.user.clone(),
         auto: cli.auto,
         image: cli.image.clone(),
+        image_mode: cli.image_mode.clone(),
+        pull_policy: cli.pull_policy.clone(),
+        runner_user: cli.runner_user.clone(),
+        seed_helper_image: cli.seed_helper_image.clone(),
+        runner_version: cli.runner_version.clone(),
+        runner_sha256: cli.runner_sha256.clone(),
+        runner_arch: cli.runner_arch.clone(),
+        runner_seed_url: cli.runner_seed_url.clone(),
+        entrypoint: cli.entrypoint.clone(),
         container: cli.container.clone(),
         volume: cli.volume.clone(),
         runner_name: cli.runner_name.clone(),
@@ -3416,6 +3871,15 @@ fn snap_to_cli(s: &CliSnap) -> Cli {
         user: s.user.clone(),
         auto: s.auto,
         image: s.image.clone(),
+        image_mode: s.image_mode.clone(),
+        pull_policy: s.pull_policy.clone(),
+        runner_user: s.runner_user.clone(),
+        seed_helper_image: s.seed_helper_image.clone(),
+        runner_version: s.runner_version.clone(),
+        runner_sha256: s.runner_sha256.clone(),
+        runner_arch: s.runner_arch.clone(),
+        runner_seed_url: s.runner_seed_url.clone(),
+        entrypoint: s.entrypoint.clone(),
         container: s.container.clone(),
         volume: s.volume.clone(),
         runner_name: s.runner_name.clone(),

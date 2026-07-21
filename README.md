@@ -14,7 +14,7 @@ Hardened Rust fleet agent for GitHub Actions self-hosted runners on Podman: long
 
 CI badge reflects self-hosted workflow status on `main` (`runs-on: [self-hosted, linux, x64, podman]`). It is only green when a host listener registers a runner and completes the job—no GitHub-hosted fallback.
 
-Docs: [QUICKSTART](docs/QUICKSTART.md) · [HOST_OPS](docs/HOST_OPS.md) · [SECURITY](docs/SECURITY.md) · [CONSUMERS](docs/CONSUMERS.md) · [DESIGN](docs/DESIGN.md)
+Docs: [QUICKSTART](docs/QUICKSTART.md) · [WORK_IMAGES](docs/WORK_IMAGES.md) · [HOST_OPS](docs/HOST_OPS.md) · [SECURITY](docs/SECURITY.md) · [CONSUMERS](docs/CONSUMERS.md) · [DESIGN](docs/DESIGN.md)
 
 [MIT](LICENSE) · [NOTICE](NOTICE) (cites [actions/runner](https://github.com/actions/runner), also MIT)
 
@@ -105,10 +105,11 @@ sequenceDiagram
 4. Git Credential Manager (GCM): Optional install assist on Debian/Ubuntu; store/retrieve PAT without pasting into shell history.
 5. Visibility filters: `--public-only` (default when unset), `--private-only`, or `--all-repos`.
 6. Scopes: `repo` | `user` (batch personal) | `org` (org-level registration).
-7. Hardened container: Non-root `runner` (UID 1001), `no-new-privileges`, `--pull=never` on hot path.
-8. Demand filters (0.2.4+): `--demand-require-labels` / `--demand-exclude-labels` so CPU listeners ignore GPU jobs and GPU listeners only wake on `gpu`.
-9. Sticky user-batch: do not recycle registration while the active repo still has matching work.
-10. Multi-instance locks: `up`/`listen` locks namespaced by `--container`.
+7. Hardened container: Configurable `--runner-user` (default `1001:1001`), `no-new-privileges`, pull policy (`never`/`missing`/`always`).
+8. **Any work image (0.2.9+):** set `GHA_IMAGE` to any OCI ref; `image-mode=external` injects actions/runner into the volume (see [WORK_IMAGES](docs/WORK_IMAGES.md)).
+9. Demand filters (0.2.4+): `--demand-require-labels` / `--demand-exclude-labels` so CPU listeners ignore GPU jobs and GPU listeners only wake on `gpu`.
+10. Sticky user-batch: do not recycle registration while the active repo still has matching work.
+11. Multi-instance locks: `up`/`listen` locks namespaced by `--container`.
 
 ## Requirements
 
@@ -126,7 +127,7 @@ Personal GitHub user accounts only get repo-scoped runners. For one registration
 ### Release binary (preferred)
 
 ```bash
-VER=0.2.8
+VER=0.2.9
 TARGET=x86_64-unknown-linux-gnu
 BASE="https://github.com/tzervas/gha-runner-ctl/releases/download/v${VER}"
 

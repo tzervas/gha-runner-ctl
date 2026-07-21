@@ -49,7 +49,7 @@ If someone compromises the host agent process as `gha-agent`: they can manage th
 | Env-file residue | `0600` under `XDG_RUNTIME_DIR`, overwrite + unlink after `up` |
 | Rootful runtime socket on fleet agent host | Refuse system `CONTAINER_HOST` podman/docker sockets unless `GHA_ALLOW_ROOTFUL_SOCKET=1`; production runs as `gha-agent` rootless |
 | Privilege escalation in work container | `--security-opt no-new-privileges`, no docker.sock mount on work |
-| Surprise image pulls on `up` | `--pull=never` after `prepare` |
+| Surprise image pulls on `up` | Default `--pull=never` (build mode) / `missing` (external); override with `GHA_PULL_POLICY` |
 | Unauthenticated wake endpoint | Loopback only; requires `GHA_WAKE_TOKEN` (≥16 chars) |
 | Twin fleet agents racing | Exclusive PID/instance lock file on `listen` / `up` (`create_new` + live-PID check; not `flock(2)`) |
 | Public fork abuse of self-hosted | Prefer private repos; documented warning on `up` |

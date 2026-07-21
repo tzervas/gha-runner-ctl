@@ -12,9 +12,9 @@
 | Artifact | Value |
 |----------|--------|
 | Crate / binary | `gha-runner-ctl` |
-| `VERSION` file | `0.2.6` |
-| `Cargo.toml` `package.version` | `0.2.6` |
-| GitHub HTTP User-Agent | `gha-runner-ctl/0.2.6` (`src/lib.rs` `UA`) |
+| `VERSION` file | `0.2.9` |
+| `Cargo.toml` `package.version` | `0.2.9` |
+| GitHub HTTP User-Agent | `gha-runner-ctl/0.2.9` (`src/lib.rs` `UA`) |
 
 ## Entry behavior
 
@@ -72,7 +72,16 @@ All global options accept the same name as env var (clap `env =`); boolean env v
 | `--owner` | `GHA_OWNER` | ident | — | `scope=org` |
 | `--user` | `GHA_USER` | ident | gh user if unset | `scope=user` (resolved at runtime) |
 | `--auto` | `GHA_AUTO` | bool | false | — |
-| `--image` | `GHA_IMAGE` | image ref | `localhost/gha-runner-ctl:latest` | — |
+| `--image` | `GHA_IMAGE` | OCI image ref | `localhost/gha-runner-ctl:latest` | Any registry/path:tag or `@sha256:`; see [WORK_IMAGES](../WORK_IMAGES.md) |
+| `--image-mode` | `GHA_IMAGE_MODE` | `auto`, `build`, `external` | `auto` | auto→build for stock tag; else external |
+| `--pull-policy` | `GHA_PULL_POLICY` | `never`, `missing`, `always` | (mode default) | build→never, external→missing when unset |
+| `--runner-user` | `GHA_RUNNER_USER` | uid:gid or name | `1001:1001` | Podman `--user` |
+| `--seed-helper-image` | `GHA_SEED_HELPER_IMAGE` | OCI ref | `docker.io/library/ubuntu:24.04` | Seeds runner kit into volumes |
+| `--runner-version` | `GHA_RUNNER_VERSION` | semver-ish | pin in code/docs | External seed tarball version |
+| `--runner-sha256` | `GHA_RUNNER_SHA256` | 64 hex | pin in code/docs | Tarball checksum |
+| `--runner-arch` | `GHA_RUNNER_ARCH` | ident | `x64` | Asset arch segment |
+| `--runner-seed-url` | `GHA_RUNNER_SEED_URL` | https URL | — | Overrides constructed runner tarball URL |
+| `--entrypoint` | `GHA_ENTRYPOINT` | path | packaging/entrypoint.sh | Required resolvable for external `up` |
 | `--container` | `GHA_CONTAINER` | ident | `gha-runner-ctl` | — |
 | `--volume` | `GHA_VOLUME` | ident | `gha-runner-ctl-data` | — |
 | `--runner-name` | `GHA_RUNNER_NAME` | ident | `shared-podman-1` | — |

@@ -310,3 +310,76 @@ fn test_is_safe_memory_parameterized() {
         );
     }
 }
+
+#[test]
+fn test_is_safe_image_oci_refs() {
+    assert!(is_safe_image("localhost/gha-runner-ctl:latest"));
+    assert!(is_safe_image("docker.io/library/ubuntu:24.04"));
+    assert!(is_safe_image("docker.io/library/fedora:40"));
+    assert!(is_safe_image("ghcr.io/org/ci-tools:1.2.3"));
+    assert!(is_safe_image("registry.example.com:5000/team/ci:stable"));
+    assert!(is_safe_image(
+        "ghcr.io/org/img@sha256:4ef2f25285f0ae4477f1fe1e346db76d2f3ebf03824e2ddd1973a2819bf6c8cf"
+    ));
+    assert!(is_safe_image("quay.io/podman/hello"));
+    // FreeBSD/OpenBSD-named Linux userspace images (OCI on Linux hosts)
+    assert!(is_safe_image("docker.io/library/alpine:3.20"));
+    assert!(!is_safe_image(""));
+    assert!(!is_safe_image("img;rm -rf /"));
+    assert!(!is_safe_image("img$(reboot)"));
+    assert!(!is_safe_image("../evil"));
+    assert!(!is_safe_image("img with space"));
+}
+
+#[test]
+fn test_effective_image_mode_auto() {
+    assert_eq!(
+        effective_image_mode(&ImageMode::Auto, "localhost/gha-runner-ctl:latest"),
+        ImageMode::Build
+    );
+    assert_eq!(
+        effective_image_mode(&ImageMode::Auto, "docker.io/library/ubuntu:24.04"),
+        ImageMode::External
+    );
+    assert_eq!(
+        effective_image_mode(&ImageMode::External, "localhost/gha-runner-ctl:latest"),
+        ImageMode::External
+    );
+    assert_eq!(
+        effective_image_mode(&ImageMode::Build, "docker.io/library/fedora:40"),
+        ImageMode::Build
+    );
+}
+
+#[test]
+fn test_effective_pull_policy_defaults() {
+    assert_eq!(
+        effective_pull_policy(None, &ImageMode::Build),
+        PullPolicy::Never
+    );
+    assert_eq!(
+        effective_pull_policy(None, &ImageMode::External),
+        PullPolicy::Missing
+    );
+    assert_eq!(
+        effective_pull_policy(Some(&PullPolicy::Always), &ImageMode::Build),
+        PullPolicy::Always
+    );
+}
+
+#[test]
+fn test_runner_user_and_sha_validation() {
+    assert!(is_safe_runner_user("1001:1001"));
+    assert!(is_safe_runner_user("0:0"));
+    assert!(is_safe_runner_user("runner"));
+    assert!(!is_safe_runner_user(""));
+    assert!(!is_safe_runner_user("1001;root"));
+    assert!(is_safe_sha256_hex(
+        "4ef2f25285f0ae4477f1fe1e346db76d2f3ebf03824e2ddd1973a2819bf6c8cf"
+    ));
+    assert!(!is_safe_sha256_hex("abcd"));
+    assert!(is_safe_url(
+        "https://github.com/actions/runner/releases/download/v2.335.1/actions-runner-linux-x64-2.335.1.tar.gz"
+    ));
+    assert!(!is_safe_url("file:///etc/passwd"));
+}
