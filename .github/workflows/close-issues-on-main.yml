@@ -26,8 +26,8 @@ permissions:
 jobs:
   close-linked:
     name: Close issues for main merge
-    # Meta workflow: GitHub-hosted is correct (issue API only; no product build).
-    runs-on: ubuntu-latest
+    # Meta jobs also use self-hosted; gha-runner-ctl fleet must stay warm.
+    runs-on: [self-hosted, linux, x64, podman]
     if: >
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' &&
