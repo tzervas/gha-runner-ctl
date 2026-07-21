@@ -144,8 +144,21 @@ pub fn size_for_job(job_name: &str, labels: &[String], force_gpu: bool) -> SizeT
     if name_contains_any(
         &name,
         &[
-            "gitleaks", "trivy", "license", "lint", "ruff", "fmt", "format", "typos", "markdown",
-            "spell", "security", "reuse", "sbom", "commitizen", "conventional",
+            "gitleaks",
+            "trivy",
+            "license",
+            "lint",
+            "ruff",
+            "fmt",
+            "format",
+            "typos",
+            "markdown",
+            "spell",
+            "security",
+            "reuse",
+            "sbom",
+            "commitizen",
+            "conventional",
         ],
     ) {
         return SizeTier::Micro;
@@ -157,7 +170,9 @@ pub fn size_for_job(job_name: &str, labels: &[String], force_gpu: bool) -> SizeT
     // Medium-default cargo / pytest
     if name_contains_any(
         &name,
-        &["test", "check", "build", "cargo", "pytest", "ci", "unit", "docs"],
+        &[
+            "test", "check", "build", "cargo", "pytest", "ci", "unit", "docs",
+        ],
     ) {
         return SizeTier::Medium;
     }
@@ -474,11 +489,7 @@ mod tests {
     #[test]
     fn tier_explicit_large_label() {
         assert_eq!(
-            size_for_job(
-                "unit",
-                &["self-hosted".into(), "large".into()],
-                false
-            ),
+            size_for_job("unit", &["self-hosted".into(), "large".into()], false),
             SizeTier::Large
         );
     }
@@ -486,7 +497,11 @@ mod tests {
     #[test]
     fn tier_build_and_test_large() {
         assert_eq!(
-            size_for_job("Build and Test (local parity)", &["self-hosted".into()], false),
+            size_for_job(
+                "Build and Test (local parity)",
+                &["self-hosted".into()],
+                false
+            ),
             SizeTier::Large
         );
     }
