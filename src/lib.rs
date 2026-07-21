@@ -54,7 +54,7 @@ const DEFAULT_REPOS_PER_TICK: u32 = 1;
 /// Min seconds between registration-token POSTs (shared across processes on host).
 const DEFAULT_REG_MIN_GAP_SECS: u64 = 5;
 /// Max registration-token POSTs per rolling hour (shared host budget).
-const DEFAULT_REG_MAX_PER_HOUR: u32 = 30;
+const DEFAULT_REG_MAX_PER_HOUR: u32 = 90;
 
 #[derive(Debug, Clone, ValueEnum)]
 pub enum Mode {
@@ -200,7 +200,7 @@ pub struct Cli {
     #[arg(long, env = "GHA_REG_MIN_GAP_SECS", default_value_t = DEFAULT_REG_MIN_GAP_SECS, global = true)]
     reg_min_gap_secs: u64,
 
-    /// Max registration-token POSTs per rolling hour (host-wide). Default 30.
+    /// Max registration-token POSTs per rolling hour (host-wide). Default 90.
     #[arg(long, env = "GHA_REG_MAX_PER_HOUR", default_value_t = DEFAULT_REG_MAX_PER_HOUR, global = true)]
     reg_max_per_hour: u32,
 
@@ -1630,12 +1630,15 @@ fn pace_registration(cli: &Cli) -> Result<(), String> {
                 state.recent.retain(|t| now.saturating_sub(*t) < 3600);
                 if state.recent.len() as u32 >= max_hour {
                     let _ = fs::remove_file(&exclusive);
-                    let wait = 30u64;
-                    eprintln!(
-                        "register: host budget {max_hour}/hour reached — wait {wait}s (attempt {attempt})"
-                    );
-                    thread::sleep(Duration::from_secs(wait));
-                    continue;
+                    // Do NOT spin-sleep here — that freezes the listen loop (no reap, no other
+                    // repos). Surface budget pressure and let the outer loop continue.
+                    let oldest = state.recent.iter().copied().min().unwrap_or(now);
+                    let wait = 3600u64
+                        .saturating_sub(now.saturating_sub(oldest))
+                        .clamp(15, 600);
+                    return Err(format!(
+                        "register: host budget {max_hour}/hour reached — retry in ~{wait}s"
+                    ));
                 }
                 if state.last_unix > 0 {
                     let elapsed = now.saturating_sub(state.last_unix);

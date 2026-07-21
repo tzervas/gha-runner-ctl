@@ -1,4 +1,10 @@
-## 0.2.8 — 2026-07-20
+## 0.2.8
+
+### Fixed
+- Registration hourly budget no longer freezes the listen loop (return error instead of spin-sleep).
+- Default `GHA_REG_MAX_PER_HOUR` raised 30→90 (host env can set 120).
+- reopen-issues meta workflow always has a green gate job (avoids zero-job red runs).
+ — 2026-07-20
 
 ### Fixed
 - **Listen drain under backlog:** `list_demand_jobs` returns **partial** results when the per-poll API budget is exhausted instead of failing the whole tick with zero spawns.
