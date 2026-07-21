@@ -69,12 +69,12 @@ Scripts source `scripts/lib/shell-debug.sh`. The Rust binary dumps context after
 
 Never dumps tokens (`GH_TOKEN` / registration secrets are redacted or skipped).
 
-## Install 0.2.6
+## Install 0.2.10
 
 Release binary:
 
 ```bash
-VER=0.2.6
+VER=0.2.10
 TARGET=x86_64-unknown-linux-gnu
 BASE="https://github.com/tzervas/gha-runner-ctl/releases/download/v${VER}"
 curl -fsSL -o "gha-runner-ctl-${VER}-${TARGET}.tar.gz" \
@@ -134,7 +134,7 @@ gha-runner-ctl --scope repo --auto listen --interval 30 --idle-secs 180
 
 ## Residual checklist
 
-- [ ] Binary 0.2.6 installed; `gha-runner-ctl --help` works
+- [ ] Binary 0.2.10 installed; `gha-runner-ctl --help` works
 - [ ] Auth path chosen (`gh` / GCM / `GH_TOKEN` / interactive) with least privilege
 - [ ] Human approved host package refresh or used `--skip-host-update`
 - [ ] `prepare` completed (image + volume present)
