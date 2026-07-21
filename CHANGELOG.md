@@ -1,4 +1,4 @@
-## 0.2.10
+## 0.2.10 — 2026-07-21
 
 ### Changed
 - Host pool defaults **16 CPU / 16 GiB**; tiers micro→xlarge (medium **2c/4g**, large **4c/8g**, xlarge **8c/16g**, gpu **4c/8g**).
@@ -15,15 +15,12 @@
 - **`GHA_RUNNER_USER`**, **`GHA_SEED_HELPER_IMAGE`**, **`GHA_ENTRYPOINT`** for ergonomic external rootfs setup.
 - Docs: [docs/WORK_IMAGES.md](docs/WORK_IMAGES.md).
 
-## 0.2.8
+## 0.2.8 — 2026-07-20
 
 ### Fixed
 - Registration hourly budget no longer freezes the listen loop (return error instead of spin-sleep).
 - Default `GHA_REG_MAX_PER_HOUR` raised 30→90 (host env can set 120).
 - reopen-issues meta workflow always has a green gate job (avoids zero-job red runs).
- — 2026-07-20
-
-### Fixed
 - **Listen drain under backlog:** `list_demand_jobs` returns **partial** results when the per-poll API budget is exhausted instead of failing the whole tick with zero spawns.
 - Partial results on budget exhaust; prefer queued runs, light in_progress sample for multi-job matrices; RR-capped scan width so registration POSTs still fit.
 - README architecture mermaid diagrams (sanitized — no hostnames, tokens, or personal paths).

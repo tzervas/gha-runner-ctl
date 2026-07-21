@@ -56,7 +56,7 @@ podman rm -f gha-runner-cpu gha-runner-gpu gha-runner-gpu-a gha-runner-gpu-b 2>/
 # optional: archive old /root/running tarballs → ~/.local/share/gha-runner-ctl/archive/
 ```
 
-## 2. Install binary (0.2.6)
+## 2. Install binary (0.2.10)
 
 ```bash
 # from repo after cargo build --release, or release tarball:

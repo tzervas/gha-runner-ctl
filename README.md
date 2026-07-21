@@ -127,7 +127,7 @@ Personal GitHub user accounts only get repo-scoped runners. For one registration
 ### Release binary (preferred)
 
 ```bash
-VER=0.2.9
+VER=0.2.10
 TARGET=x86_64-unknown-linux-gnu
 BASE="https://github.com/tzervas/gha-runner-ctl/releases/download/v${VER}"
 
@@ -243,7 +243,7 @@ See [docs/CONSUMERS.md](docs/CONSUMERS.md).
 
 Install and listen are safe unattended on a prepared machine; host package upgrades touch the workstation and stay human-gated.
 
-1. Install 0.2.6 (release tarball above, or `bash packaging/install-ctl.sh` from source).
+1. Install 0.2.10 (release tarball above, or `bash packaging/install-ctl.sh` from source).
 2. Authenticate: `gh auth login` and/or GCM and/or `GH_TOKEN` (least privilege for registration).
 3. Prepare (builds image + snapshot; by default also runs host `apt`/`dnf` upgrade):
 
