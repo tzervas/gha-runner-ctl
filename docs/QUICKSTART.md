@@ -1,5 +1,8 @@
 # Quickstart — WSL dual CPU + dual GPU-slice runners
 
+Platforms (Linux-first; WSL optional): [HOST_PLATFORMS.md](HOST_PLATFORMS.md)
+
+
 Target layout on this workstation (WSL2):
 
 | Piece | Path / unit |
