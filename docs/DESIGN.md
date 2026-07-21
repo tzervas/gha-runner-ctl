@@ -119,7 +119,7 @@ API pacing: `GHA_API_MIN_GAP_MS`, `GHA_API_MAX_PER_POLL`, backoff on 403/429.
 
 ## 4. Work containers (the endpoint)
 
-* **Image:** Ubuntu-based snapshot with official runner + common CI tools ([packaging/Containerfile](../packaging/Containerfile)).
+* **Image:** Ubuntu-based snapshot with official runner + common CI tools ([packaging/Containerfile](../packaging/Containerfile)): `uv`, pinned **gitleaks**, and **Rust 1.96** (`cargo`/`rustc` via rustup for UID 1001). Rebuild after packaging changes with `gha-runner-ctl prepare`.
 * **Ephemeral mode:** register with `--ephemeral`, die after one job, wipe credentials on down.
 * **Retain mode:** stay registered; container can restart with `RUNNER_TOKEN=REUSE` if `.runner` is on the volume for the same `REPO_URL`.
 * **GPU soft-slices:** labels + demand filters; idle down returns GPU to the host (no MIG on consumer GeForce/WSL).

@@ -95,6 +95,10 @@ the image with `--pull=always` and reseeds the volume. That keeps the long-lived
 snapshot from freezing known CVEs on the host or base image. Skip only when
 intentional: `--skip-host-update` or `GHA_SKIP_HOST_UPDATE=1`.
 
+After `git pull` of packaging changes (work image pins for gitleaks, Rust, runner
+tarball), re-run `prepare` so fleet jobs see the new binaries; `up` alone does not
+rebuild.
+
 ## Reporting
 
 Open a private security advisory on the GitHub repo if you find a vulnerability.

@@ -28,12 +28,33 @@ jobs:
       - name: Run gitleaks
         run: |
           set -euo pipefail
+          # Pin: nested docker/podman from runner work containers often cannot pull/run.
+          GITLEAKS_VERSION="8.21.2"
+          if ! command -v gitleaks >/dev/null 2>&1; then
+            install_dir="${RUNNER_TEMP:-/tmp}/bin"
+            if [[ ! -d "$install_dir" ]]; then
+              mkdir -p "$install_dir" 2>/dev/null || true
+            fi
+            if [[ ! -w "$install_dir" ]] && [[ -w /usr/local/bin ]]; then
+              install_dir="/usr/local/bin"
+            fi
+            archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+            url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${archive}"
+            tmp="${RUNNER_TEMP:-/tmp}/${archive}"
+            if curl -fsSL "$url" -o "$tmp" \
+              && tar -xzf "$tmp" -C "$install_dir" gitleaks \
+              && chmod +x "$install_dir/gitleaks"; then
+              export PATH="$install_dir:${PATH}"
+            else
+              echo "gitleaks binary install failed; trying container fallbacks..." >&2
+            fi
+          fi
           if command -v gitleaks >/dev/null 2>&1; then
             gitleaks detect --source . --verbose --redact
-          elif command -v docker >/dev/null 2>&1; then
-            docker run --rm -v "$PWD:/path" zricethezav/gitleaks:latest detect --source=/path --verbose --redact
           elif command -v podman >/dev/null 2>&1; then
-            podman run --rm -v "$PWD:/path:ro" docker.io/zricethezav/gitleaks:latest detect --source=/path --verbose --redact
+            podman run --rm -v "$PWD:/path:ro" "docker.io/zricethezav/gitleaks:v${GITLEAKS_VERSION}" detect --source=/path --verbose --redact
+          elif command -v docker >/dev/null 2>&1; then
+            docker run --rm -v "$PWD:/path:ro" "zricethezav/gitleaks:v${GITLEAKS_VERSION}" detect --source=/path --verbose --redact
           else
             echo "gitleaks not available on runner — FAIL (honest security gate)" >&2
             exit 1

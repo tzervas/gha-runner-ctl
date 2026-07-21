@@ -103,6 +103,11 @@ gha-runner-ctl prepare --skip-host-update
 Host package upgrades require privileges and operator intent. Do not automate
 unattended host `apt`/`dnf` upgrade without an explicit human decision for that host.
 
+**After pulling packaging changes** (e.g. work image tools: gitleaks, Rust/cargo),
+re-run `gha-runner-ctl prepare` (or `prepare --skip-host-update`) so live work
+containers pick up the rebuilt image + reseeding snapshot. Hot-path `up` uses
+`--pull=never` and will not rebuild for you.
+
 ## User listen (personal batch)
 
 ```bash

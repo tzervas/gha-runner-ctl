@@ -203,7 +203,7 @@ gha-runner-ctl down
 
 | Command | Description |
 |---|---|
-| `prepare` | Host package refresh (unless skipped), build image (`--pull=always`), seed snapshot volume |
+| `prepare` | Host package refresh (unless skipped), build image (`--pull=always`), seed snapshot volume. Re-run after packaging/Containerfile changes (gitleaks, Rust, runner pin) so fleet work containers get the new tools |
 | `up` | Fetch registration token, seed env, start Podman runner |
 | `down` | Stop/remove container; ephemeral mode wipes registration on volume |
 | `status` | Scope, container state, registration details |

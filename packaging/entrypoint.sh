@@ -6,6 +6,14 @@ set -euo pipefail
 SEED="${RUNNER_SEED:-/opt/actions-runner-seed}"
 HOME_DIR="${RUNNER_HOME:-/opt/actions-runner}"
 
+# cargo/rustc for fleet-ci (image ENV may already set this; export for non-login job shells)
+export CARGO_HOME="${CARGO_HOME:-/home/runner/.cargo}"
+export RUSTUP_HOME="${RUSTUP_HOME:-/home/runner/.rustup}"
+case ":${PATH}:" in
+    *":${CARGO_HOME}/bin:"*) ;;
+    *) export PATH="${CARGO_HOME}/bin:${PATH}" ;;
+esac
+
 log() { printf 'runner: %s\n' "$*" >&2; }
 
 # Reject shell metacharacters / traversal in controller-supplied identity fields.

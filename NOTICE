@@ -19,3 +19,20 @@ That binary is subject to the actions/runner MIT license.
 
 Ubuntu base image (docker.io/library/ubuntu) used only as a container base;
 see Canonical / Ubuntu licensing for the base OS.
+
+---------------------------------------------------------------------------
+Gitleaks (gitleaks/gitleaks)
+https://github.com/gitleaks/gitleaks
+Copyright (c) Zachary Rice and contributors
+License: MIT
+  See https://github.com/gitleaks/gitleaks/blob/master/LICENSE
+
+The packaging/Containerfile downloads a pinned release tarball solely to install
+/usr/local/bin/gitleaks in the local work runner image.
+---------------------------------------------------------------------------
+
+Rust toolchain (via rustup) installed at image-build time for the runner user
+under /home/runner/.cargo — subject to Rust / rustup licenses
+(https://www.rust-lang.org/policies/licenses). Not redistributed in this
+source tree.
+---------------------------------------------------------------------------
