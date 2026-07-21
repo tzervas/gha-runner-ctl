@@ -2958,22 +2958,30 @@ fn reap_pool_workers(cli: &Cli, pool: &ResourcePool) {
     let Ok(claims) = pool.claims() else {
         return;
     };
+    let now = now_unix();
     for c in claims {
         // Only reap workers owned by this listen base name prefix
         if !c.container.starts_with(&cli.container) {
             continue;
         }
-        if !container_running(&c.container) {
+        let running = container_running(&c.container);
+        // Stale claim: container exited/missing, or claim older than 2h (orphan).
+        let stale_age = now.saturating_sub(c.claimed_at_unix) > 7200;
+        if !running || stale_age {
             eprintln!(
-                "pool: reap {} (tier={} repo={:?})",
+                "pool: reap {} running={running} stale={stale_age} tier={} repo={:?}",
                 c.container, c.tier, c.repo
             );
             let mut dead = cli.clone_for_listen();
             dead.container = c.container.clone();
             dead.volume = format!("{}-data", c.container);
             dead.runner_name = c.worker_id.clone();
+            // Always release claim even if down fails — otherwise memory budget leaks to 0 MiB.
             let _ = down(&dead, true);
-            let _ = pool.release(&c.worker_id);
+            if let Err(e) = pool.release(&c.worker_id) {
+                eprintln!("pool: release {} failed: {}", c.worker_id, redact(&e));
+                let _ = pool.release_container(&c.container);
+            }
         }
     }
 }
