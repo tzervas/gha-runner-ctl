@@ -8,7 +8,7 @@ Target layout on this workstation (WSL2):
 | Instance env | `~/.local/share/gha-runner-ctl/instances/{cpu,gpu-a,gpu-b}.env` |
 | Logs | `~/.local/share/gha-runner-ctl/logs/` |
 | systemd | `systemctl --user status 'gha-runner-ctl@*'` |
-| Work image | `localhost/gha-runner-ctl:latest` (Ubuntu + actions/runner) |
+| Work image | Any OCI image via `GHA_IMAGE` (default stock: `localhost/gha-runner-ctl:latest`) — see [WORK_IMAGES](WORK_IMAGES.md) |
 | Agent image (optional) | `localhost/gha-runner-ctl-agent:latest` (Ubuntu-minimal stripped control plane) |
 
 ## Architecture: fleet agent + work endpoints

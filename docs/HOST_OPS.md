@@ -92,12 +92,16 @@ From source: `bash packaging/install-ctl.sh` then ensure `~/.local/bin` is on `P
 ## Prepare (snapshot + optional host update)
 
 ```bash
-# Default: host apt/dnf upgrade, then image build --pull=always, then seed volume
+# Default stock path: host apt/dnf upgrade, build packaging image, seed volume
 gha-runner-ctl prepare
 
 # Skip host package refresh only
 gha-runner-ctl prepare --skip-host-update
 # equivalent: GHA_SKIP_HOST_UPDATE=1 gha-runner-ctl prepare
+
+# Any OCI image as job rootfs (auto → external when GHA_IMAGE is not the stock tag)
+GHA_IMAGE=docker.io/library/ubuntu:24.04 gha-runner-ctl prepare --skip-host-update
+GHA_IMAGE=ghcr.io/my-org/ci:latest GHA_PULL_POLICY=always gha-runner-ctl prepare --skip-host-update
 ```
 
 Host package upgrades require privileges and operator intent. Do not automate
@@ -106,7 +110,10 @@ unattended host `apt`/`dnf` upgrade without an explicit human decision for that 
 **After pulling packaging changes** (e.g. work image tools: gitleaks, Rust/cargo),
 re-run `gha-runner-ctl prepare` (or `prepare --skip-host-update`) so live work
 containers pick up the rebuilt image + reseeding snapshot. Hot-path `up` uses
-`--pull=never` and will not rebuild for you.
+the configured pull policy (`never` by default for **build** mode) and will not
+rebuild packaging for you.
+
+Full image reference: [WORK_IMAGES.md](WORK_IMAGES.md).
 
 ## User listen (personal batch)
 

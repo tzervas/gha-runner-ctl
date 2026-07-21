@@ -1,3 +1,20 @@
+## 0.2.10
+
+### Changed
+- Host pool defaults **16 CPU / 16 GiB**; tiers micro→xlarge (medium **2c/4g**, large **4c/8g**, xlarge **8c/16g**, gpu **4c/8g**).
+- Explicit size labels on `runs-on` (`large`/`xlarge`/`gpu`) drive allocation; workers re-register matching labels.
+- Docs: DYNAMIC_POOL sizing policy (justified labels only).
+
+## 0.2.9
+
+### Added
+- **Any OCI work image:** `GHA_IMAGE` accepts arbitrary registry/refs (including host:port and `@sha256:` digests).
+- **`GHA_IMAGE_MODE`:** `auto` | `build` | `external` — auto uses packaging build only for the stock default tag; any other image is external (pull + inject runner).
+- **`GHA_PULL_POLICY`:** `never` | `missing` | `always` (defaults: never for build hot path, missing for external).
+- **Runner kit knobs (not hard-coded):** `GHA_RUNNER_VERSION`, `GHA_RUNNER_SHA256`, `GHA_RUNNER_ARCH`, optional `GHA_RUNNER_SEED_URL`.
+- **`GHA_RUNNER_USER`**, **`GHA_SEED_HELPER_IMAGE`**, **`GHA_ENTRYPOINT`** for ergonomic external rootfs setup.
+- Docs: [docs/WORK_IMAGES.md](docs/WORK_IMAGES.md).
+
 ## 0.2.8
 
 ### Fixed
