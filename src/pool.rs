@@ -86,21 +86,8 @@ pub fn size_for_job(job_name: &str, labels: &[String], force_gpu: bool) -> SizeT
     if name_contains_any(
         &name,
         &[
-            "gitleaks",
-            "trivy",
-            "license",
-            "lint",
-            "ruff",
-            "fmt",
-            "format",
-            "clippy",
-            "typos",
-            "markdown",
-            "docs",
-            "spell",
-            "security",
-            "reuse",
-            "sbom",
+            "gitleaks", "trivy", "license", "lint", "ruff", "fmt", "format", "clippy", "typos",
+            "markdown", "docs", "spell", "security", "reuse", "sbom",
         ],
     ) {
         return SizeTier::Micro;
@@ -138,7 +125,10 @@ pub fn resources_for_tier(tier: SizeTier) -> (String, String) {
 }
 
 pub fn parse_cpus_f64(s: &str) -> Option<f64> {
-    s.trim().parse::<f64>().ok().filter(|n| *n > 0.0 && *n <= 64.0)
+    s.trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|n| *n > 0.0 && *n <= 64.0)
 }
 
 /// Parse memory like `512m`, `2g`, `8192` (MiB if bare number) → MiB.

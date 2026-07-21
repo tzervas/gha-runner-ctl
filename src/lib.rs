@@ -213,7 +213,12 @@ pub struct Cli {
     pool_memory: String,
 
     /// Max concurrent ephemeral workers this listen process may own. Default 16.
-    #[arg(long, env = "GHA_POOL_MAX_WORKERS", default_value_t = 16, global = true)]
+    #[arg(
+        long,
+        env = "GHA_POOL_MAX_WORKERS",
+        default_value_t = 16,
+        global = true
+    )]
     pool_max_workers: u32,
 
     /// Enable dynamic multi-worker pool sizing (default true).
@@ -2994,14 +2999,7 @@ fn spawn_sized_worker(
     let worker_id = format!("{}-w{slot}", base.runner_name);
     let container = format!("{}-w{slot}", base.container);
     let volume = format!("{container}-data");
-    if !pool.try_claim(
-        &worker_id,
-        &container,
-        c,
-        m,
-        tier,
-        Some(job.repo.as_str()),
-    )? {
+    if !pool.try_claim(&worker_id, &container, c, m, tier, Some(job.repo.as_str()))? {
         eprintln!("pool: claim failed for {container}");
         return Ok(());
     }
@@ -3124,7 +3122,10 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
                 .claims()
                 .map(|c| {
                     c.iter()
-                        .filter(|x| x.container.starts_with(&cli.container) && container_running(&x.container))
+                        .filter(|x| {
+                            x.container.starts_with(&cli.container)
+                                && container_running(&x.container)
+                        })
                         .count()
                 })
                 .unwrap_or(0);
@@ -3206,7 +3207,9 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
                             })
                             .unwrap_or(false);
                         if container_running(&cli.container) && busy {
-                            eprintln!("listen: sticky on {active:?} (still busy); defer move to {r}");
+                            eprintln!(
+                                "listen: sticky on {active:?} (still busy); defer move to {r}"
+                            );
                             if let Some(a) = active {
                                 cli.repo = Some(a);
                             }
