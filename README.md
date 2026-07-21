@@ -28,6 +28,62 @@ Docs: [QUICKSTART](docs/QUICKSTART.md) · [HOST_OPS](docs/HOST_OPS.md) · [SECUR
 
 Real host snapshot text: [docs/assets/setup-status.txt](docs/assets/setup-status.txt).
 
+
+## Architecture (overview)
+
+Sanitized schematic — no hostnames, tokens, or personal paths.
+
+```mermaid
+flowchart TB
+  subgraph control["Control plane (always on)"]
+    SYS["systemd units<br/>cpu / gpu-a / gpu-b"]
+    CTL["gha-runner-ctl listen"]
+    SYS --> CTL
+  end
+
+  subgraph github["GitHub Actions"]
+    Q["Queued self-hosted jobs<br/>labels: self-hosted,linux,x64,podman"]
+    REG["Repo registration tokens<br/>paced POSTs"]
+  end
+
+  subgraph pool["Dynamic pool (ephemeral workers)"]
+    W0["worker w0<br/>sized micro→large"]
+    W1["worker w1"]
+    WN["worker wn"]
+  end
+
+  CTL -->|"poll prefer-repos<br/>partial results if API budget hit"| Q
+  CTL -->|"mint registration token"| REG
+  CTL -->|"podman run"| W0
+  CTL --> W1
+  CTL --> WN
+  W0 -->|"actions/runner picks job"| Q
+  W1 --> Q
+  WN --> Q
+  W0 -->|"exit after job"| CTL
+```
+
+### Listen tick (dynamic pool)
+
+```mermaid
+sequenceDiagram
+  participant L as listen loop
+  participant API as GitHub API
+  participant P as ResourcePool
+  participant C as Podman worker
+
+  L->>L: reap finished workers
+  L->>API: list queued runs (prefer-repos, capped)
+  Note over L,API: On per-poll budget exhaust:<br/>keep partial job list (do not fail empty)
+  L->>API: list jobs for candidate runs
+  L->>P: claim CPU/RAM for tier
+  L->>API: registration-token POST (paced)
+  L->>C: up ephemeral container
+  C-->>API: runner online, take job
+  C-->>L: exit → release claim
+```
+
+
 ## Why
 
 | Goal | Approach |
@@ -70,7 +126,7 @@ Personal GitHub user accounts only get repo-scoped runners. For one registration
 ### Release binary (preferred)
 
 ```bash
-VER=0.2.6
+VER=0.2.8
 TARGET=x86_64-unknown-linux-gnu
 BASE="https://github.com/tzervas/gha-runner-ctl/releases/download/v${VER}"
 
@@ -147,7 +203,7 @@ gha-runner-ctl down
 
 | Command | Description |
 |---|---|
-| `prepare` | Host package refresh (unless skipped), build image (`--pull=always`), seed snapshot volume |
+| `prepare` | Host package refresh (unless skipped), build image (`--pull=always`), seed snapshot volume. Re-run after packaging/Containerfile changes (gitleaks, Rust, runner pin) so fleet work containers get the new tools |
 | `up` | Fetch registration token, seed env, start Podman runner |
 | `down` | Stop/remove container; ephemeral mode wipes registration on volume |
 | `status` | Scope, container state, registration details |

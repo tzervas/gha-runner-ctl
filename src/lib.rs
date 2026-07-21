@@ -31,7 +31,7 @@ const DEFAULT_CONTAINER: &str = "gha-runner-ctl";
 const DEFAULT_VOLUME: &str = "gha-runner-ctl-data";
 const DEFAULT_LABELS: &str = "self-hosted,linux,x64,podman";
 const DEFAULT_NAME: &str = "shared-podman-1";
-const UA: &str = "gha-runner-ctl/0.2.7";
+const UA: &str = "gha-runner-ctl/0.2.8";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 const MIN_POLL_SECS: u64 = 5;
 const MAX_POLL_SECS: u64 = 3600;
@@ -54,7 +54,7 @@ const DEFAULT_REPOS_PER_TICK: u32 = 1;
 /// Min seconds between registration-token POSTs (shared across processes on host).
 const DEFAULT_REG_MIN_GAP_SECS: u64 = 5;
 /// Max registration-token POSTs per rolling hour (shared host budget).
-const DEFAULT_REG_MAX_PER_HOUR: u32 = 30;
+const DEFAULT_REG_MAX_PER_HOUR: u32 = 90;
 
 #[derive(Debug, Clone, ValueEnum)]
 pub enum Mode {
@@ -200,7 +200,7 @@ pub struct Cli {
     #[arg(long, env = "GHA_REG_MIN_GAP_SECS", default_value_t = DEFAULT_REG_MIN_GAP_SECS, global = true)]
     reg_min_gap_secs: u64,
 
-    /// Max registration-token POSTs per rolling hour (host-wide). Default 30.
+    /// Max registration-token POSTs per rolling hour (host-wide). Default 90.
     #[arg(long, env = "GHA_REG_MAX_PER_HOUR", default_value_t = DEFAULT_REG_MAX_PER_HOUR, global = true)]
     reg_max_per_hour: u32,
 
@@ -213,7 +213,12 @@ pub struct Cli {
     pool_memory: String,
 
     /// Max concurrent ephemeral workers this listen process may own. Default 16.
-    #[arg(long, env = "GHA_POOL_MAX_WORKERS", default_value_t = 16, global = true)]
+    #[arg(
+        long,
+        env = "GHA_POOL_MAX_WORKERS",
+        default_value_t = 16,
+        global = true
+    )]
     pool_max_workers: u32,
 
     /// Enable dynamic multi-worker pool sizing (default true).
@@ -1625,12 +1630,15 @@ fn pace_registration(cli: &Cli) -> Result<(), String> {
                 state.recent.retain(|t| now.saturating_sub(*t) < 3600);
                 if state.recent.len() as u32 >= max_hour {
                     let _ = fs::remove_file(&exclusive);
-                    let wait = 30u64;
-                    eprintln!(
-                        "register: host budget {max_hour}/hour reached — wait {wait}s (attempt {attempt})"
-                    );
-                    thread::sleep(Duration::from_secs(wait));
-                    continue;
+                    // Do NOT spin-sleep here — that freezes the listen loop (no reap, no other
+                    // repos). Surface budget pressure and let the outer loop continue.
+                    let oldest = state.recent.iter().copied().min().unwrap_or(now);
+                    let wait = 3600u64
+                        .saturating_sub(now.saturating_sub(oldest))
+                        .clamp(15, 600);
+                    return Err(format!(
+                        "register: host budget {max_hour}/hour reached — retry in ~{wait}s"
+                    ));
                 }
                 if state.last_unix > 0 {
                     let elapsed = now.saturating_sub(state.last_unix);
@@ -2800,7 +2808,11 @@ fn collect_jobs_for_run(
     Ok(out)
 }
 
-/// Collect matching queued/in_progress jobs (for multi-worker + sizing). Cap for API budget.
+/// Collect matching queued jobs (for multi-worker + sizing). Cap for API budget.
+///
+/// On per-poll budget exhaustion: return **partial** results (never fail the whole
+/// listen tick empty-handed). That keeps ephemeral workers spawning under backlog
+/// instead of spinning on "budget exhausted" with zero ups.
 fn list_demand_jobs(
     cli: &Cli,
     api: &str,
@@ -2819,65 +2831,77 @@ fn list_demand_jobs(
         return Ok(out);
     };
     let tick = select_repos_for_tick(cli, &repos);
-    // When pool-scaling, scan more repos per tick if allowlist is large.
+    // When pool-scaling, scan a modest number of repos per tick (staggered).
+    // Keep this small so budget remains for job detail GETs + registration POSTs.
     let scan = if pool_mode_on(cli) {
+        // Always stagger via round-robin; never pin to allowlist head (starves tail repos).
+        let mut cli_scan = cli.clone_for_listen();
         if cli.repos_per_tick == 0 {
-            repos.clone()
+            cli_scan.repos_per_tick = 6;
         } else {
-            // up to 8 repos/tick when dynamic, still staggered
-            let mut extra = select_repos_for_tick(cli, &repos);
-            if extra.len() < 8 && repos.len() > extra.len() {
-                for r in &repos {
-                    if !extra.contains(r) {
-                        extra.push(r.clone());
-                    }
-                    if extra.len() >= 8 {
-                        break;
-                    }
-                }
-            }
-            extra
+            cli_scan.repos_per_tick = cli.repos_per_tick.min(6);
         }
+        select_repos_for_tick(&cli_scan, &repos)
     } else {
         tick
     };
-    for name in scan {
-        if out.len() >= max_jobs {
-            break;
-        }
-        for status in ["queued", "in_progress"] {
+
+    // Prefer queued runs; also sample in_progress (multi-job matrices can still have
+    // queued jobs while the run is overall in_progress). Cap hard for API budget.
+    'budget_hit: {
+        for name in &scan {
             if out.len() >= max_jobs {
                 break;
             }
-            let url = format!(
-                "https://api.github.com/repos/{name}/actions/runs?status={status}&per_page=5"
-            );
-            let runs = match fetch_runs(&url, api, pacer) {
-                Ok(r) => r,
-                Err(e) if is_soft_api_err(&e) => {
-                    if e.contains("rate limited") || e.contains("budget exhausted") {
-                        return Err(e);
-                    }
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-            for run in runs.into_iter().take(3) {
+            for (status, run_take) in [("queued", 2usize), ("in_progress", 1usize)] {
                 if out.len() >= max_jobs {
                     break;
                 }
-                match collect_jobs_for_run(cli, &name, run.id, api, pacer) {
-                    Ok(mut jobs) => out.append(&mut jobs),
+                let url = format!(
+                    "https://api.github.com/repos/{name}/actions/runs?status={status}&per_page=5"
+                );
+                let runs = match fetch_runs(&url, api, pacer) {
+                    Ok(r) => r,
                     Err(e) if is_soft_api_err(&e) => {
-                        if e.contains("rate limited") || e.contains("budget exhausted") {
+                        if e.contains("budget exhausted") {
+                            eprintln!(
+                                "listen: list_demand_jobs: budget exhausted mid-scan ({} jobs kept)",
+                                out.len()
+                            );
+                            break 'budget_hit;
+                        }
+                        if e.contains("rate limited") {
                             return Err(e);
                         }
+                        continue;
                     }
                     Err(e) => return Err(e),
+                };
+                for run in runs.into_iter().take(run_take) {
+                    if out.len() >= max_jobs {
+                        break;
+                    }
+                    match collect_jobs_for_run(cli, name, run.id, api, pacer) {
+                        Ok(mut jobs) => out.append(&mut jobs),
+                        Err(e) if is_soft_api_err(&e) => {
+                            if e.contains("budget exhausted") {
+                                eprintln!(
+                                    "listen: list_demand_jobs: budget exhausted on jobs ({} kept)",
+                                    out.len()
+                                );
+                                break 'budget_hit;
+                            }
+                            if e.contains("rate limited") {
+                                return Err(e);
+                            }
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
             }
         }
     }
+
     // Dedupe by repo+job_name
     let mut seen = std::collections::HashSet::new();
     out.retain(|j| seen.insert(format!("{}::{}", j.repo, j.job_name)));
@@ -2934,22 +2958,30 @@ fn reap_pool_workers(cli: &Cli, pool: &ResourcePool) {
     let Ok(claims) = pool.claims() else {
         return;
     };
+    let now = now_unix();
     for c in claims {
         // Only reap workers owned by this listen base name prefix
         if !c.container.starts_with(&cli.container) {
             continue;
         }
-        if !container_running(&c.container) {
+        let running = container_running(&c.container);
+        // Stale claim: container exited/missing, or claim older than 2h (orphan).
+        let stale_age = now.saturating_sub(c.claimed_at_unix) > 7200;
+        if !running || stale_age {
             eprintln!(
-                "pool: reap {} (tier={} repo={:?})",
+                "pool: reap {} running={running} stale={stale_age} tier={} repo={:?}",
                 c.container, c.tier, c.repo
             );
             let mut dead = cli.clone_for_listen();
             dead.container = c.container.clone();
             dead.volume = format!("{}-data", c.container);
             dead.runner_name = c.worker_id.clone();
+            // Always release claim even if down fails — otherwise memory budget leaks to 0 MiB.
             let _ = down(&dead, true);
-            let _ = pool.release(&c.worker_id);
+            if let Err(e) = pool.release(&c.worker_id) {
+                eprintln!("pool: release {} failed: {}", c.worker_id, redact(&e));
+                let _ = pool.release_container(&c.container);
+            }
         }
     }
 }
@@ -2978,14 +3010,7 @@ fn spawn_sized_worker(
     let worker_id = format!("{}-w{slot}", base.runner_name);
     let container = format!("{}-w{slot}", base.container);
     let volume = format!("{container}-data");
-    if !pool.try_claim(
-        &worker_id,
-        &container,
-        c,
-        m,
-        tier,
-        Some(job.repo.as_str()),
-    )? {
+    if !pool.try_claim(&worker_id, &container, c, m, tier, Some(job.repo.as_str()))? {
         eprintln!("pool: claim failed for {container}");
         return Ok(());
     }
@@ -3087,6 +3112,8 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
         };
 
         if dynamic {
+            // Reset per-poll GET budget every tick (demand() does this; dynamic path must too).
+            pacer.begin_poll();
             let jobs = match list_demand_jobs(&cli, &api, &mut pacer, max_local as usize * 2) {
                 Ok(j) => j,
                 Err(e) => {
@@ -3106,7 +3133,10 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
                 .claims()
                 .map(|c| {
                     c.iter()
-                        .filter(|x| x.container.starts_with(&cli.container) && container_running(&x.container))
+                        .filter(|x| {
+                            x.container.starts_with(&cli.container)
+                                && container_running(&x.container)
+                        })
                         .count()
                 })
                 .unwrap_or(0);
@@ -3188,7 +3218,9 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
                             })
                             .unwrap_or(false);
                         if container_running(&cli.container) && busy {
-                            eprintln!("listen: sticky on {active:?} (still busy); defer move to {r}");
+                            eprintln!(
+                                "listen: sticky on {active:?} (still busy); defer move to {r}"
+                            );
                             if let Some(a) = active {
                                 cli.repo = Some(a);
                             }

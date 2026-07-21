@@ -2,8 +2,13 @@
 # Official runner tarball (MIT — see NOTICE) — registration injected at start.
 # Pin: https://github.com/actions/runner/releases/tag/v2.335.1
 #
+# Fleet work tools (baked in so jobs need not per-install):
+#   - gitleaks (pinned binary → /usr/local/bin)
+#   - Rust 1.96 via rustup for UID 1001 (/home/runner/.cargo)
+#
 # Runs as non-root UID 1001 (trivy DS-0002). Snapshot volume must be owned by 1001.
 # Style: one logical step per RUN (no && chains).
+# After pull/edit: rebuild with `gha-runner-ctl prepare` (or prepare --skip-host-update).
 
 FROM docker.io/library/ubuntu:24.04
 
@@ -11,10 +16,18 @@ ARG RUNNER_VERSION=2.335.1
 ARG TARGETARCH=x64
 ARG RUNNER_SHA256=4ef2f25285f0ae4477f1fe1e346db76d2f3ebf03824e2ddd1973a2819bf6c8cf
 ARG RUNNER_UID=1001
+# gitleaks pin: https://github.com/gitleaks/gitleaks/releases/tag/v8.30.1
+ARG GITLEAKS_VERSION=8.30.1
+ARG GITLEAKS_SHA256=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+# MSRV / rust-toolchain.toml channel
+ARG RUST_TOOLCHAIN=1.96
 
 ENV DEBIAN_FRONTEND=noninteractive \
     RUNNER_HOME=/opt/actions-runner \
-    RUNNER_USER=runner
+    RUNNER_USER=runner \
+    CARGO_HOME=/home/runner/.cargo \
+    RUSTUP_HOME=/home/runner/.rustup \
+    PATH=/home/runner/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # Install HTTPS transport and CA certificates first to support secure updates.
 RUN apt-get update \
@@ -57,6 +70,36 @@ RUN curl -fsSL https://astral.sh/uv/install.sh -o /tmp/uv-install.sh
 RUN sh /tmp/uv-install.sh
 RUN install -m 755 /root/.local/bin/uv /usr/local/bin/uv
 RUN rm -rf /root/.local /tmp/uv-install.sh
+
+# gitleaks pinned binary → /usr/local/bin (fleet-security / secret scan jobs)
+RUN curl -fsSL -o /tmp/gitleaks.tar.gz \
+      "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+RUN echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tar.gz" | sha256sum -c -
+RUN tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+RUN install -m 755 /tmp/gitleaks /usr/local/bin/gitleaks
+RUN rm -f /tmp/gitleaks /tmp/gitleaks.tar.gz
+RUN gitleaks version
+
+# Rust via rustup for runner (UID 1001): cargo/rustc on default PATH for non-login shells.
+# Matches package rust-version / rust-toolchain.toml (1.96) + rustfmt/clippy.
+USER runner
+WORKDIR /home/runner
+RUN curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o /tmp/rustup-init.sh
+RUN sh /tmp/rustup-init.sh -y --default-toolchain "${RUST_TOOLCHAIN}" \
+      --profile minimal \
+      --component rustfmt \
+      --component clippy \
+      --no-modify-path
+RUN rm -f /tmp/rustup-init.sh
+RUN rustup --version
+RUN rustc --version
+RUN cargo --version
+# Drop download cache noise; keep toolchain + cargo bin
+RUN rm -rf /home/runner/.cargo/registry /home/runner/.cargo/git \
+      /tmp/tmp* 2>/dev/null || true
+
+USER root
+WORKDIR /
 
 # Seed dir holds extracted runner; snapshot volume mounts over RUNNER_HOME at runtime.
 RUN mkdir -p /opt/actions-runner-seed "${RUNNER_HOME}"

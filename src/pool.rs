@@ -18,7 +18,9 @@ pub const DEFAULT_POOL_CPUS: f64 = 8.0;
 pub const DEFAULT_POOL_MEMORY_MIB: u64 = 8192;
 pub const DEFAULT_MAX_WORKERS: u32 = 24;
 /// Smallest worker: 250m CPU / 256 MiB.
+#[allow(dead_code)] // public pool API / future floor knobs
 pub const DEFAULT_MIN_CPUS: f64 = 0.25;
+#[allow(dead_code)]
 pub const DEFAULT_MIN_MEMORY_MIB: u64 = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,21 +88,8 @@ pub fn size_for_job(job_name: &str, labels: &[String], force_gpu: bool) -> SizeT
     if name_contains_any(
         &name,
         &[
-            "gitleaks",
-            "trivy",
-            "license",
-            "lint",
-            "ruff",
-            "fmt",
-            "format",
-            "clippy",
-            "typos",
-            "markdown",
-            "docs",
-            "spell",
-            "security",
-            "reuse",
-            "sbom",
+            "gitleaks", "trivy", "license", "lint", "ruff", "fmt", "format", "clippy", "typos",
+            "markdown", "docs", "spell", "security", "reuse", "sbom",
         ],
     ) {
         return SizeTier::Micro;
@@ -138,7 +127,10 @@ pub fn resources_for_tier(tier: SizeTier) -> (String, String) {
 }
 
 pub fn parse_cpus_f64(s: &str) -> Option<f64> {
-    s.trim().parse::<f64>().ok().filter(|n| *n > 0.0 && *n <= 64.0)
+    s.trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|n| *n > 0.0 && *n <= 64.0)
 }
 
 /// Parse memory like `512m`, `2g`, `8192` (MiB if bare number) → MiB.
@@ -380,7 +372,7 @@ pub fn format_cpus(c: f64) -> String {
 }
 
 pub fn format_memory_mib(m: u64) -> String {
-    if m >= 1024 && m % 1024 == 0 {
+    if m >= 1024 && m.is_multiple_of(1024) {
         format!("{}g", m / 1024)
     } else {
         format!("{m}m")
