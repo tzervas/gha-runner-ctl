@@ -1,3 +1,10 @@
+## 0.2.8 — 2026-07-20
+
+### Fixed
+- **Listen drain under backlog:** `list_demand_jobs` returns **partial** results when the per-poll API budget is exhausted instead of failing the whole tick with zero spawns.
+- Scan **queued** runs only (in_progress already has a runner); fewer runs per repo; cap scan width so registration POSTs still fit in budget.
+- README architecture mermaid diagrams (sanitized — no hostnames, tokens, or personal paths).
+
 ## 0.2.7
 
 ### Dynamic host pool (horizontal + vertical)

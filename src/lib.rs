@@ -2800,7 +2800,11 @@ fn collect_jobs_for_run(
     Ok(out)
 }
 
-/// Collect matching queued/in_progress jobs (for multi-worker + sizing). Cap for API budget.
+/// Collect matching queued jobs (for multi-worker + sizing). Cap for API budget.
+///
+/// On per-poll budget exhaustion: return **partial** results (never fail the whole
+/// listen tick empty-handed). That keeps ephemeral workers spawning under backlog
+/// instead of spinning on "budget exhausted" with zero ups.
 fn list_demand_jobs(
     cli: &Cli,
     api: &str,
@@ -2819,19 +2823,20 @@ fn list_demand_jobs(
         return Ok(out);
     };
     let tick = select_repos_for_tick(cli, &repos);
-    // When pool-scaling, scan more repos per tick if allowlist is large.
+    // When pool-scaling, scan a modest number of repos per tick (staggered).
+    // Keep this small so budget remains for job detail GETs + registration POSTs.
     let scan = if pool_mode_on(cli) {
         if cli.repos_per_tick == 0 {
-            repos.clone()
+            repos.iter().take(6).cloned().collect()
         } else {
-            // up to 8 repos/tick when dynamic, still staggered
             let mut extra = select_repos_for_tick(cli, &repos);
-            if extra.len() < 8 && repos.len() > extra.len() {
+            let cap = 6usize.min(repos.len().max(1));
+            if extra.len() < cap {
                 for r in &repos {
                     if !extra.contains(r) {
                         extra.push(r.clone());
                     }
-                    if extra.len() >= 8 {
+                    if extra.len() >= cap {
                         break;
                     }
                 }
@@ -2841,35 +2846,49 @@ fn list_demand_jobs(
     } else {
         tick
     };
-    for name in scan {
-        if out.len() >= max_jobs {
-            break;
-        }
-        for status in ["queued", "in_progress"] {
+
+    // Only "queued" for wake-up: in_progress already has a runner assigned.
+    // Fewer runs per repo → more repos/jobs before budget hit.
+    'budget_hit: {
+        for name in scan {
             if out.len() >= max_jobs {
                 break;
             }
             let url = format!(
-                "https://api.github.com/repos/{name}/actions/runs?status={status}&per_page=5"
+                "https://api.github.com/repos/{name}/actions/runs?status=queued&per_page=5"
             );
             let runs = match fetch_runs(&url, api, pacer) {
                 Ok(r) => r,
                 Err(e) if is_soft_api_err(&e) => {
-                    if e.contains("rate limited") || e.contains("budget exhausted") {
+                    if e.contains("budget exhausted") {
+                        eprintln!(
+                            "listen: list_demand_jobs: budget exhausted mid-scan ({} jobs kept)",
+                            out.len()
+                        );
+                        break 'budget_hit;
+                    }
+                    if e.contains("rate limited") {
                         return Err(e);
                     }
                     continue;
                 }
                 Err(e) => return Err(e),
             };
-            for run in runs.into_iter().take(3) {
+            for run in runs.into_iter().take(2) {
                 if out.len() >= max_jobs {
                     break;
                 }
                 match collect_jobs_for_run(cli, &name, run.id, api, pacer) {
                     Ok(mut jobs) => out.append(&mut jobs),
                     Err(e) if is_soft_api_err(&e) => {
-                        if e.contains("rate limited") || e.contains("budget exhausted") {
+                        if e.contains("budget exhausted") {
+                            eprintln!(
+                                "listen: list_demand_jobs: budget exhausted on jobs ({} kept)",
+                                out.len()
+                            );
+                            break 'budget_hit;
+                        }
+                        if e.contains("rate limited") {
                             return Err(e);
                         }
                     }
@@ -2878,6 +2897,7 @@ fn list_demand_jobs(
             }
         }
     }
+
     // Dedupe by repo+job_name
     let mut seen = std::collections::HashSet::new();
     out.retain(|j| seen.insert(format!("{}::{}", j.repo, j.job_name)));
