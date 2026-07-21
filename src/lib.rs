@@ -31,7 +31,7 @@ const DEFAULT_CONTAINER: &str = "gha-runner-ctl";
 const DEFAULT_VOLUME: &str = "gha-runner-ctl-data";
 const DEFAULT_LABELS: &str = "self-hosted,linux,x64,podman";
 const DEFAULT_NAME: &str = "shared-podman-1";
-const UA: &str = "gha-runner-ctl/0.2.7";
+const UA: &str = "gha-runner-ctl/0.2.8";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 const MIN_POLL_SECS: u64 = 5;
 const MAX_POLL_SECS: u64 = 3600;
@@ -2826,64 +2826,38 @@ fn list_demand_jobs(
     // When pool-scaling, scan a modest number of repos per tick (staggered).
     // Keep this small so budget remains for job detail GETs + registration POSTs.
     let scan = if pool_mode_on(cli) {
+        // Always stagger via round-robin; never pin to allowlist head (starves tail repos).
+        let mut cli_scan = cli.clone_for_listen();
         if cli.repos_per_tick == 0 {
-            repos.iter().take(6).cloned().collect()
+            cli_scan.repos_per_tick = 6;
         } else {
-            let mut extra = select_repos_for_tick(cli, &repos);
-            let cap = 6usize.min(repos.len().max(1));
-            if extra.len() < cap {
-                for r in &repos {
-                    if !extra.contains(r) {
-                        extra.push(r.clone());
-                    }
-                    if extra.len() >= cap {
-                        break;
-                    }
-                }
-            }
-            extra
+            cli_scan.repos_per_tick = cli.repos_per_tick.min(6);
         }
+        select_repos_for_tick(&cli_scan, &repos)
     } else {
         tick
     };
 
-    // Only "queued" for wake-up: in_progress already has a runner assigned.
-    // Fewer runs per repo → more repos/jobs before budget hit.
+    // Prefer queued runs; also sample in_progress (multi-job matrices can still have
+    // queued jobs while the run is overall in_progress). Cap hard for API budget.
     'budget_hit: {
-        for name in scan {
+        for name in &scan {
             if out.len() >= max_jobs {
                 break;
             }
-            let url = format!(
-                "https://api.github.com/repos/{name}/actions/runs?status=queued&per_page=5"
-            );
-            let runs = match fetch_runs(&url, api, pacer) {
-                Ok(r) => r,
-                Err(e) if is_soft_api_err(&e) => {
-                    if e.contains("budget exhausted") {
-                        eprintln!(
-                            "listen: list_demand_jobs: budget exhausted mid-scan ({} jobs kept)",
-                            out.len()
-                        );
-                        break 'budget_hit;
-                    }
-                    if e.contains("rate limited") {
-                        return Err(e);
-                    }
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-            for run in runs.into_iter().take(2) {
+            for (status, run_take) in [("queued", 2usize), ("in_progress", 1usize)] {
                 if out.len() >= max_jobs {
                     break;
                 }
-                match collect_jobs_for_run(cli, &name, run.id, api, pacer) {
-                    Ok(mut jobs) => out.append(&mut jobs),
+                let url = format!(
+                    "https://api.github.com/repos/{name}/actions/runs?status={status}&per_page=5"
+                );
+                let runs = match fetch_runs(&url, api, pacer) {
+                    Ok(r) => r,
                     Err(e) if is_soft_api_err(&e) => {
                         if e.contains("budget exhausted") {
                             eprintln!(
-                                "listen: list_demand_jobs: budget exhausted on jobs ({} kept)",
+                                "listen: list_demand_jobs: budget exhausted mid-scan ({} jobs kept)",
                                 out.len()
                             );
                             break 'budget_hit;
@@ -2891,8 +2865,30 @@ fn list_demand_jobs(
                         if e.contains("rate limited") {
                             return Err(e);
                         }
+                        continue;
                     }
                     Err(e) => return Err(e),
+                };
+                for run in runs.into_iter().take(run_take) {
+                    if out.len() >= max_jobs {
+                        break;
+                    }
+                    match collect_jobs_for_run(cli, name, run.id, api, pacer) {
+                        Ok(mut jobs) => out.append(&mut jobs),
+                        Err(e) if is_soft_api_err(&e) => {
+                            if e.contains("budget exhausted") {
+                                eprintln!(
+                                    "listen: list_demand_jobs: budget exhausted on jobs ({} kept)",
+                                    out.len()
+                                );
+                                break 'budget_hit;
+                            }
+                            if e.contains("rate limited") {
+                                return Err(e);
+                            }
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
             }
         }
@@ -3107,6 +3103,8 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
         };
 
         if dynamic {
+            // Reset per-poll GET budget every tick (demand() does this; dynamic path must too).
+            pacer.begin_poll();
             let jobs = match list_demand_jobs(&cli, &api, &mut pacer, max_local as usize * 2) {
                 Ok(j) => j,
                 Err(e) => {

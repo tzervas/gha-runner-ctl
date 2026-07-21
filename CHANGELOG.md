@@ -2,7 +2,7 @@
 
 ### Fixed
 - **Listen drain under backlog:** `list_demand_jobs` returns **partial** results when the per-poll API budget is exhausted instead of failing the whole tick with zero spawns.
-- Scan **queued** runs only (in_progress already has a runner); fewer runs per repo; cap scan width so registration POSTs still fit in budget.
+- Partial results on budget exhaust; prefer queued runs, light in_progress sample for multi-job matrices; RR-capped scan width so registration POSTs still fit.
 - README architecture mermaid diagrams (sanitized — no hostnames, tokens, or personal paths).
 
 ## 0.2.7
