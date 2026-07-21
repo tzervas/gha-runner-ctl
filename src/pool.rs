@@ -13,9 +13,10 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Default host pool: 8 cores / 8 GiB for all ephemeral work containers.
-pub const DEFAULT_POOL_CPUS: f64 = 8.0;
-pub const DEFAULT_POOL_MEMORY_MIB: u64 = 8192;
+/// Default host pool: 16 cores / 16 GiB for all ephemeral work containers.
+/// Single-worker ceiling matches xlarge/gpu tiers (16c / 16 GiB max claim).
+pub const DEFAULT_POOL_CPUS: f64 = 16.0;
+pub const DEFAULT_POOL_MEMORY_MIB: u64 = 16 * 1024;
 pub const DEFAULT_MAX_WORKERS: u32 = 24;
 /// Smallest worker: 250m CPU / 256 MiB.
 #[allow(dead_code)] // public pool API / future floor knobs
@@ -27,13 +28,15 @@ pub const DEFAULT_MIN_MEMORY_MIB: u64 = 256;
 pub enum SizeTier {
     /// fleet-security / lint / gitleaks-class
     Micro,
-    /// light unit tests, ruff
+    /// light unit tests, ruff, detect
     Small,
-    /// default cargo test / full CI
+    /// default cargo test / full CI (enough RAM to avoid OOM on medium crates)
     Medium,
-    /// heavy build, multi-crate, release
+    /// multi-crate, release, e2e, image build
     Large,
-    /// GPU jobs (still claims CPU/RAM from pool)
+    /// workspace-wide / chromium-class / justified max CPU+RAM (≤16c/16g)
+    Xlarge,
+    /// GPU jobs (CPU+RAM claim + device attach on GPU listeners)
     Gpu,
 }
 
@@ -44,26 +47,76 @@ impl SizeTier {
             SizeTier::Small => "small",
             SizeTier::Medium => "medium",
             SizeTier::Large => "large",
+            SizeTier::Xlarge => "xlarge",
             SizeTier::Gpu => "gpu",
         }
     }
 }
 
-/// Automatic size from job name + labels (no workflow knobs required).
+/// Explicit size labels workflows may put on `runs-on` (must be registered on the worker).
+/// Example: `runs-on: [self-hosted, linux, x64, podman, large]`
+fn tier_from_labels(labs: &[String]) -> Option<SizeTier> {
+    // Prefer most specific / largest explicit label.
+    let has = |s: &str| labs.iter().any(|l| l == s || l == &format!("size-{s}"));
+    if has("gpu")
+        || labs
+            .iter()
+            .any(|l| l.starts_with("gpu-slice") || l == "cuda" || l.contains("nvidia"))
+    {
+        return Some(SizeTier::Gpu);
+    }
+    if has("xlarge") || has("x-large") || has("huge") {
+        return Some(SizeTier::Xlarge);
+    }
+    if has("large") {
+        return Some(SizeTier::Large);
+    }
+    if has("medium") {
+        return Some(SizeTier::Medium);
+    }
+    if has("small") {
+        return Some(SizeTier::Small);
+    }
+    if has("micro") {
+        return Some(SizeTier::Micro);
+    }
+    None
+}
+
+/// Automatic size from job name + labels.
+///
+/// **Label override** (preferred for justified heavy jobs): put a size token in
+/// `runs-on` alongside the fleet labels, e.g.
+/// `[self-hosted, linux, x64, podman, large]`. Workers register that label so
+/// GitHub routes correctly and the pool claims the matching tier.
 pub fn size_for_job(job_name: &str, labels: &[String], force_gpu: bool) -> SizeTier {
     let name = job_name.to_ascii_lowercase();
     let labs: Vec<String> = labels
         .iter()
         .map(|l| l.trim().to_ascii_lowercase())
         .collect();
-    let has_gpu = force_gpu
-        || labs.iter().any(|l| {
-            l == "gpu" || l.starts_with("gpu-slice") || l == "cuda" || l.contains("nvidia")
-        });
-    if has_gpu {
+    if force_gpu {
         return SizeTier::Gpu;
     }
-    // Heavy signals
+    if let Some(t) = tier_from_labels(&labs) {
+        return t;
+    }
+    // Xlarge signals (justified heavy compiles / full workspaces)
+    if name_contains_any(
+        &name,
+        &[
+            "xlarge",
+            "workspace-build",
+            "full-workspace",
+            "chromium",
+            "compile-all",
+            "all-features",
+            "heavy-build",
+        ],
+    ) {
+        return SizeTier::Xlarge;
+    }
+    // Large signals
     if name_contains_any(
         &name,
         &[
@@ -80,29 +133,36 @@ pub fn size_for_job(job_name: &str, labels: &[String], force_gpu: bool) -> SizeT
             "integration",
             "e2e",
             "matrix",
+            "local parity",
+            "local-parity",
+            "build and test",
         ],
     ) {
         return SizeTier::Large;
     }
-    // Light / security / lint
+    // Light / security / lint (docs/clippy alone stay micro)
     if name_contains_any(
         &name,
         &[
-            "gitleaks", "trivy", "license", "lint", "ruff", "fmt", "format", "clippy", "typos",
-            "markdown", "docs", "spell", "security", "reuse", "sbom",
+            "gitleaks", "trivy", "license", "lint", "ruff", "fmt", "format", "typos", "markdown",
+            "spell", "security", "reuse", "sbom", "commitizen", "conventional",
         ],
     ) {
+        return SizeTier::Micro;
+    }
+    // Clippy-only jobs are light; "cargo clippy" with build stays medium via cargo below
+    if name.contains("clippy") && !name.contains("build") && !name.contains("test") {
         return SizeTier::Micro;
     }
     // Medium-default cargo / pytest
     if name_contains_any(
         &name,
-        &["test", "check", "build", "cargo", "pytest", "ci", "unit"],
+        &["test", "check", "build", "cargo", "pytest", "ci", "unit", "docs"],
     ) {
         return SizeTier::Medium;
     }
     // fleet-ci / fleet-security workflow job names
-    if name.contains("fleet-security") || name.contains("noop") {
+    if name.contains("fleet-security") || name.contains("noop") || name.contains("gate") {
         return SizeTier::Micro;
     }
     if name.contains("fleet-ci") || name.contains("detect") {
@@ -116,13 +176,17 @@ fn name_contains_any(name: &str, needles: &[&str]) -> bool {
 }
 
 /// Map tier → (cpus string, memory string) for podman.
+/// Caps: xlarge/gpu ≤ 16 CPU / 16 GiB (host pool default matches).
 pub fn resources_for_tier(tier: SizeTier) -> (String, String) {
     match tier {
         SizeTier::Micro => ("0.25".into(), "512m".into()),
         SizeTier::Small => ("0.5".into(), "1g".into()),
-        SizeTier::Medium => ("1".into(), "2g".into()),
-        SizeTier::Large => ("2".into(), "4g".into()),
-        SizeTier::Gpu => ("2".into(), "4g".into()),
+        // Medium crates / cargo check — 2c/4g avoids OOM on self-hosted workers
+        SizeTier::Medium => ("2".into(), "4g".into()),
+        SizeTier::Large => ("4".into(), "8g".into()),
+        SizeTier::Xlarge => ("8".into(), "16g".into()),
+        // GPU jobs: solid host CPU/RAM for data loaders + full device on GPU slice
+        SizeTier::Gpu => ("4".into(), "8g".into()),
     }
 }
 
@@ -405,6 +469,40 @@ mod tests {
             size_for_job("train", &["self-hosted".into(), "gpu".into()], false),
             SizeTier::Gpu
         );
+    }
+
+    #[test]
+    fn tier_explicit_large_label() {
+        assert_eq!(
+            size_for_job(
+                "unit",
+                &["self-hosted".into(), "large".into()],
+                false
+            ),
+            SizeTier::Large
+        );
+    }
+
+    #[test]
+    fn tier_build_and_test_large() {
+        assert_eq!(
+            size_for_job("Build and Test (local parity)", &["self-hosted".into()], false),
+            SizeTier::Large
+        );
+    }
+
+    #[test]
+    fn resources_medium_has_headroom() {
+        let (c, m) = resources_for_tier(SizeTier::Medium);
+        assert_eq!(c, "2");
+        assert_eq!(m, "4g");
+    }
+
+    #[test]
+    fn resources_xlarge_cap() {
+        let (c, m) = resources_for_tier(SizeTier::Xlarge);
+        assert_eq!(c, "8");
+        assert_eq!(m, "16g");
     }
 
     #[test]

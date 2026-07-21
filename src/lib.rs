@@ -40,7 +40,7 @@ const DEFAULT_RUNNER_VERSION: &str = "2.335.1";
 const DEFAULT_RUNNER_SHA256: &str =
     "4ef2f25285f0ae4477f1fe1e346db76d2f3ebf03824e2ddd1973a2819bf6c8cf";
 const DEFAULT_RUNNER_ARCH: &str = "x64";
-const UA: &str = "gha-runner-ctl/0.2.9";
+const UA: &str = "gha-runner-ctl/0.2.10";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 const MIN_POLL_SECS: u64 = 5;
 const MAX_POLL_SECS: u64 = 3600;
@@ -3414,6 +3414,50 @@ fn reap_pool_workers(cli: &Cli, pool: &ResourcePool) {
     }
 }
 
+/// Merge fleet base labels with job-requested size/capability labels + tier tag.
+/// GitHub requires the runner to advertise every `runs-on` label.
+pub fn runner_labels_for_job(base_labels: &str, job_labels: &[String], tier: SizeTier) -> String {
+    use std::collections::BTreeSet;
+    let mut set: BTreeSet<String> = base_labels
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    // Always advertise the resolved tier so size-* jobs can match.
+    set.insert(tier.as_str().to_string());
+    for l in job_labels {
+        let l = l.trim().to_ascii_lowercase();
+        if l.is_empty() || !is_safe_ident(&l) {
+            continue;
+        }
+        // Only capability/size extras — never drop self-hosted/linux/x64/podman from base.
+        if matches!(
+            l.as_str(),
+            "micro"
+                | "small"
+                | "medium"
+                | "large"
+                | "xlarge"
+                | "x-large"
+                | "huge"
+                | "gpu"
+                | "cuda"
+                | "nvidia"
+                | "size-micro"
+                | "size-small"
+                | "size-medium"
+                | "size-large"
+                | "size-xlarge"
+        ) || l.starts_with("gpu-slice")
+            || l.starts_with("size-")
+        {
+            set.insert(l);
+        }
+    }
+    set.into_iter().collect::<Vec<_>>().join(",")
+}
+
 fn spawn_sized_worker(
     base: &Cli,
     pool: &ResourcePool,
@@ -3450,11 +3494,15 @@ fn spawn_sized_worker(
     unit.runner_name = worker_id.clone();
     unit.cpus = format_cpus(c);
     unit.memory = format_memory_mib(m);
+    // Register base fleet labels + job-requested size/capability labels so
+    // `runs-on: [self-hosted, linux, x64, podman, large|xlarge|gpu]` matches.
+    unit.labels = runner_labels_for_job(&base.labels, &job.labels, tier);
     eprintln!(
-        "pool: up {container} tier={} cpus={} mem={} repo={} job={}",
+        "pool: up {container} tier={} cpus={} mem={} labels={} repo={} job={}",
         tier.as_str(),
         unit.cpus,
         unit.memory,
+        unit.labels,
         job.repo,
         job.job_name
     );

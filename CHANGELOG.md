@@ -1,3 +1,10 @@
+## 0.2.10
+
+### Changed
+- Host pool defaults **16 CPU / 16 GiB**; tiers micro→xlarge (medium **2c/4g**, large **4c/8g**, xlarge **8c/16g**, gpu **4c/8g**).
+- Explicit size labels on `runs-on` (`large`/`xlarge`/`gpu`) drive allocation; workers re-register matching labels.
+- Docs: DYNAMIC_POOL sizing policy (justified labels only).
+
 ## 0.2.9
 
 ### Added
