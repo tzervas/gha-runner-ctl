@@ -1,0 +1,29 @@
+=== gha-agent podman ps -a ===
+gha-runner-cpu-tzervas-webpuppet-rs-mcp	Up 7 hours	localhost/gha-runner-ctl:latest	2026-07-21 15:52:33.849250642 -0400 EDT
+gha-runner-cpu-tzervas-aphelion-framework-rs	Up 7 hours	localhost/gha-runner-ctl:latest	2026-07-21 15:52:39.27513051 -0400 EDT
+gha-runner-cpu-tzervas-security-mcp	Up 7 hours	localhost/gha-runner-ctl:latest	2026-07-21 15:53:01.305862265 -0400 EDT
+gha-runner-cpu-tzervas-dev-shell	Up 7 hours	localhost/gha-runner-ctl:latest	2026-07-21 15:53:24.208785198 -0400 EDT
+gha-runner-cpu-tzervas-workstation-private-config	Up 7 hours	localhost/gha-runner-ctl:latest	2026-07-21 15:53:49.717773921 -0400 EDT
+gha-runner-cpu-tzervas-memory-gate	Up 7 hours	localhost/gha-runner-ctl:latest	2026-07-21 15:53:55.166400967 -0400 EDT
+gha-runner-ctl-tzervas-agent-mcp	Up 7 hours	localhost/gha-runner-ctl:latest	2026-07-21 16:09:04.93296426 -0400 EDT
+gha-runner-ctl-tzervas-memory-gate-rs	Up 7 hours	localhost/gha-runner-ctl:latest	2026-07-21 16:09:09.376906906 -0400 EDT
+gha-runner-ctl-tzervas-cabal-devmelopner	Exited (0) 4 hours ago	localhost/gha-runner-ctl:latest	2026-07-21 16:38:36.130173919 -0400 EDT
+gha-runner-cpu-myc-lang	Exited (0) About an hour ago	localhost/gha-runner-ctl:latest	2026-07-21 21:45:24.612605932 -0400 EDT
+gha-runner-cpu-myc-lang-myc	Exited (0) About an hour ago	localhost/gha-runner-ctl:latest	2026-07-21 21:45:44.823719952 -0400 EDT
+gha-runner-cpu-mycelium-lang-myc	Exited (0) About an hour ago	localhost/gha-runner-ctl:latest	2026-07-21 21:56:57.695601599 -0400 EDT
+gha-runner-cpu-ml-1	Exited (0) 28 minutes ago	localhost/gha-runner-ctl:latest	2026-07-21 22:43:59.823206265 -0400 EDT
+gha-runner-cpu-mycelium-lang	Exited (0) 4 minutes ago	localhost/gha-runner-ctl:latest	2026-07-21 23:07:07.603342123 -0400 EDT
+gha-runner-cpu-w0	Exited (0) 5 seconds ago	localhost/gha-runner-ctl:latest	2026-07-21 23:11:52.927744742 -0400 EDT
+gha-runner-cpu-w1	Exited (0) 8 seconds ago	localhost/gha-runner-ctl:latest	2026-07-21 23:11:57.283797528 -0400 EDT
+
+=== images ===
+localhost/gha-runner-ctl:latest	2.41 GB
+<none>:<none>	2.41 GB
+<none>:<none>	1.69 GB
+<none>:<none>	1.69 GB
+docker.io/library/ubuntu:22.04	80.6 MB
+docker.io/library/ubuntu:24.04	80.7 MB
+docker.io/library/alpine:3.20	8.1 MB
+docker.io/library/rust:1.85-bookworm	1.49 GB
+docker.io/library/rockylinux:9	181 MB
+docker.io/nvidia/cuda:12.0.0-base-ubuntu22.04	240 MB

@@ -1,0 +1,30 @@
+=== idle online runners (zombie retain suspects) ===
+--- webpuppet-rs-mcp ---
+{"busy":false,"labels":["self-hosted","Linux","X64","podman"],"name":"wsl-cpu-tzervas-webpuppet-rs-mcp","os":"Linux","status":"online"}
+--- aphelion-framework-rs ---
+{"busy":false,"labels":["self-hosted","Linux","X64","podman"],"name":"wsl-cpu-1-tzervas-aphelion-framework-rs","os":"Linux","status":"online"}
+--- security-mcp ---
+{"busy":false,"labels":["self-hosted","Linux","X64","podman"],"name":"wsl-cpu-tzervas-security-mcp","os":"Linux","status":"online"}
+--- dev-shell ---
+{"busy":false,"labels":["self-hosted","Linux","X64","podman"],"name":"wsl-cpu-tzervas-dev-shell","os":"Linux","status":"online"}
+--- workstation-private-config ---
+{"busy":false,"labels":["self-hosted","Linux","X64","podman"],"name":"wsl-cpu-tzervas-workstation-private-config","os":"Linux","status":"online"}
+--- memory-gate ---
+{"busy":false,"labels":["self-hosted","Linux","X64","podman"],"name":"wsl-cpu-1-tzervas-memory-gate","os":"Linux","status":"online"}
+--- agent-mcp ---
+{"busy":false,"labels":["self-hosted","Linux","X64","podman"],"name":"shared-podman-1-tzervas-agent-mcp","os":"Linux","status":"online"}
+--- memory-gate-rs ---
+{"busy":false,"labels":["self-hosted","Linux","X64","podman"],"name":"shared-podman-1-tzervas-memory-gate-rs","os":"Linux","status":"online"}
+{"busy":false,"labels":["self-hosted","Linux","X64","podman","medium"],"name":"wsl-cpu-w4","os":"Linux","status":"offline"}
+--- cabal-devmelopner ---
+{"busy":false,"labels":["self-hosted","Linux","X64","podman"],"name":"shared-podman-1-tzervas-cabal-devmelopner","os":"Linux","status":"offline"}
+--- mycelium-lang ---
+--- mycelium-lang-myc ---
+{"busy":false,"labels":["self-hosted","Linux","X64","podman"],"name":"wsl-cpu-mycelium-lang-myc","os":"Linux","status":"offline"}
+--- mycelium-core ---
+--- tero-rs ---
+{"busy":false,"labels":["self-hosted","Linux","X64","podman"],"name":"shared-podman-1-tzervas-tero-rs","os":"Linux","status":"online"}
+{"busy":false,"labels":["self-hosted","Linux","X64","podman"],"name":"wsl-cpu-1-tzervas-tero-rs","os":"Linux","status":"offline"}
+--- tero-mcp ---
+{"busy":false,"labels":["self-hosted","Linux","X64","podman"],"name":"shared-podman-1-tzervas-tero-mcp","os":"Linux","status":"online"}
+{"busy":false,"labels":["self-hosted","Linux","X64","podman"],"name":"wsl-cpu-1-tzervas-tero-mcp","os":"Linux","status":"offline"}
