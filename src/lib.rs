@@ -265,12 +265,22 @@ pub struct Cli {
     listen_min_interval: u64,
 
     /// Max repos scanned for demand in dynamic pool mode per tick (after priority set). Default 12.
-    #[arg(long, env = "GHA_POOL_SCAN_PER_TICK", default_value_t = 12, global = true)]
+    #[arg(
+        long,
+        env = "GHA_POOL_SCAN_PER_TICK",
+        default_value_t = 12,
+        global = true
+    )]
     pool_scan_per_tick: u32,
 
     /// On listen start, stop+rm worker containers older than this many seconds that are not in the pool claim set.
     /// Targets stale retain/warm leftovers. `0` disables. Default 3600.
-    #[arg(long, env = "GHA_REAP_STALE_SECS", default_value_t = 3600, global = true)]
+    #[arg(
+        long,
+        env = "GHA_REAP_STALE_SECS",
+        default_value_t = 3600,
+        global = true
+    )]
     reap_stale_secs: u64,
 
     /// Append one JSON line per listen tick to this path (dir created). Empty = disabled.
@@ -2906,7 +2916,6 @@ struct NamedRepo {
     private: Option<bool>,
 }
 
-
 fn parse_repo_csv(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     for part in s.split(|c| c == ',' || c == '\n' || c == '\r') {
@@ -2955,15 +2964,17 @@ fn priority_repos_list(cli: &Cli) -> Vec<String> {
 
 fn tick_log_path(cli: &Cli) -> Option<PathBuf> {
     let raw = cli.tick_log.trim();
-    if raw.is_empty() || raw.eq_ignore_ascii_case("off") || raw.eq_ignore_ascii_case("false") || raw == "0" {
+    if raw.is_empty()
+        || raw.eq_ignore_ascii_case("off")
+        || raw.eq_ignore_ascii_case("false")
+        || raw == "0"
+    {
         return None;
     }
     if raw.eq_ignore_ascii_case("auto") {
         let base = std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share"))
-            })
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
             .unwrap_or_else(|| PathBuf::from("/tmp"));
         return Some(base.join("gha-runner-ctl/logs/listen-ticks.jsonl"));
     }
@@ -3115,7 +3126,6 @@ fn reap_stale_containers(cli: &Cli, pool: &ResourcePool) {
         claimed.len()
     );
 }
-
 
 fn repos_round_robin_state_path(container: &str) -> PathBuf {
     let dir = std::env::var_os("XDG_RUNTIME_DIR")
@@ -3543,7 +3553,7 @@ fn list_demand_jobs(
         if !scan.contains(&r) {
             scan.push(r);
         }
-    };
+    }
 
     // Prefer queued runs; also sample in_progress (multi-job matrices can still have
     // queued jobs while the run is overall in_progress). Cap hard for API budget.
@@ -4567,9 +4577,6 @@ mod robust_queue_tests {
     #[test]
     fn normalize_podman_started_at_iso() {
         let raw = "2026-07-21T19:52:33.909118621Z";
-        assert_eq!(
-            normalize_podman_started_at(raw),
-            "2026-07-21 19:52:33 UTC"
-        );
+        assert_eq!(normalize_podman_started_at(raw), "2026-07-21 19:52:33 UTC");
     }
 }
