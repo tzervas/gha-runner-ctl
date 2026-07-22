@@ -2,6 +2,14 @@
 
 Applied from the workstation pack under `plans/fleet-standards/pack/`.
 
+## Honest CI (normative)
+
+See **[HONEST_CI.md](./HONEST_CI.md)** — outcomes are only **pass / fail / skip**;
+failures must classify **`FAIL_PRODUCT` | `FAIL_NOT_IMPLEMENTED` | `FAIL_RUNNER` |
+`FAIL_ENV` | `FAIL_INFRA`** so runner/env problems are never mistaken for product
+or for “not implemented yet.” No fake green (missing toolchain → exit 0 is banned
+on required jobs).
+
 ## Workflows
 
 | Workflow | When | Runner |
