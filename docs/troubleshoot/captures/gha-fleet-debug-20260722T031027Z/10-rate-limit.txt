@@ -1,0 +1,5 @@
+=== gh rate limit ===
+{"core":{"limit":5000,"remaining":4973,"reset":1784693374,"used":27},"graphql":{"limit":5000,"remaining":4962,"reset":1784691785,"used":38},"search":{"limit":30,"remaining":30,"reset":1784689976,"used":0}}
+
+=== rate limit via gha-agent token (no secret echo) ===
+core remaining=4973/5000 reset=1784693374

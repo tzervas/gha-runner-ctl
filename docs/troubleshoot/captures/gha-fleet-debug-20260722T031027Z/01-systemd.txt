@@ -1,0 +1,48 @@
+● gha-runner-ctl@cpu.service - gha-runner-ctl listen instance cpu (fleet agent)
+     Loaded: loaded (/home/gha-agent/.config/systemd/user/gha-runner-ctl@.service; enabled; preset: enabled)
+    Drop-In: /home/gha-agent/.config/systemd/user/gha-runner-ctl@cpu.service.d
+             └─interval.conf
+     Active: active (running) since Tue 2026-07-21 22:42:40 EDT; 29min ago
+   Main PID: 394667 (gha-runner-ctl)
+      Tasks: 1 (limit: 28367)
+     Memory: 777.3M (peak: 2.1G)
+        CPU: 33.626s
+     CGroup: /user.slice/user-997.slice/user@997.service/app.slice/app-gha\x2drunner\x2dctl.slice/gha-runner-ctl@cpu.service
+             └─394667 /home/gha-agent/.local/bin/gha-runner-ctl listen --interval 45 --idle-secs 300
+=== unit ===
+[Unit]
+Description=gha-runner-ctl listen instance %i (fleet agent)
+After=network-online.target gha-runner-warm-boot.service
+Wants=network-online.target
+Requires=gha-runner-warm-boot.service
+
+[Service]
+Type=simple
+Environment=XDG_RUNTIME_DIR=/run/user/997
+EnvironmentFile=-/home/gha-agent/.local/share/gha-runner-ctl/instances/%i.env
+EnvironmentFile=-/home/gha-agent/.local/share/gha-runner-ctl/instances/warm-auth.env
+ExecStart=/home/gha-agent/.local/bin/gha-runner-ctl listen --interval 150 --idle-secs 500
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target
+=== drop-ins ===
+FILE /home/gha-agent/.config/systemd/user/gha-runner-ctl@cpu.service.d/interval.conf
+[Service]
+# Faster demand ticks while mycelium fleet backlog drains (ephemeral needs re-up per job)
+ExecStart=
+ExecStart=/home/gha-agent/.local/bin/gha-runner-ctl listen --interval 45 --idle-secs 300
+=== units ===
+  UNIT                         LOAD   ACTIVE   SUB     DESCRIPTION
+  gha-runner-ctl@cpu.service   loaded active   running gha-runner-ctl listen instance cpu (fleet agent)
+  gha-runner-ctl@gpu-a.service loaded inactive dead    gha-runner-ctl listen instance gpu-a (fleet agent)
+  gha-runner-ctl@gpu-b.service loaded inactive dead    gha-runner-ctl listen instance gpu-b (fleet agent)
+  gha-runner-warm-boot.service loaded active   exited  gha-runner-ctl warm boot (retain runners for allowlist)
+
+Legend: LOAD   → Reflects whether the unit definition was properly loaded.
+        ACTIVE → The high-level unit activation state, i.e. generalization of SUB.
+        SUB    → The low-level unit activation state, values depend on unit type.
+
+4 loaded units listed.
+To show all installed unit files use 'systemctl list-unit-files'.

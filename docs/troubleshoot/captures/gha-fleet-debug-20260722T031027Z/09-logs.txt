@@ -1,0 +1,326 @@
+=== gha-agent logs dir ===
+total 24
+drwx------ 2 gha-agent gha-agent 4096 Jul 16 11:41 .
+drwxr-xr-x 6 gha-agent gha-agent 4096 Jul 21 21:44 ..
+-rw-rw-r-- 1 gha-agent gha-agent 1114 Jul 16 00:10 boot-20260716T040955Z.log
+-rw-rw-r-- 1 gha-agent gha-agent 5316 Jul 16 11:43 boot-20260716T154159Z.log
+-rw-r--r-- 1 root      root       928 Jul 15 21:18 warm-20260715.log
+=== root logs dir ===
+total 6800
+drwxr-xr-x 2 root root    4096 Jul 15 20:32 .
+drwxr-xr-x 8 root root    4096 Jul 21 18:29 ..
+-rw-r--r-- 1 root root    1453 Jul 15 19:54 cpu-repo.log
+-rw-r--r-- 1 root root 6766819 Jul 21 06:23 cpu.log
+-rw-r--r-- 1 root root    1578 Jul 15 20:08 drain-loop.log
+-rw-r--r-- 1 root root   70732 Jul 15 19:52 gpu-a.log
+-rw-r--r-- 1 root root   70711 Jul 15 19:53 gpu-b.log
+-rw-r--r-- 1 root root    2271 Jul 15 18:21 gpu.log
+-rw-r--r-- 1 root root     303 Jul 15 18:07 prepare-cpu.log
+-rw-r--r-- 1 root root     303 Jul 15 18:07 prepare-gpu.log
+-rw-r--r-- 1 root root     893 Jul 15 20:33 warm.log
+=== last 200 lines cpu.log if any ===
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+gha-runner-ctl ERROR: refusing to run as root.
+Fleet agent identity: unprivileged user (e.g. gha-agent), rootless Podman, no sudo.
+Bootstrap once:  sudo bash scripts/setup-rootless.sh
+Then:            sudo -u gha-agent -H env XDG_RUNTIME_DIR=/run/user/$(id -u gha-agent) …
+Ephemeral dev only:  GHA_ALLOW_ROOT=1 gha-runner-ctl …
+=== journal user unit (if readable) ===
+Hint: You are currently not seeing messages from the system.
+      Users in groups 'adm', 'systemd-journal' can see all messages.
+      Pass -q to turn off this notice.
+No journal files were opened due to insufficient permissions.
+Jul 21 23:09:43 DESKTOP-S4UNB9A gha-runner-cpu-w0[424565]: 
+Jul 21 23:09:43 DESKTOP-S4UNB9A gha-runner-cpu-w0[424565]: 
+Jul 21 23:09:43 DESKTOP-S4UNB9A gha-runner-cpu-w0[424565]: √ Settings Saved.
+Jul 21 23:09:43 DESKTOP-S4UNB9A gha-runner-cpu-w0[424565]: 
+Jul 21 23:09:45 DESKTOP-S4UNB9A gha-runner-cpu-w0[424565]: 
+Jul 21 23:09:45 DESKTOP-S4UNB9A gha-runner-cpu-w0[424565]: √ Connected to GitHub
+Jul 21 23:09:45 DESKTOP-S4UNB9A gha-runner-cpu-w0[424565]: 
+Jul 21 23:09:45 DESKTOP-S4UNB9A gha-runner-cpu-w0[424565]: Current runner version: '2.335.1'
+Jul 21 23:09:45 DESKTOP-S4UNB9A gha-runner-cpu-w0[424565]: 2026-07-22 03:09:45Z: Listening for Jobs
+Jul 21 23:09:46 DESKTOP-S4UNB9A gha-runner-ctl[394667]: register: minted registration-token for https://github.com/tzervas/webpuppet-rs
+Jul 21 23:09:46 DESKTOP-S4UNB9A gha-runner-ctl[394667]: up: scope=User mode=Ephemeral image_mode=Build pull=never ephemeral=true user=1001:1001 url=https://github.com/tzervas/webpuppet-rs
+Jul 21 23:09:46 DESKTOP-S4UNB9A gha-runner-ctl[394667]: up: container gha-runner-cpu-w1 gpu=false slice=None
+Jul 21 23:09:46 DESKTOP-S4UNB9A gha-runner-ctl[394667]: pool: spawned=2 usage=4.50/16c 9216/16384MiB claims=2
+Jul 21 23:09:46 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: runner: registering runner name=wsl-cpu-w1 ephemeral=true
+Jul 21 23:09:46 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: 
+Jul 21 23:09:46 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: --------------------------------------------------------------------------------
+Jul 21 23:09:46 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: |        ____ _ _   _   _       _          _        _   _                      |
+Jul 21 23:09:46 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: |       / ___(_) |_| | | |_   _| |__      / \   ___| |_(_) ___  _ __  ___      |
+Jul 21 23:09:46 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: |      | |  _| | __| |_| | | | | '_ \    / _ \ / __| __| |/ _ \| '_ \/ __|     |
+Jul 21 23:09:46 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: |      | |_| | | |_|  _  | |_| | |_) |  / ___ \ (__| |_| | (_) | | | \__ \     |
+Jul 21 23:09:46 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: |       \____|_|\__|_| |_|\__,_|_.__/  /_/   \_\___|\__|_|\___/|_| |_|___/     |
+Jul 21 23:09:46 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: |                                                                              |
+Jul 21 23:09:46 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: |                       Self-hosted runner registration                        |
+Jul 21 23:09:46 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: |                                                                              |
+Jul 21 23:09:46 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: --------------------------------------------------------------------------------
+Jul 21 23:09:46 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: 
+Jul 21 23:09:46 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: # Authentication
+Jul 21 23:09:46 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: 
+Jul 21 23:09:47 DESKTOP-S4UNB9A gha-runner-cpu-w0[424565]: 2026-07-22 03:09:47Z: Running job: trivy filesystem (vuln+secret+license)
+Jul 21 23:09:48 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: 
+Jul 21 23:09:48 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: √ Connected to GitHub
+Jul 21 23:09:48 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: 
+Jul 21 23:09:48 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: # Runner Registration
+Jul 21 23:09:48 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: 
+Jul 21 23:09:48 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: 
+Jul 21 23:09:48 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: 
+Jul 21 23:09:48 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: 
+Jul 21 23:09:49 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: √ Runner successfully added
+Jul 21 23:09:49 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: 
+Jul 21 23:09:49 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: # Runner settings
+Jul 21 23:09:49 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: 
+Jul 21 23:09:49 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: 
+Jul 21 23:09:49 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: √ Settings Saved.
+Jul 21 23:09:49 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: 
+Jul 21 23:09:50 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: 
+Jul 21 23:09:50 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: √ Connected to GitHub
+Jul 21 23:09:50 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: 
+Jul 21 23:09:50 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: Current runner version: '2.335.1'
+Jul 21 23:09:50 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: 2026-07-22 03:09:50Z: Listening for Jobs
+Jul 21 23:09:52 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: 2026-07-22 03:09:52Z: Running job: gitleaks
+Jul 21 23:09:52 DESKTOP-S4UNB9A gha-runner-cpu-w0[424565]: 2026-07-22 03:09:52Z: Job trivy filesystem (vuln+secret+license) completed with result: Succeeded
+Jul 21 23:09:52 DESKTOP-S4UNB9A gha-runner-cpu-w0[424565]: √ Removed .credentials
+Jul 21 23:09:52 DESKTOP-S4UNB9A gha-runner-cpu-w0[424565]: √ Removed .runner
+Jul 21 23:09:52 DESKTOP-S4UNB9A gha-runner-cpu-w0[424565]: Runner listener exit with 0 return code, stop the service, no retry needed.
+Jul 21 23:09:52 DESKTOP-S4UNB9A gha-runner-cpu-w0[424565]: Exiting runner...
+Jul 21 23:09:55 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: 2026-07-22 03:09:55Z: Job gitleaks completed with result: Succeeded
+Jul 21 23:09:55 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: √ Removed .credentials
+Jul 21 23:09:55 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: √ Removed .runner
+Jul 21 23:09:55 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: Runner listener exit with 0 return code, stop the service, no retry needed.
+Jul 21 23:09:55 DESKTOP-S4UNB9A gha-runner-cpu-w1[424716]: Exiting runner...
+Jul 21 23:11:46 DESKTOP-S4UNB9A gha-runner-ctl[394667]: pool: reap gha-runner-cpu-w0 running=false stale=false tier=small repo=Some("tzervas/webpuppet-rs")
+Jul 21 23:11:46 DESKTOP-S4UNB9A gha-runner-ctl[394667]: down: stopping gha-runner-cpu-w0
+Jul 21 23:11:47 DESKTOP-S4UNB9A gha-runner-ctl[394667]: pool: reap gha-runner-cpu-w1 running=false stale=false tier=large repo=Some("tzervas/webpuppet-rs")
+Jul 21 23:11:47 DESKTOP-S4UNB9A gha-runner-ctl[394667]: down: stopping gha-runner-cpu-w1
+Jul 21 23:11:52 DESKTOP-S4UNB9A gha-runner-ctl[394667]: pool: up gha-runner-cpu-w0 tier=medium cpus=2 mem=4g labels=linux,medium,podman,self-hosted,x64 repo=tzervas/mycelium-cli-common job=cargo check/test
+Jul 21 23:11:52 DESKTOP-S4UNB9A gha-runner-ctl[394667]: register: minted registration-token for https://github.com/tzervas/mycelium-cli-common
+Jul 21 23:11:52 DESKTOP-S4UNB9A gha-runner-ctl[394667]: up: scope=User mode=Ephemeral image_mode=Build pull=never ephemeral=true user=1001:1001 url=https://github.com/tzervas/mycelium-cli-common
+Jul 21 23:11:52 DESKTOP-S4UNB9A gha-runner-ctl[394667]: up: container gha-runner-cpu-w0 gpu=false slice=None
+Jul 21 23:11:53 DESKTOP-S4UNB9A gha-runner-cpu-w0[428705]: runner: registering runner name=wsl-cpu-w0 ephemeral=true
+Jul 21 23:11:53 DESKTOP-S4UNB9A gha-runner-ctl[394667]: pool: up gha-runner-cpu-w1 tier=small cpus=0.50 mem=1g labels=linux,podman,self-hosted,small,x64 repo=tzervas/mycelium-cli-common-myc job=no stack detected
+Jul 21 23:11:53 DESKTOP-S4UNB9A gha-runner-ctl[394667]: register: pacing 4s before next registration-token POST
+Jul 21 23:11:53 DESKTOP-S4UNB9A gha-runner-cpu-w0[428705]: 
+Jul 21 23:11:53 DESKTOP-S4UNB9A gha-runner-cpu-w0[428705]: --------------------------------------------------------------------------------
+Jul 21 23:11:53 DESKTOP-S4UNB9A gha-runner-cpu-w0[428705]: |        ____ _ _   _   _       _          _        _   _                      |
+Jul 21 23:11:53 DESKTOP-S4UNB9A gha-runner-cpu-w0[428705]: |       / ___(_) |_| | | |_   _| |__      / \   ___| |_(_) ___  _ __  ___      |
+Jul 21 23:11:53 DESKTOP-S4UNB9A gha-runner-cpu-w0[428705]: |      | |  _| | __| |_| | | | | '_ \    / _ \ / __| __| |/ _ \| '_ \/ __|     |
+Jul 21 23:11:53 DESKTOP-S4UNB9A gha-runner-cpu-w0[428705]: |      | |_| | | |_|  _  | |_| | |_) |  / ___ \ (__| |_| | (_) | | | \__ \     |
+Jul 21 23:11:53 DESKTOP-S4UNB9A gha-runner-cpu-w0[428705]: |       \____|_|\__|_| |_|\__,_|_.__/  /_/   \_\___|\__|_|\___/|_| |_|___/     |
+Jul 21 23:11:53 DESKTOP-S4UNB9A gha-runner-cpu-w0[428705]: |                                                                              |
+Jul 21 23:11:53 DESKTOP-S4UNB9A gha-runner-cpu-w0[428705]: |                       Self-hosted runner registration                        |
+Jul 21 23:11:53 DESKTOP-S4UNB9A gha-runner-cpu-w0[428705]: |                                                                              |
+Jul 21 23:11:53 DESKTOP-S4UNB9A gha-runner-cpu-w0[428705]: --------------------------------------------------------------------------------
+Jul 21 23:11:53 DESKTOP-S4UNB9A gha-runner-cpu-w0[428705]: 
+Jul 21 23:11:53 DESKTOP-S4UNB9A gha-runner-cpu-w0[428705]: # Authentication
+Jul 21 23:11:53 DESKTOP-S4UNB9A gha-runner-cpu-w0[428705]: 
+Jul 21 23:11:55 DESKTOP-S4UNB9A gha-runner-cpu-w0[428705]: 
+Jul 21 23:11:55 DESKTOP-S4UNB9A gha-runner-cpu-w0[428705]: √ Connected to GitHub
+Jul 21 23:11:55 DESKTOP-S4UNB9A gha-runner-cpu-w0[428705]: 
+Jul 21 23:11:55 DESKTOP-S4UNB9A gha-runner-cpu-w0[428705]: # Runner Registration
+Jul 21 23:11:55 DESKTOP-S4UNB9A gha-runner-cpu-w0[428705]: 
+Jul 21 23:11:55 DESKTOP-S4UNB9A gha-runner-cpu-w0[428705]: 
+Jul 21 23:11:55 DESKTOP-S4UNB9A gha-runner-cpu-w0[428705]: 
+Jul 21 23:11:55 DESKTOP-S4UNB9A gha-runner-cpu-w0[428705]: 
+Jul 21 23:11:55 DESKTOP-S4UNB9A gha-runner-cpu-w0[428705]: √ Runner successfully added
+Jul 21 23:11:55 DESKTOP-S4UNB9A gha-runner-cpu-w0[428705]: 
+Jul 21 23:11:55 DESKTOP-S4UNB9A gha-runner-cpu-w0[428705]: # Runner settings
+Jul 21 23:11:55 DESKTOP-S4UNB9A gha-runner-cpu-w0[428705]: 
+Jul 21 23:11:55 DESKTOP-S4UNB9A gha-runner-cpu-w0[428705]: 
+Jul 21 23:11:55 DESKTOP-S4UNB9A gha-runner-cpu-w0[428705]: √ Settings Saved.
+Jul 21 23:11:55 DESKTOP-S4UNB9A gha-runner-cpu-w0[428705]: 

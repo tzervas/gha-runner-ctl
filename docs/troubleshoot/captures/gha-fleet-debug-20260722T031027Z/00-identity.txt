@@ -1,0 +1,10 @@
+Wed Jul 22 03:12:15 UTC 2026
+DESKTOP-S4UNB9A
+Linux DESKTOP-S4UNB9A 6.18.33.1-microsoft-standard-WSL2 #1 SMP PREEMPT_DYNAMIC Fri Jun  5 01:12:21 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+-rwxr-xr-x 1 gha-agent gha-agent 2932680 Jul 21 16:12 /home/gha-agent/.local/bin/gha-runner-ctl
+81db5e2b13e175254ba20ecdb4ecbe6f  /home/gha-agent/.local/bin/gha-runner-ctl
+Fleet agent for self-hosted GHA on Podman: long-lived control plane, ephemeral work containers
+
+Usage: gha-runner-ctl [OPTIONS] [COMMAND]
+
+Commands:

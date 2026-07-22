@@ -1,0 +1,59 @@
+pool state:
+{
+  "claims": [
+    {
+      "worker_id": "wsl-cpu-w0",
+      "container": "gha-runner-cpu-w0",
+      "cpus": 2.0,
+      "memory_mib": 4096,
+      "tier": "medium",
+      "repo": "tzervas/mycelium-cli-common",
+      "claimed_at_unix": 1784689912
+    },
+    {
+      "worker_id": "wsl-cpu-w1",
+      "container": "gha-runner-cpu-w1",
+      "cpus": 0.5,
+      "memory_mib": 1024,
+      "tier": "small",
+      "repo": "tzervas/mycelium-cli-common-myc",
+      "claimed_at_unix": 1784689913
+    }
+  ]
+}
+RR files:
+/run/user/997/gha-runner-ctl-rr-gha-runner-cpu-gha-agent.txt = 16
+/run/user/997/gha-runner-ctl-rr-gha-runner-cpu.txt = 0
+
+/run/user/997/gha-runner-ctl-rr-gha-runner-gpu-a-gha-agent.txt = 9
+/run/user/997/gha-runner-ctl-rr-gha-runner-gpu-a.txt = 7
+/run/user/997/gha-runner-ctl-rr-gha-runner-gpu-b-gha-agent.txt = 9
+/run/user/997/gha-runner-ctl-rr-gha-runner-gpu-b.txt = 7
+total 28
+drwxr-xr-x 6 gha-agent gha-agent 4096 Jul 21 21:44 .
+drwx------ 4 gha-agent gha-agent 4096 Jul 15 20:44 ..
+-rw-r--r-- 1 gha-agent gha-agent 1071 Jul 16 22:53 FLEET_POLICY.txt
+drwxr-xr-x 2 root      root      4096 Jul 21 21:44 allowlists
+drwx------ 2 gha-agent gha-agent 4096 Jul 21 21:44 instances
+drwx------ 2 gha-agent gha-agent 4096 Jul 16 11:41 logs
+drwxrwxr-x 2 gha-agent gha-agent 4096 Jul 21 23:11 pool
+/home/gha-agent/.local/share/gha-runner-ctl/FLEET_POLICY.txt
+/home/gha-agent/.local/share/gha-runner-ctl/logs/boot-20260716T040955Z.log
+/home/gha-agent/.local/share/gha-runner-ctl/logs/warm-20260715.log
+/home/gha-agent/.local/share/gha-runner-ctl/logs/boot-20260716T154159Z.log
+/home/gha-agent/.local/share/gha-runner-ctl/allowlists/all-active-mycelium-first.list
+/home/gha-agent/.local/share/gha-runner-ctl/allowlists/all-active-mycelium-first.csv
+/home/gha-agent/.local/share/gha-runner-ctl/instances/gpu-b.env
+/home/gha-agent/.local/share/gha-runner-ctl/instances/gpu-a.env.bak.pool16-1784662958
+/home/gha-agent/.local/share/gha-runner-ctl/instances/cpu.env.bak.pool16-1784662958
+/home/gha-agent/.local/share/gha-runner-ctl/instances/warm-auth.env
+/home/gha-agent/.local/share/gha-runner-ctl/instances/gpu-b.env.bak.pool16-1784662958
+/home/gha-agent/.local/share/gha-runner-ctl/instances/cpu.env.bak.1784597445
+/home/gha-agent/.local/share/gha-runner-ctl/instances/gpu-a.env.bak.1784597445
+/home/gha-agent/.local/share/gha-runner-ctl/instances/gpu-a.env
+/home/gha-agent/.local/share/gha-runner-ctl/instances/gpu-b.env.bak.1784597445
+/home/gha-agent/.local/share/gha-runner-ctl/instances/cpu.env.bak.land-pr21-1784663648
+/home/gha-agent/.local/share/gha-runner-ctl/instances/cpu.env
+/home/gha-agent/.local/share/gha-runner-ctl/instances/cpu.env.bak.rerun-1784630306
+/home/gha-agent/.local/share/gha-runner-ctl/instances/cpu.env.bak.pre-myc-prio.1784684689
+/home/gha-agent/.local/share/gha-runner-ctl/pool/state.json
