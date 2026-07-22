@@ -70,10 +70,10 @@ jobs:
           fi
 
   trivy-fs:
-    name: trivy filesystem (vuln+secret+license)
+    # Name must include advisory/experimental when continue-on-error (HONEST_CI).
+    name: trivy filesystem (advisory/experimental)
     runs-on: [self-hosted, linux, x64, podman]
-    # Advisory for missing scanner; real findings still fail the step when trivy present.
-    # Job stays green only if: trivy missing OR scan clean. Documented in FLEET_STANDARDS.
+    # Non-gating until trivy is required on fleet images. Findings fail when present.
     continue-on-error: true
     timeout-minutes: 30
     steps:
@@ -84,7 +84,8 @@ jobs:
         run: |
           set -euo pipefail
           if ! command -v trivy >/dev/null 2>&1; then
-            echo "trivy missing on runner — advisory skip (continue-on-error; install trivy on image for hard gate)"
+            echo "::notice title=SKIP_STUB::trivy missing on runner — advisory job only"
+            echo "HONEST_CI class=SKIP_STUB detail=trivy_missing"
             exit 0
           fi
           trivy fs --scanners vuln,secret,license \
