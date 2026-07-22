@@ -16,9 +16,10 @@ gaps close. A working proof-of-concept of the portable fragment lives in
   **fully synchronous** (no `async`/tokio), no `unsafe`, light on generics/traits.
   Its concurrency is a blocking poll loop + `sleep` — so Mycelium's lack of `async`
   is **not** on the critical path.
-- The **pure-logic core** (resource-tier accounting, budget fitting, backoff pacing,
-  enum/`match` validation, constant-time compare) ports cleanly and is **already
-  demonstrated** natively — see `mycelium-port/`.
+- The **pure-logic core** ports cleanly; the **resource-tier accounting, budget fitting,
+  and backoff pacing** slice is **already demonstrated** natively (see `mycelium-port/`),
+  and the rest (enum/`match` mode/scope/policy validation, constant-time compare) is the
+  same pure-fragment shape, not yet ported.
 - ~80–90% of the tool's *value*, however, lives in **host effects the language cannot
   express or bridge today**: subprocess spawning (`podman`/`git`/`gh`), HTTPS+TLS to
   the GitHub API, JSON, and CLI parsing.
@@ -36,8 +37,11 @@ this repo at the `v0.464.0` train):
 |---|---|
 | Top-level items (non-test) | 192 |
 | Items emitted (some `.myc` draft) — `expressible_fraction` | **32 / 192 = 16.7%** |
-| Items that actually type-check (`myc check`) — `checked_fraction` | **0 / 192 = 0.0%** (file-gated) |
-| Files with any fully-clean emission | 0 / 2 |
+| Type-check rate — `checked_fraction` via `--vet` (unreliable here†) | **not measured** |
+| Type-check rate — measured directly with `myc check` (file-gated) | **4 / 192 ≈ 2.1%** |
+| Files with a fully-clean emission | 1 / 2 — `pool.myc` clean; `lib.myc` fails |
+
+> † `--vet` runs its `myc check` oracle as a cargo package (`mycelium-check`) in the Mycelium workspace, which this standalone setup lacks, so it recorded 0/192 (`exit 101`) — an **un-run** oracle, not a real result. The 2.1% comes from checking each emitted nodule directly; see `mycelium-transpile/docs/vet-gha-runner-ctl-2026-07-22/`.
 
 Gap categories (union over `src/`), most-common first:
 
@@ -53,10 +57,12 @@ Gap categories (union over `src/`), most-common first:
 | `MacroInvocation` | 6 | `println!`/`format!`/`vec!` … |
 | `Impl` / `NamedFieldDrop` | 10 | inherent/trait impls; named→positional field loss |
 
-Read honestly: **0.0% `checked_fraction` does not mean "0% portable."** It means the
-*automatic* transpiler emits nothing that type-checks unmodified — because idiomatic
-Rust here is imperative, method-call-heavy, string-heavy, and unit-returning, none of
-which the pure Mycelium fragment expresses. Hand-porting the *pure* logic works fine
+Read honestly: the reliable number is **16.7% expressible**. The `--vet` `checked_fraction`
+did **not** run here (oracle absent — see †), so it is *not measured*, not 0%. Measured
+directly, the emitted `pool.myc` **type-checks clean** while `lib.myc` fails (≈2.1%
+file-gated) — the transpiler emits **partial but sometimes-valid** drafts, capped by
+idiomatic Rust the pure Mycelium fragment can't express (method calls, imperative /
+unit-returning bodies, imports, strings/structs). Hand-porting the *pure* logic works fine
 (the `mycelium-port/` PoC is proof); the transpiler is a **measurement instrument**,
 not a porter.
 
@@ -64,7 +70,7 @@ not a porter.
 
 | Capability (this tool) | Class | Detail |
 |---|---|---|
-| Enum/`match` mode/scope/policy resolution, allowlist checks, pacing/backoff math, resource-tier accounting, constant-time compare | **(a) native today** | Pure, total, finite/unsigned — demonstrated in `mycelium-port/` |
+| Enum/`match` mode/scope/policy resolution, allowlist checks, pacing/backoff math, resource-tier accounting, constant-time compare | **(a) native today** | Pure, total, finite/unsigned — the pacing/backoff + resource-tier slice is demonstrated in `mycelium-port/` |
 | Config/lock file read/write, `/proc` & `/dev/null` reads | (a/b) | Thin real-OS `std-sys` fs floor exists; richer `std-fs` is in-memory only (M-541) |
 | Env-var **reads**, `sleep`, monotonic/wall clocks | (a/b) | Present in `std-sys`; env **mutation** / cwd absent |
 | **JSON** (serde_json) | **(b) new stdlib** | pure computation, writable in-language; today only `Value`↔JSON exists |
