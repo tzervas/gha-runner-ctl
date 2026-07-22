@@ -1,0 +1,96 @@
+// nodule: gha_pool — native Mycelium port of gha-runner-ctl's pure resource-tier / pacing core.
+// STAGING (claude/mycelium-readiness-gaps): dogfood of the port-able fragment. Generated with
+// full-width Binary{32} literals (bare decimals have no representation family, Q6/RFC-0012).
+// Semantics mirror src/pool.rs (resources_for_tier, fit_to_budget) and src/lib.rs (ApiPacer
+// backoff doubling with ceiling). Milli-CPU + MiB integer model; never-silent add_u (no wrap).
+nodule gha_pool;
+
+type Tier = Micro | Small | Medium | Large | Xlarge | Gpu;
+
+// A budget-fit outcome: shrunk (cpu_milli, mem_mib) claim, or no fit. Mirrors Option<(f64,u64)>.
+type Fit = Fit(Binary{32}, Binary{32}) | NoFit;
+
+// ---- Bool + Binary{32} helpers (kernel prims eq/lt are ambient; overflow is never-silent) ----
+fn and_bool(a: Bool, b: Bool) => Bool =
+  match a { True => b, False => False };
+
+fn beq32(a: Binary{32}, b: Binary{32}) => Bool =
+  match eq(a, b) { 0b1 => True, _ => False };
+
+fn ble32(a: Binary{32}, b: Binary{32}) => Bool =
+  match lt(a, b) { 0b1 => True, _ => match eq(a, b) { 0b1 => True, _ => False } };
+
+fn bmin32(a: Binary{32}, b: Binary{32}) => Binary{32} =
+  match lt(a, b) { 0b1 => a, _ => b };
+
+fn bmax32(a: Binary{32}, b: Binary{32}) => Binary{32} =
+  match lt(a, b) { 0b1 => b, _ => a };
+
+// ---- Tier -> resources (src/pool.rs resources_for_tier), CPU in milli-cores, RAM in MiB ----
+fn tier_cpus_milli(t: Tier) => Binary{32} =
+  match t {
+    Micro => 0b0000_0000_0000_0000_0000_0000_1111_1010,
+    Small => 0b0000_0000_0000_0000_0000_0001_1111_0100,
+    Medium => 0b0000_0000_0000_0000_0000_0111_1101_0000,
+    Large => 0b0000_0000_0000_0000_0000_1111_1010_0000,
+    Xlarge => 0b0000_0000_0000_0000_0001_1111_0100_0000,
+    Gpu => 0b0000_0000_0000_0000_0000_1111_1010_0000
+  };
+
+fn tier_mem_mib(t: Tier) => Binary{32} =
+  match t {
+    Micro => 0b0000_0000_0000_0000_0000_0010_0000_0000,
+    Small => 0b0000_0000_0000_0000_0000_0100_0000_0000,
+    Medium => 0b0000_0000_0000_0000_0001_0000_0000_0000,
+    Large => 0b0000_0000_0000_0000_0010_0000_0000_0000,
+    Xlarge => 0b0000_0000_0000_0000_0100_0000_0000_0000,
+    Gpu => 0b0000_0000_0000_0000_0010_0000_0000_0000
+  };
+
+// tier_fits: does a whole tier fit within a free (cpu_milli, mem_mib) budget?
+fn tier_fits(t: Tier, free_c: Binary{32}, free_m: Binary{32}) => Bool =
+  and_bool(ble32(tier_cpus_milli(t), free_c), ble32(tier_mem_mib(t), free_m));
+
+// fit_to_budget: shrink a want to fit free, never below min; NoFit if free < min (either axis).
+// Mirrors pool.rs fit_to_budget: c = clamp(want, min, free) once free>=min is established.
+fn fit_to_budget(
+  want_c: Binary{32}, want_m: Binary{32},
+  free_c: Binary{32}, free_m: Binary{32},
+  min_c: Binary{32},  min_m: Binary{32}
+) => Fit =
+  match and_bool(ble32(min_c, free_c), ble32(min_m, free_m)) {
+    False => NoFit,
+    True  => Fit(bmax32(min_c, bmin32(want_c, free_c)),
+                 bmax32(min_m, bmin32(want_m, free_m)))
+  };
+
+// ---- ApiPacer backoff (src/lib.rs): init clamps to [5, 900]s; next doubles with a 900s ceiling ----
+fn backoff_init(secs: Binary{32}) => Binary{32} =
+  bmax32(0b0000_0000_0000_0000_0000_0000_0000_0101, bmin32(secs, 0b0000_0000_0000_0000_0000_0011_1000_0100));
+
+// double via add_u(cur,cur) — never-silent (no modular wrap); ceiling via bmin32.
+fn backoff_next(cur: Binary{32}, max: Binary{32}) => Binary{32} =
+  bmin32(add_u(cur, cur), max);
+
+fn fit_eq(a: Fit, b: Fit) => Bool =
+  match a {
+    Fit(c1, m1) => match b { Fit(c2, m2) => and_bool(beq32(c1, c2), beq32(m1, m2)), NoFit => False },
+    NoFit => match b { Fit(_, _) => False, NoFit => True }
+  };
+
+// ---- Differential battery: each check equals the Rust oracle value (computed at gen time) ----
+fn check_all() => Bool =
+  and_bool(beq32(tier_mem_mib(Large), 0b0000_0000_0000_0000_0010_0000_0000_0000),
+  and_bool(beq32(tier_cpus_milli(Xlarge), 0b0000_0000_0000_0000_0001_1111_0100_0000),
+  and_bool(fit_eq(fit_to_budget(0b0000_0000_0000_0000_0000_0111_1101_0000, 0b0000_0000_0000_0000_0001_0000_0000_0000, 0b0000_0000_0000_0000_0000_0011_1110_1000, 0b0000_0000_0000_0000_0000_0100_0000_0000, 0b0000_0000_0000_0000_0000_0000_1111_1010, 0b0000_0000_0000_0000_0000_0001_0000_0000),
+            Fit(0b0000_0000_0000_0000_0000_0011_1110_1000, 0b0000_0000_0000_0000_0000_0100_0000_0000)),
+  and_bool(fit_eq(fit_to_budget(0b0000_0000_0000_0000_0000_0011_1110_1000, 0b0000_0000_0000_0000_0000_0100_0000_0000, 0b0000_0000_0000_0000_0000_0000_0110_0100, 0b0000_0000_0000_0000_0000_0000_0110_0100, 0b0000_0000_0000_0000_0000_0000_1111_1010, 0b0000_0000_0000_0000_0000_0001_0000_0000), NoFit),
+  and_bool(beq32(backoff_init(0b0000_0000_0000_0000_0000_0000_0000_0011), 0b0000_0000_0000_0000_0000_0000_0000_0101),
+  and_bool(beq32(backoff_init(0b0000_0000_0000_0000_0000_0011_1110_1000), 0b0000_0000_0000_0000_0000_0011_1000_0100),
+  and_bool(beq32(backoff_next(0b0000_0000_0000_0000_0000_0000_0011_1100, 0b0000_0000_0000_0000_0000_0011_1000_0100), 0b0000_0000_0000_0000_0000_0000_0111_1000),
+           beq32(backoff_next(0b0000_0000_0000_0000_0000_0010_0101_1000, 0b0000_0000_0000_0000_0000_0011_1000_0100), 0b0000_0000_0000_0000_0000_0011_1000_0100))))))));
+
+// main returns True iff every ported function agrees with the Rust semantics. `myc run` prints it.
+// main: 0b1 iff every ported function agrees with the Rust oracle (numeric fragment for `myc run`).
+fn main() => Binary{1} =
+  match check_all() { True => 0b1, False => 0b0 };

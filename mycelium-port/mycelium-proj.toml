@@ -1,0 +1,11 @@
+# Staging phylum: native-Mycelium port of gha-runner-ctl's pure resource/pacing core.
+# Part of claude/mycelium-readiness-gaps — dogfoods the port-able fragment (see PORTING_TO_MYCELIUM.md).
+[project]
+name    = "gha_pool"
+kind    = "phylum"
+version = "0.1.0"
+license = "MIT"
+summary = "Native Mycelium port of gha-runner-ctl's pure resource-tier / pacing core (dogfood)."
+
+[surface]
+exports = ["gha_pool"]
