@@ -1,3 +1,22 @@
+## 0.2.12
+
+### Fixed — robust queue drain (fleet stall 2026-07-22)
+
+Listen no longer starves hot repos under a large prefer-list + ephemeral multi-job load.
+
+- **Priority repos every tick:** `GHA_PRIORITY_REPOS` / `--priority-repos` polled before round-robin so `mycelium-lang`, cabal, etc. never wait a full RR cycle.
+- **Prefer-repos file:** `GHA_PREFER_REPOS_FILE` / `--prefer-repos-file` (one `owner/repo` per line and/or CSV). Merged with `GHA_PREFER_REPOS`; avoids huge env strings and reload pain.
+- **Higher pool scan default:** `GHA_POOL_SCAN_PER_TICK` (default **12**, was hard-capped at 6) after the priority set.
+- **Listen floor 45s:** `GHA_LISTEN_MIN_INTERVAL` (default **45**, was hard-coded **120**) under `scope=user`.
+- **Stale container reap on listen start:** `GHA_REAP_STALE_SECS` (default **3600**) stops+rms unclaimed fleet workers older than the threshold (warm-boot / retain leftovers). `0` disables.
+- **Tick metrics log:** `GHA_TICK_LOG=auto` → `$XDG_DATA_HOME/gha-runner-ctl/logs/listen-ticks.jsonl` each tick (`jobs`, `spawned`, pool usage). `off` / empty disables.
+- Demand allowlist paths (`scope=user|repo`) honor prefer-file, not only `GHA_PREFER_REPOS`.
+
+### Docs
+
+- Pre-drain capture preserved under `docs/troubleshoot/` (PR #24); product work closed by this release.
+- `docs/troubleshoot/FLEET_QUEUE_STALL_2026-07-22.md` updated with host apply knobs.
+
 ## 0.2.11
 
 ### Added

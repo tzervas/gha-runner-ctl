@@ -3,7 +3,7 @@
 **Contract ID:** `ctl/cli-env`  
 **Producer:** W1b (code/contracts)  
 **Status:** STABLE  
-**Version:** 0.2.6  
+**Version:** 0.2.12  
 **Consumers:** W1c (docs narrative), W2 (host/env), W3 (PR test plan)  
 **Depends-on:** `framework/bulletin@STABLE`
 
@@ -12,9 +12,9 @@
 | Artifact | Value |
 |----------|--------|
 | Crate / binary | `gha-runner-ctl` |
-| `VERSION` file | `0.2.9` |
-| `Cargo.toml` `package.version` | `0.2.9` |
-| GitHub HTTP User-Agent | `gha-runner-ctl/0.2.9` (`src/lib.rs` `UA`) |
+| `VERSION` file | `0.2.12` |
+| `Cargo.toml` `package.version` | `0.2.12` |
+| GitHub HTTP User-Agent | `gha-runner-ctl/0.2.12` (`src/lib.rs` `UA`) |
 
 ## Entry behavior
 
@@ -44,7 +44,7 @@
 |------|-----|---------|---------|-------|
 | `--with-container` | — | **true** | `prepare` | Build/run seed container when true |
 | `--skip-host-update` | `GHA_SKIP_HOST_UPDATE` | false | `prepare` | Skip apt/dnf on host |
-| `--interval` | — | `180` | `listen` | Clamped **5–3600** s; `scope=user` floor **120** s |
+| `--interval` | — | `180` | `listen` | Clamped **5–3600** s; `scope=user` floor via `GHA_LISTEN_MIN_INTERVAL` (default **45** s) |
 | `--idle-secs` | — | `180` | `listen` | Clamped **30–86400** s |
 | `--wake-port` | `GHA_WAKE_PORT` | unset | `listen` | Requires `GHA_WAKE_TOKEN` (≥16 chars); binds `127.0.0.1` |
 | `--rm` | — | **true** | `down` | Remove container after stop |
@@ -101,6 +101,12 @@ All global options accept the same name as env var (clap `env =`); boolean env v
 | `--private-only` | `GHA_PRIVATE_ONLY` | bool | false | Org/user demand visibility |
 | `--all-repos` | `GHA_ALL_REPOS` | bool | false | Public+private for demand |
 | `--prefer-repos` | `GHA_PREFER_REPOS` | CSV `owner/repo` | — | User-batch allowlist; warm repo list |
+| `--prefer-repos-file` | `GHA_PREFER_REPOS_FILE` | path | — | Prefer allowlist file (lines and/or CSV); merged with `--prefer-repos` |
+| `--priority-repos` | `GHA_PRIORITY_REPOS` | CSV `owner/repo` | — | Polled **every tick before** RR (hot queues) |
+| `--listen-min-interval` | `GHA_LISTEN_MIN_INTERVAL` | u64 | `45` | Floor for `scope=user` listen poll interval |
+| `--pool-scan-per-tick` | `GHA_POOL_SCAN_PER_TICK` | u32 | `12` | Max non-priority repos scanned per tick in dynamic pool |
+| `--reap-stale-secs` | `GHA_REAP_STALE_SECS` | u64 | `3600` | On listen start (ephemeral): stop+rm unclaimed workers older than N; `0` disables |
+| `--tick-log` | `GHA_TICK_LOG` | path / `auto` / `off` | `auto` | JSONL tick metrics; `auto` → `$XDG_DATA_HOME/gha-runner-ctl/logs/listen-ticks.jsonl` |
 | `--api-min-gap-ms` | `GHA_API_MIN_GAP_MS` | u64 | `1000` | Clamped **50–60000** in pacer |
 | `--api-max-per-poll` | `GHA_API_MAX_PER_POLL` | u32 | `12` | Clamped **2–500** |
 | `--api-backoff-secs` | `GHA_API_BACKOFF_SECS` | u64 | `90` | Clamped **5–900**; doubles on rate limit |
