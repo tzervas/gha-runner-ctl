@@ -7,8 +7,9 @@ on:
 
 jobs:
   build:
-    # Prefer the shared self-hosted runner when available; otherwise GitHub-hosted.
-    runs-on: [self-hosted, linux, x64, podman]
+    # Prefer the shared self-hosted runner when available.
+    # `large` is a fleet size label (4c/8g) so rustup+cargo are not OOM-killed (exit 137).
+    runs-on: [self-hosted, linux, x64, podman, large]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.96

@@ -1,5 +1,16 @@
 ## 0.2.12
 
+### Added — safe recovery (queue-preserving)
+
+- **`gha-runner-ctl recover`**: release orphan pool claims + prune exited fleet
+  containers so listen can pick up **queued** Actions jobs. **Never** cancels
+  GitHub workflow runs.
+- Listen: reap finished claims before poll **and** mid-spawn (retry once on
+  budget failure).
+- Job sizing: bare `build` jobs → **large** tier; product `ci.yml` uses
+  `runs-on: …, large` to avoid rustup OOM (exit 137).
+- Docs: [docs/RECOVERY.md](docs/RECOVERY.md).
+
 ### Fixed — robust queue drain (fleet stall 2026-07-22)
 
 Listen no longer starves hot repos under a large prefer-list + ephemeral multi-job load.

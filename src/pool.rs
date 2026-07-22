@@ -167,6 +167,11 @@ pub fn size_for_job(job_name: &str, labels: &[String], force_gpu: bool) -> SizeT
     if name.contains("clippy") && !name.contains("build") && !name.contains("test") {
         return SizeTier::Micro;
     }
+    // Single "build" jobs (product ci.yml job name) need RAM for rustup + LTO-ish
+    // builds. Undersizing caused OOM kill 137 on self-hosted. Prefer large.
+    if name == "build" || name.starts_with("build ") || name.ends_with(" build") {
+        return SizeTier::Large;
+    }
     // Rust compilation is the fleet's memory-hungry workload, and Medium (2c/4g) is
     // not enough for it. Observed: `cargo check --workspace --all-targets` on
     // mycelium-l1 was OOM-killed with exit 137 (run 29955035985) on a job named

@@ -366,6 +366,16 @@ pub enum Cmd {
         #[arg(long, default_value_t = true)]
         start: bool,
     },
+    /// Safe local recovery: free orphan pool claims + exited workers so new jobs can be picked up.
+    /// **Never** cancels GitHub workflow runs or deletes the Actions queue.
+    Recover {
+        /// Also force-rm exited fleet containers not in the claim set (default true).
+        #[arg(long, default_value_t = true)]
+        prune_exited: bool,
+        /// Print JSON summary to stdout (default false).
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 /// Dump troubleshooting context after a failure (no secrets).
@@ -598,6 +608,7 @@ pub fn run() -> Result<(), String> {
             listen(&cli, interval, idle_secs, wake_port)
         }
         Cmd::Warm { gap_secs, start } => warm(&cli, gap_secs, start),
+        Cmd::Recover { prune_exited, json } => recover(&cli, prune_exited, json),
     }
 }
 
@@ -3653,11 +3664,13 @@ fn ensure_worker_volume(cli: &Cli, worker_volume: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn reap_pool_workers(cli: &Cli, pool: &ResourcePool) {
+/// Returns number of claims released.
+fn reap_pool_workers(cli: &Cli, pool: &ResourcePool) -> u32 {
     let Ok(claims) = pool.claims() else {
-        return;
+        return 0;
     };
     let now = now_unix();
+    let mut n = 0u32;
     for c in claims {
         // Only reap workers owned by this listen base name prefix
         if !c.container.starts_with(&cli.container) {
@@ -3681,8 +3694,114 @@ fn reap_pool_workers(cli: &Cli, pool: &ResourcePool) {
                 eprintln!("pool: release {} failed: {}", c.worker_id, redact(&e));
                 let _ = pool.release_container(&c.container);
             }
+            n += 1;
         }
     }
+    n
+}
+
+/// Prune exited fleet worker containers that are not in active claims.
+/// Does **not** touch running workers or cancel any GitHub Actions runs.
+fn prune_exited_fleet_workers(cli: &Cli, pool: &ResourcePool) -> u32 {
+    let claimed: std::collections::HashSet<String> = pool
+        .claims()
+        .map(|c| c.into_iter().map(|x| x.container).collect())
+        .unwrap_or_default();
+    let out = match std::process::Command::new("podman")
+        .args(["ps", "-a", "--format", "{{.Names}}\t{{.Status}}"])
+        .output()
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => return 0,
+    };
+    let prefix = cli.container.as_str();
+    let mut n = 0u32;
+    for line in out.lines() {
+        let Some((name, status)) = line.split_once('\t') else {
+            continue;
+        };
+        let name = name.trim();
+        let status = status.trim().to_ascii_lowercase();
+        if name.is_empty() {
+            continue;
+        }
+        let ours = name.starts_with(prefix)
+            || name.starts_with("gha-runner-cpu")
+            || name.starts_with("gha-runner-ctl");
+        if !ours || claimed.contains(name) {
+            continue;
+        }
+        // Only remove clearly stopped/exited/created leftovers — never "up".
+        let removable = status.starts_with("exited")
+            || status.starts_with("created")
+            || status.starts_with("dead")
+            || status.contains("exited");
+        if !removable {
+            continue;
+        }
+        eprintln!("recover: prune exited leftover {name} ({status})");
+        let _ = podman(&["rm", "-f", name]);
+        n += 1;
+    }
+    n
+}
+
+/// Safe recovery: free local capacity so listen can pick up **queued** GitHub jobs.
+/// Explicitly does **not** cancel or delete workflow runs (queue is preserved on GitHub).
+fn recover(cli: &Cli, prune_exited: bool, json: bool) -> Result<(), String> {
+    std::env::set_var("GHA_POOL_CPUS", &cli.pool_cpus);
+    std::env::set_var("GHA_POOL_MEMORY", &cli.pool_memory);
+    std::env::set_var("GHA_POOL_MAX_WORKERS", cli.pool_max_workers.to_string());
+    std::env::set_var("GHA_POOL_MODE", &cli.pool_mode);
+    let pool = ResourcePool::from_env();
+
+    let (c0, m0, n0) = pool.usage().unwrap_or((0.0, 0, 0));
+    eprintln!(
+        "recover: start usage={c0:.2}/{:.0}c {m0}/{}MiB claims={n0} (will NOT cancel GitHub runs)",
+        pool.max_cpus, pool.max_memory_mib
+    );
+
+    let reaped = reap_pool_workers(cli, &pool);
+    let mut pruned = 0u32;
+    if prune_exited {
+        pruned = prune_exited_fleet_workers(cli, &pool);
+    }
+    // Second pass: claims may point at containers we just pruned.
+    let reaped2 = reap_pool_workers(cli, &pool);
+
+    if matches!(cli.mode, Mode::Ephemeral) {
+        reap_stale_containers(cli, &pool);
+    }
+
+    let (c1, m1, n1) = pool.usage().unwrap_or((0.0, 0, 0));
+    let free_c = (pool.max_cpus - c1).max(0.0);
+    let free_m = pool.max_memory_mib.saturating_sub(m1);
+    eprintln!(
+        "recover: done reaped_claims={} pruned_containers={pruned} usage={c1:.2}/{:.0}c {m1}/{}MiB claims={n1} free≈{free_c:.2}c/{free_m}MiB",
+        reaped + reaped2,
+        pool.max_cpus,
+        pool.max_memory_mib
+    );
+    eprintln!(
+        "recover: next — leave listen running (or restart gha-runner-ctl@cpu); queued Actions jobs stay on GitHub and will be claimed when demand poll runs"
+    );
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "reaped_claims": reaped + reaped2,
+                "pruned_containers": pruned,
+                "pool_cpus_used": c1,
+                "pool_mem_mib_used": m1,
+                "pool_claims": n1,
+                "pool_cpus_free": free_c,
+                "pool_mem_mib_free": free_m,
+                "cancels_github_runs": false,
+            })
+        );
+    }
+    Ok(())
 }
 
 /// Merge fleet base labels with job-requested size/capability labels + tier tag.
@@ -3859,7 +3978,10 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
 
         // Always reap finished pool workers first (frees budget).
         if dynamic {
-            reap_pool_workers(&cli, &pool);
+            let n = reap_pool_workers(&cli, &pool);
+            if n > 0 {
+                eprintln!("listen: reaped {n} finished/orphan claim(s) before poll");
+            }
         }
 
         let api = match github_token() {
@@ -3874,6 +3996,8 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
         if dynamic {
             // Reset per-poll GET budget every tick (demand() does this; dynamic path must too).
             pacer.begin_poll();
+            // Free capacity again if workers finished during API cool-down.
+            let _ = reap_pool_workers(&cli, &pool);
             let jobs = match list_demand_jobs(&cli, &api, &mut pacer, max_local as usize * 2) {
                 Ok(j) => j,
                 Err(e) => {
@@ -3936,8 +4060,19 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
                         eprintln!("pool: local max workers {max_local} reached");
                         break;
                     }
+                    // Free any workers that finished mid-batch before claiming budget.
+                    let _ = reap_pool_workers(&cli, &pool);
                     if let Err(e) = spawn_sized_worker(&cli, &pool, slot, job) {
                         eprintln!("pool: spawn failed: {}", redact(&e));
+                        // Budget may be stuck on exited claims — reap and retry once.
+                        let freed = reap_pool_workers(&cli, &pool);
+                        if freed > 0 {
+                            if let Err(e2) = spawn_sized_worker(&cli, &pool, slot, job) {
+                                eprintln!("pool: spawn retry failed: {}", redact(&e2));
+                            } else {
+                                spawned += 1;
+                            }
+                        }
                     } else {
                         spawned += 1;
                     }
