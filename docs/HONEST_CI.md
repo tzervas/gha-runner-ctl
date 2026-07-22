@@ -1,8 +1,14 @@
 # Honest CI — outcomes and failure classes
 
-**Normative for fleet-managed repos.** Green means real gates cleared. Missing
-toolchains, half-ported platforms, and broken runners must **never** look like
-product success.
+**Normative for all fleet-managed repos org-wide** (not mycelium-only). Green
+means real gates cleared. Missing toolchains, half-ported platforms, and broken
+runners must **never** look like product success.
+
+**Minimum showcase bar:** GitHub **profile-pinned** repos must comply first
+(visitor-facing). Current pin set is tracked in the workstation pack as
+`SHOWCASE_REPOS.md` / operator notes (peft-rs, gha-runner-ctl, memory-gate-rs,
+tero-mcp, tg-agent-relay, mycelium-lang as of 2026-07-21). Pins change → update
+that list in the same change that re-pins.
 
 Companion: [SUPPORT_MATRIX](https://github.com/tzervas/mycelium-lang/blob/main/docs/SUPPORT_MATRIX.md)
 pattern (required / experimental / planned), [FLEET_STANDARDS.md](./FLEET_STANDARDS.md).
