@@ -167,7 +167,22 @@ pub fn size_for_job(job_name: &str, labels: &[String], force_gpu: bool) -> SizeT
     if name.contains("clippy") && !name.contains("build") && !name.contains("test") {
         return SizeTier::Micro;
     }
-    // Medium-default cargo / pytest
+    // Rust compilation is the fleet's memory-hungry workload, and Medium (2c/4g) is
+    // not enough for it. Observed: `cargo check --workspace --all-targets` on
+    // mycelium-l1 was OOM-killed with exit 137 (run 29955035985) on a job named
+    // "cargo check/test", which landed on Medium via the catch-all below.
+    //
+    // A workspace-wide compile gets Xlarge; any other cargo compile/check/test gets
+    // Large. Lint-only cargo jobs (clippy/fmt without build or test) are already
+    // routed to Micro above, so they are unaffected.
+    if name.contains("cargo") && name_contains_any(&name, &["check", "test", "build", "doc"]) {
+        return if name_contains_any(&name, &["workspace", "all-targets", "all targets"]) {
+            SizeTier::Xlarge
+        } else {
+            SizeTier::Large
+        };
+    }
+    // Medium-default non-Rust test/build (pytest, generic ci)
     if name_contains_any(
         &name,
         &[
@@ -470,11 +485,69 @@ mod tests {
         );
     }
 
+    /// Rust compiles used to default to Medium (2c/4g) and OOM-killed there:
+    /// mycelium-l1's "cargo check/test" job exited 137. They now get Large.
     #[test]
-    fn tier_cargo_test_medium() {
+    fn tier_cargo_test_large() {
         assert_eq!(
             size_for_job("cargo test", &["self-hosted".into()], false),
+            SizeTier::Large
+        );
+        assert_eq!(
+            size_for_job("cargo check/test", &["self-hosted".into()], false),
+            SizeTier::Large
+        );
+    }
+
+    /// A workspace-wide compile is the heaviest shape and gets Xlarge.
+    #[test]
+    fn tier_cargo_workspace_xlarge() {
+        assert_eq!(
+            size_for_job("cargo check --workspace", &["self-hosted".into()], false),
+            SizeTier::Xlarge
+        );
+        assert_eq!(
+            size_for_job("cargo build (all-targets)", &["self-hosted".into()], false),
+            SizeTier::Xlarge
+        );
+    }
+
+    /// Non-Rust jobs keep the Medium default — this change is scoped to cargo.
+    #[test]
+    fn tier_non_rust_test_stays_medium() {
+        assert_eq!(
+            size_for_job("pytest", &["self-hosted".into()], false),
             SizeTier::Medium
+        );
+        assert_eq!(
+            size_for_job("unit test", &["self-hosted".into()], false),
+            SizeTier::Medium
+        );
+    }
+
+    /// Lint-only cargo jobs must not be promoted by the rule above.
+    #[test]
+    fn tier_cargo_lint_stays_micro() {
+        assert_eq!(
+            size_for_job("cargo clippy", &["self-hosted".into()], false),
+            SizeTier::Micro
+        );
+        assert_eq!(
+            size_for_job("cargo fmt", &["self-hosted".into()], false),
+            SizeTier::Micro
+        );
+    }
+
+    /// An explicit size label still wins over the cargo heuristic.
+    #[test]
+    fn tier_label_overrides_cargo_rule() {
+        assert_eq!(
+            size_for_job(
+                "cargo check",
+                &["self-hosted".into(), "size-small".into()],
+                false
+            ),
+            SizeTier::Small
         );
     }
 
