@@ -3,7 +3,7 @@
 **Contract ID:** `ctl/cli-env`  
 **Producer:** W1b (code/contracts)  
 **Status:** STABLE  
-**Version:** 0.2.12  
+**Version:** 0.3.0  
 **Consumers:** W1c (docs narrative), W2 (host/env), W3 (PR test plan)  
 **Depends-on:** `framework/bulletin@STABLE`
 
@@ -12,9 +12,9 @@
 | Artifact | Value |
 |----------|--------|
 | Crate / binary | `gha-runner-ctl` |
-| `VERSION` file | `0.2.12` |
-| `Cargo.toml` `package.version` | `0.2.12` |
-| GitHub HTTP User-Agent | `gha-runner-ctl/0.2.12` (`src/lib.rs` `UA`) |
+| `VERSION` file | `0.3.0` |
+| `Cargo.toml` `package.version` | `0.3.0` |
+| GitHub HTTP User-Agent | `gha-runner-ctl/0.3.0` (`src/lib.rs` `UA`) |
 
 ## Entry behavior
 
@@ -74,6 +74,8 @@ All global options accept the same name as env var (clap `env =`); boolean env v
 | `--auto` | `GHA_AUTO` | bool | false | — |
 | `--image` | `GHA_IMAGE` | OCI image ref | `localhost/gha-runner-ctl:latest` | Any registry/path:tag or `@sha256:`; see [WORK_IMAGES](../WORK_IMAGES.md) |
 | `--image-mode` | `GHA_IMAGE_MODE` | `auto`, `build`, `external` | `auto` | auto→build for stock tag; else external |
+| `--image-map` | `GHA_IMAGE_MAP` | path | — | Label→image map (JSON/TOML); merges over builtins; issue #28 |
+| `--platform` | `GHA_PLATFORM` | OCI platform | — | e.g. `linux/arm64`; also set from job arch labels at spawn |
 | `--pull-policy` | `GHA_PULL_POLICY` | `never`, `missing`, `always` | (mode default) | build→never, external→missing when unset |
 | `--runner-user` | `GHA_RUNNER_USER` | uid:gid or name | `1001:1001` | Podman `--user` |
 | `--seed-helper-image` | `GHA_SEED_HELPER_IMAGE` | OCI ref | `docker.io/library/ubuntu:24.04` | Seeds runner kit into volumes |

@@ -1,0 +1,19 @@
+# Example label → OCI image map for gha-runner-ctl (issue #28).
+# Install on the fleet host and point GHA_IMAGE_MAP at this file.
+# Built-in defaults already cover common distros; this file overrides/extends.
+#
+# Workflow:
+#   runs-on: [self-hosted, linux, x64, podman, ubuntu-24.04]
+# spawns a runner whose rootfs is the mapped image (no nested podman/docker).
+
+[images]
+ubuntu-24.04 = "docker.io/library/ubuntu:24.04"
+ubuntu-22.04 = "docker.io/library/ubuntu:22.04"
+debian-bookworm = "docker.io/library/debian:bookworm"
+rocky-9 = "docker.io/library/rockylinux:9"
+# custom-ci = "ghcr.io/example/ci-base:2026.07"
+
+[arches]
+# Optional platform overrides (defaults are built-in for known arch labels).
+arm64 = "linux/arm64"
+riscv64 = "linux/riscv64"

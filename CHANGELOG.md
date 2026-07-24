@@ -1,4 +1,4 @@
-## Unreleased
+## v0.3.0 (2026-07-24)
 
 ### Fixed — capacity-safe idle scale-in (demand-driven autoscaler)
 
@@ -17,6 +17,28 @@ round-robin demand sample looks empty.
 - Scale-out clamp math (`max_workers` / CPU / mem / `max_spawn_per_tick` +
   `try_claim`) unchanged.
 - Regression tests: busy worker not scaled in; empty gate requires full sweep.
+### Added — workflow-selectable image + cross-arch spawn (issue #28, draft)
+
+Fleet runners have no nested container engine; distro/arch jobs must select the
+work rootfs at **spawn** (mycelium-lang draw-in / multi-OS CI).
+
+- **Label → image map:** built-in distro labels (`ubuntu-24.04`, `debian-bookworm`,
+  `rocky-9`, …) plus optional `GHA_IMAGE_MAP` / `--image-map` (JSON or minimal TOML).
+  Dynamic pool resolves job `runs-on` labels → OCI ref, forces external image mode,
+  and re-registers the worker with those labels.
+- **Arch / platform:** arch labels (`arm64`, `riscv64`, …) → `podman --platform`;
+  CLI `GHA_PLATFORM` / `--platform` for single-container `up`.
+- **binfmt guard:** when target arch ≠ host, require QEMU/`binfmt_misc` registration
+  or fail with a clear error (no silent wrong-arch run).
+- Docs: [docs/WORK_IMAGES.md](docs/WORK_IMAGES.md); examples
+  `packaging/image-map.example.json` / `.toml`.
+- Unit tests: label→image resolution, arch→platform args, binfmt-missing guard.
+
+### Host prerequisite (cross-arch only)
+
+```bash
+podman run --privileged --rm tonistiigi/binfmt --install all
+```
 
 ## 0.2.12
 
