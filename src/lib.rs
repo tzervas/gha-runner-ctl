@@ -13,9 +13,10 @@
 mod pool;
 
 pub use pool::{
-    fit_to_budget, format_cpus, format_memory_mib, parse_cpus_f64, parse_memory_mib, plan_scale,
-    resources_for_tier, size_for_job, DemandSignal, ResourcePool, ScaleInput, ScalePlan, SizeTier,
-    SpawnRequest, WorkerSnapshot, DEFAULT_MAX_SPAWN_PER_TICK,
+    demand_empty_confirmed, empty_sweep_ticks, fit_to_budget, format_cpus, format_memory_mib,
+    is_busy, parse_cpus_f64, parse_memory_mib, plan_scale, resources_for_tier, size_for_job,
+    DemandSignal, ResourcePool, ScaleInput, ScalePlan, SizeTier, SpawnRequest, WorkerSnapshot,
+    DEFAULT_MAX_SPAWN_PER_TICK,
 };
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -2087,6 +2088,30 @@ fn container_running(name: &str) -> bool {
     podman(&["inspect", "-f", "{{.State.Running}}", name]).is_ok_and(|s| s == "true")
 }
 
+/// Local per-worker busy signal for scale-in safety.
+///
+/// Does **not** consult the demand scan (which is only a partial prefer-repo RR
+/// sample). Uses the actions/runner process tree inside the container:
+/// `Runner.Worker` is present only while a job is executing; idle online
+/// runners only have `Runner.Listener`.
+///
+/// Fail-closed: if the container is running but process inspection fails, treat
+/// as busy so we never tear down a mid-job worker under uncertainty.
+fn container_worker_busy(name: &str) -> bool {
+    if !container_running(name) {
+        return false;
+    }
+    match podman(&["top", name]) {
+        Ok(out) => {
+            let lower = out.to_ascii_lowercase();
+            // actions/runner spawns Runner.Worker (any path / casing) for the job.
+            lower.contains("runner.worker")
+        }
+        // Cannot prove idle → not eligible for scale-in.
+        Err(_) => true,
+    }
+}
+
 fn container_exists(name: &str) -> bool {
     podman_ok(&["container", "exists", name])
 }
@@ -3971,6 +3996,10 @@ fn scale_in_worker(base: &Cli, pool: &ResourcePool, worker_id: &str) -> Result<(
 }
 
 /// Build planner worker snapshots for containers owned by this listen base name.
+///
+/// `busy` is filled from the local container process tree ([`container_worker_busy`]),
+/// never from the demand scan — so a mid-job worker on an un-scanned prefer-repo
+/// is still marked busy and protected from idle scale-in.
 fn local_worker_snapshots(cli: &Cli, pool: &ResourcePool, max_local: u32) -> Vec<WorkerSnapshot> {
     let mut out = Vec::new();
     let claims = pool.claims().unwrap_or_default();
@@ -3982,11 +4011,14 @@ fn local_worker_snapshots(cli: &Cli, pool: &ResourcePool, max_local: u32) -> Vec
             .iter()
             .any(|c| c.container == container || c.worker_id == worker_id);
         if running || claimed {
+            // Local job signal only; independent of list_demand_jobs RR sample.
+            let busy = running && container_worker_busy(&container);
             out.push(WorkerSnapshot {
                 slot,
                 worker_id,
                 container,
                 running,
+                busy,
             });
         }
     }
@@ -4054,9 +4086,31 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
     }
 
     let mut idle_since: Option<Instant> = None;
+    // Consecutive ticks where the (partial) demand sample was empty.
+    // Idle timer starts only after a full prefer-list sweep of empty.
+    let mut empty_streak: u32 = 0;
     let mut cli = cli.clone_for_listen();
     let mut pacer = ApiPacer::from_cli(&cli);
     let max_local = cli.pool_max_workers.min(pool.max_workers).max(1);
+    // Effective partial-scan width for the empty-sweep gate (mirrors list_demand_jobs).
+    let scan_width: usize = if dynamic {
+        let cap = cli.pool_scan_per_tick.max(1);
+        if cli.repos_per_tick == 0 {
+            cap as usize
+        } else {
+            cli.repos_per_tick.min(cap).max(1) as usize
+        }
+    } else if cli.repos_per_tick == 0 {
+        prefer_n.max(1)
+    } else {
+        cli.repos_per_tick as usize
+    };
+    let sweep_ticks = empty_sweep_ticks(prefer_n, scan_width);
+    if dynamic {
+        eprintln!(
+            "listen: capacity-safe scale-in: empty_sweep_ticks={sweep_ticks} (prefer={prefer_n}/scan={scan_width}); busy workers never scaled in"
+        );
+    }
 
     loop {
         if let Some(wait) = pacer.cooling() {
@@ -4104,6 +4158,8 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
             };
             drop(api);
 
+            // Keep raw demand count for tick log (filter may drop GPU/CPU affinity mismatches).
+            let jobs_n = jobs.len();
             // Filter by GPU affinity before planning (CPU listener skips gpu tiers).
             let filtered: Vec<DemandJob> = jobs
                 .into_iter()
@@ -4119,16 +4175,31 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
 
             let workers = local_worker_snapshots(&cli, &pool, max_local);
             let running_n = workers.iter().filter(|w| w.running).count() as u32;
+            let busy_n = workers.iter().filter(|w| w.running && is_busy(w)).count() as u32;
             let (used_c, used_m, host_claims) = pool.usage().unwrap_or((0.0, 0, 0));
             let free_c = (pool.max_cpus - used_c).max(0.0);
             let free_m = pool.max_memory_mib.saturating_sub(used_m);
 
-            // Idle timer: advance whenever the queue is empty (including while
-            // workers are still up — that is when scale-in must eventually fire).
+            // Demand-empty gate + idle timer:
+            // 1. A single empty *partial* RR sample must NOT start idle_secs
+            //    (busy job may live on an un-scanned prefer-repo).
+            // 2. Require consecutive empty ticks covering a full prefer-list
+            //    sweep ([`demand_empty_confirmed`] / [`empty_sweep_ticks`]).
+            // 3. Only then count idle_secs toward scale-in.
+            // Per-worker busy is a second, independent layer in plan_scale.
             let idle_expired = if filtered.is_empty() {
-                let since = idle_since.get_or_insert_with(Instant::now);
-                since.elapsed() >= Duration::from_secs(idle_secs)
+                empty_streak = empty_streak.saturating_add(1);
+                let confirmed = demand_empty_confirmed(empty_streak, prefer_n, scan_width);
+                if confirmed {
+                    let since = idle_since.get_or_insert_with(Instant::now);
+                    since.elapsed() >= Duration::from_secs(idle_secs)
+                } else {
+                    // Still covering the prefer-list — do not start idle clock.
+                    idle_since = None;
+                    false
+                }
             } else {
+                empty_streak = 0;
                 idle_since = None;
                 false
             };
@@ -4149,7 +4220,7 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
 
             let plan = plan_scale(&ScaleInput {
                 jobs: signals,
-                workers,
+                workers: workers.clone(),
                 free_cpus: free_c,
                 free_memory_mib: free_m,
                 max_cpus: pool.max_cpus,
@@ -4163,12 +4234,23 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
             });
 
             eprintln!(
-                "pool: plan {} (running={running_n} free={free_c:.2}c/{free_m}MiB)",
+                "pool: plan {} (running={running_n} busy={busy_n} empty_streak={empty_streak}/{sweep_ticks} free={free_c:.2}c/{free_m}MiB)",
                 plan.notes
             );
 
             // Scale-IN first (return capacity before scale-out packing).
+            // plan_scale only lists provably-idle workers; re-check the local
+            // busy signal at execution time in case a job started mid-tick.
             for wid in &plan.scale_in {
+                let container = workers
+                    .iter()
+                    .find(|w| w.worker_id == *wid)
+                    .map(|w| w.container.as_str())
+                    .unwrap_or("");
+                if !container.is_empty() && container_worker_busy(container) {
+                    eprintln!("pool: scale-in skip busy worker {wid} (local job signal)");
+                    continue;
+                }
                 if let Err(e) = scale_in_worker(&cli, &pool, wid) {
                     eprintln!("pool: scale-in failed: {}", redact(&e));
                 }
@@ -4222,7 +4304,7 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
                         path,
                         &serde_json::json!({
                             "ts_unix": now_unix(),
-                            "jobs": jobs.len(),
+                            "jobs": jobs_n,
                             "spawned": spawned,
                             "running": running_n,
                             "pool_cpus_used": uc,

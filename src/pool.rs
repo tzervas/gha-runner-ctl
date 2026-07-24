@@ -500,6 +500,51 @@ pub struct WorkerSnapshot {
     pub container: String,
     /// Whether the container process is still running.
     pub running: bool,
+    /// Whether this worker is **actively executing a job** (local signal —
+    /// container process tree / claim bookkeeping — **not** the demand scan).
+    /// Scale-in must never target a busy worker even when the partial RR demand
+    /// sample looks empty (busy job may live on an un-scanned prefer-repo).
+    pub busy: bool,
+}
+
+/// True when the worker is known to be executing a job (not merely online/idle).
+///
+/// Independent of demand polling: a busy worker on an un-scanned prefer-repo
+/// must still report `busy` so scale-in cannot kill it mid-run.
+#[inline]
+pub fn is_busy(worker: &WorkerSnapshot) -> bool {
+    worker.busy
+}
+
+/// How many consecutive **empty** demand ticks are required before the idle
+/// timer may start counting, given a prefer-list of `prefer_len` and a partial
+/// round-robin scan width of `scan_per_tick`.
+///
+/// Derivation (correct at any fleet size — not a magic constant):
+///
+/// ```text
+/// empty_sweep_ticks = ceil(prefer_len / max(scan_per_tick, 1))
+///                   = max(1, …)   // at least one observation
+/// ```
+///
+/// With prefer=236 and scan=12 this is 20 ticks — one full prefer-list sweep
+/// under partial RR. A single empty partial sample is never enough.
+pub fn empty_sweep_ticks(prefer_len: usize, scan_per_tick: usize) -> u32 {
+    let width = scan_per_tick.max(1);
+    if prefer_len == 0 {
+        // No allowlist → one observation is a full "sweep".
+        return 1;
+    }
+    prefer_len.div_ceil(width) as u32
+}
+
+/// Whether a streak of empty partial-scan ticks constitutes a **confirmed**
+/// empty queue (a full prefer-list sweep has been observed empty).
+///
+/// Only after this returns true may `idle_secs` start counting toward scale-in.
+#[inline]
+pub fn demand_empty_confirmed(empty_streak: u32, prefer_len: usize, scan_per_tick: usize) -> bool {
+    empty_streak >= empty_sweep_ticks(prefer_len, scan_per_tick)
 }
 
 /// Inputs for one scale decision. All numbers are **host-pool** free/max
@@ -584,30 +629,54 @@ impl Default for ScaleInput {
 ///   the remainder.
 /// * **Capacity:** never plans a spawn that does not fit free CPU **and** memory
 ///   (and free local/host worker slots). Claimed-or-running workers occupy slots.
-/// * **Scale-in:** when there is no demand and `idle_expired`, tear down all
-///   still-running local pool workers so capacity returns to the shared budget.
+/// * **Scale-in:** when there is no demand and `idle_expired`, tear down only
+///   **provably-idle** local pool workers (`running && !busy`). Busy workers
+///   (local job signal) are never scaled in — demand emptiness alone is not
+///   enough when the prefer-list is only partially scanned.
 /// * **Storm bound:** at most `max_spawn_per_tick` spawns per call.
+///
+/// Callers must set `idle_expired` only after a **full prefer-repo sweep** of
+/// empty observations ([`demand_empty_confirmed`]) **and** `idle_secs` elapsed.
 pub fn plan_scale(input: &ScaleInput) -> ScalePlan {
     let running_local = input.workers.iter().filter(|w| w.running).count() as u32;
+    let busy_local = input
+        .workers
+        .iter()
+        .filter(|w| w.running && is_busy(w))
+        .count() as u32;
     // Any known local worker (running **or** claimed-but-not-yet-running) holds its
     // slot id — otherwise a mid-spawn claim is double-booked on the next tick.
     let used_slots: std::collections::HashSet<u32> = input.workers.iter().map(|w| w.slot).collect();
     let occupied_local = used_slots.len() as u32;
 
-    // --- Idle scale-IN: no demand, idle timer fired → tear down pool workers ---
+    // --- Idle scale-IN: no demand, idle timer fired → tear down *idle* pool workers ---
     if input.jobs.is_empty() {
         if input.idle_expired && running_local > 0 {
+            // Never down a busy worker — even when the (partial) demand sample is empty.
             let scale_in: Vec<String> = input
                 .workers
                 .iter()
-                .filter(|w| w.running)
+                .filter(|w| w.running && !is_busy(w))
                 .map(|w| w.worker_id.clone())
                 .collect();
+            if scale_in.is_empty() {
+                return ScalePlan {
+                    spawns: Vec::new(),
+                    scale_in: Vec::new(),
+                    desired_count: 0,
+                    notes: format!(
+                        "hold: no demand, {busy_local} busy worker(s) protected (not scale-in)"
+                    ),
+                };
+            }
+            let n = scale_in.len();
             return ScalePlan {
                 spawns: Vec::new(),
                 scale_in,
                 desired_count: 0,
-                notes: format!("scale-in: idle, tearing down {running_local} pool worker(s)"),
+                notes: format!(
+                    "scale-in: idle, tearing down {n} idle worker(s) (held {busy_local} busy)"
+                ),
             };
         }
         return ScalePlan {
@@ -616,7 +685,7 @@ pub fn plan_scale(input: &ScaleInput) -> ScalePlan {
             desired_count: 0,
             notes: if running_local > 0 {
                 format!(
-                    "hold: no demand, {running_local} worker(s) still running (idle not expired)"
+                    "hold: no demand, {running_local} worker(s) still running (idle not expired; busy={busy_local})"
                 )
             } else {
                 "idle: no demand, no workers".into()
@@ -1032,30 +1101,25 @@ mod tests {
         assert_eq!(plan.desired_count, 8); // clamped by max_local_workers=8
     }
 
-    /// Idle scale-in: no jobs + idle_expired → tear down running pool workers.
+    fn worker(slot: u32, running: bool, busy: bool) -> WorkerSnapshot {
+        WorkerSnapshot {
+            slot,
+            worker_id: format!("runner-w{slot}"),
+            container: format!("ctl-w{slot}"),
+            running,
+            busy,
+        }
+    }
+
+    /// Idle scale-in: no jobs + idle_expired → tear down **idle** running pool workers.
     #[test]
     fn scale_idle_scale_in() {
         let input = ScaleInput {
             jobs: Vec::new(),
             workers: vec![
-                WorkerSnapshot {
-                    slot: 0,
-                    worker_id: "runner-w0".into(),
-                    container: "ctl-w0".into(),
-                    running: true,
-                },
-                WorkerSnapshot {
-                    slot: 1,
-                    worker_id: "runner-w1".into(),
-                    container: "ctl-w1".into(),
-                    running: true,
-                },
-                WorkerSnapshot {
-                    slot: 2,
-                    worker_id: "runner-w2".into(),
-                    container: "ctl-w2".into(),
-                    running: false, // already dead — not in scale_in
-                },
+                worker(0, true, false),
+                worker(1, true, false),
+                worker(2, false, false), // already dead — not in scale_in
             ],
             idle_expired: true,
             ..ScaleInput::default()
@@ -1073,12 +1137,7 @@ mod tests {
     fn scale_idle_hold_before_timeout() {
         let input = ScaleInput {
             jobs: Vec::new(),
-            workers: vec![WorkerSnapshot {
-                slot: 0,
-                worker_id: "runner-w0".into(),
-                container: "ctl-w0".into(),
-                running: true,
-            }],
+            workers: vec![worker(0, true, false)],
             idle_expired: false,
             ..ScaleInput::default()
         };
@@ -1086,6 +1145,94 @@ mod tests {
         assert!(plan.spawns.is_empty());
         assert!(plan.scale_in.is_empty());
         assert!(plan.notes.contains("hold"));
+    }
+
+    /// **Capacity-safety regression (a):** a busy worker on an un-scanned prefer-repo
+    /// must NOT be scaled in when the partial demand sample looks empty.
+    ///
+    /// Old behavior: `jobs.is_empty() && idle_expired` → tear down every running
+    /// worker, including ones still executing a job. New: only `!busy` workers.
+    #[test]
+    fn scale_idle_skips_busy_worker_on_unscanned_repo() {
+        // Partial RR demand sample returned empty (busy job lives on a repo not
+        // in this tick's scan window), idle timer has fired, but w0 is mid-job.
+        let input = ScaleInput {
+            jobs: Vec::new(),
+            workers: vec![
+                worker(0, true, true),  // busy mid-job → PROTECTED
+                worker(1, true, false), // idle → eligible
+            ],
+            idle_expired: true,
+            ..ScaleInput::default()
+        };
+        let plan = plan_scale(&input);
+        assert!(plan.spawns.is_empty());
+        assert_eq!(plan.scale_in, vec!["runner-w1".to_string()]);
+        assert!(!plan.scale_in.iter().any(|id| id == "runner-w0"));
+        assert!(plan.notes.contains("held"), "notes={}", plan.notes);
+        assert!(is_busy(&input.workers[0]));
+        assert!(!is_busy(&input.workers[1]));
+    }
+
+    /// All running workers busy → scale-in list empty (never kill mid-run fleet).
+    #[test]
+    fn scale_idle_all_busy_no_scale_in() {
+        let input = ScaleInput {
+            jobs: Vec::new(),
+            workers: vec![worker(0, true, true), worker(1, true, true)],
+            idle_expired: true,
+            ..ScaleInput::default()
+        };
+        let plan = plan_scale(&input);
+        assert!(plan.spawns.is_empty());
+        assert!(
+            plan.scale_in.is_empty(),
+            "must not scale-in busy workers: {:?}",
+            plan.scale_in
+        );
+        assert!(plan.notes.contains("busy"), "notes={}", plan.notes);
+    }
+
+    /// **Capacity-safety regression (b):** idle scale-in only after a full prefer-list
+    /// sweep of empty observations — modeled via the pure sweep-gate helpers.
+    ///
+    /// Old behavior: one empty partial RR tick started `idle_secs`. New: require
+    /// `ceil(prefer_len / scan_width)` consecutive empty ticks first.
+    #[test]
+    fn demand_empty_gate_requires_full_prefer_sweep() {
+        // Fleet-sized prefer-list (236) with partial scan width 12 → 20 ticks.
+        assert_eq!(empty_sweep_ticks(236, 12), 20);
+        assert_eq!(empty_sweep_ticks(12, 12), 1);
+        assert_eq!(empty_sweep_ticks(13, 12), 2);
+        assert_eq!(empty_sweep_ticks(1, 12), 1);
+        assert_eq!(empty_sweep_ticks(0, 12), 1);
+        assert_eq!(empty_sweep_ticks(100, 0), 100); // width floors to 1
+
+        // Single partial-empty tick is NOT confirmed empty.
+        assert!(!demand_empty_confirmed(1, 236, 12));
+        assert!(!demand_empty_confirmed(19, 236, 12));
+        // Full sweep of empty observations → confirmed; idle_secs may start.
+        assert!(demand_empty_confirmed(20, 236, 12));
+        assert!(demand_empty_confirmed(21, 236, 12));
+
+        // Small allowlist: one empty tick is a full sweep.
+        assert!(demand_empty_confirmed(1, 6, 12));
+        assert!(!demand_empty_confirmed(0, 6, 12));
+    }
+
+    /// Planner still holds when idle_expired is false (caller has not completed
+    /// full-sweep empty + idle_secs). Models partial-scan: empty jobs alone ≠ scale-in.
+    #[test]
+    fn scale_idle_no_scale_before_sweep_gate() {
+        let input = ScaleInput {
+            jobs: Vec::new(), // partial sample empty
+            workers: vec![worker(0, true, false)],
+            idle_expired: false, // sweep gate / idle_secs not yet satisfied
+            ..ScaleInput::default()
+        };
+        let plan = plan_scale(&input);
+        assert!(plan.scale_in.is_empty());
+        assert!(plan.spawns.is_empty());
     }
 
     /// Occupied workers hold slots; deficit spawns use the next free slot id.
@@ -1096,12 +1243,7 @@ mod tests {
             job("gitleaks", &["self-hosted"]),
             job("ruff", &["self-hosted"]),
         ]);
-        input.workers = vec![WorkerSnapshot {
-            slot: 0,
-            worker_id: "runner-w0".into(),
-            container: "ctl-w0".into(),
-            running: true,
-        }];
+        input.workers = vec![worker(0, true, false)];
         input.host_claim_count = 1;
         let plan = plan_scale(&input);
         assert_eq!(plan.spawns.len(), 1, "notes={}", plan.notes);
@@ -1116,12 +1258,7 @@ mod tests {
             job("gitleaks", &["self-hosted"]),
             job("ruff", &["self-hosted"]),
         ]);
-        input.workers = vec![WorkerSnapshot {
-            slot: 0,
-            worker_id: "runner-w0".into(),
-            container: "ctl-w0".into(),
-            running: false,
-        }];
+        input.workers = vec![worker(0, false, false)];
         input.host_claim_count = 1;
         let plan = plan_scale(&input);
         assert_eq!(plan.spawns.len(), 1, "notes={}", plan.notes);
@@ -1132,12 +1269,7 @@ mod tests {
     #[test]
     fn scale_no_overspawn_when_covered() {
         let mut input = base_input(vec![job("gitleaks", &["self-hosted"])]);
-        input.workers = vec![WorkerSnapshot {
-            slot: 0,
-            worker_id: "runner-w0".into(),
-            container: "ctl-w0".into(),
-            running: true,
-        }];
+        input.workers = vec![worker(0, true, false)];
         input.host_claim_count = 1;
         let plan = plan_scale(&input);
         assert!(plan.spawns.is_empty(), "notes={}", plan.notes);
