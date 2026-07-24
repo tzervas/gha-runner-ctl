@@ -1,6 +1,17 @@
-# GitHub natively closes issues on merge for any base branch when PR uses Closes #n.
-# This workflow reopens issues closed by merges into non-main branches so epics/tasks
-# stay open until delivered to trunk.
+# Reopen EPICS that were closed by a merge into a non-main branch.
+#
+# Premise (corrected): GitHub only auto-closes a linked issue when the PR merges into the
+# repository's DEFAULT branch — not "any base branch". On a repo defaulting to `main` this
+# workflow is a rarely-firing safety net; it is load-bearing only where the default branch is
+# not `main` (e.g. repos defaulting to `dev`), where a dev-merge auto-closes linked issues.
+#
+# Policy:
+#   - A regular issue MAY close when its PR merges into dev/int — that is normal, LEAVE IT.
+#   - An epic MUST stay open until the work is released to main. So we reopen ONLY epics that
+#     were closed off-main. Epic detection: label exactly `epic`, a label prefixed `epic:`/
+#     `epic/`, or a title beginning `[Epic]`. (Deliberately does not match `epicurean` etc.)
+#
+# Runs on ubuntu-latest (pure API bookkeeping — must not consume self-hosted fleet capacity).
 name: reopen-issues-closed-off-main
 
 on:
@@ -14,25 +25,26 @@ permissions:
   pull-requests: read
 
 jobs:
-  # Always-green gate so skipped evaluations never mark the run red with zero jobs.
+  # Always-green gate so a run whose reopen job is skipped never concludes "failure with zero
+  # jobs". Cheap on ubuntu-latest — no fleet load (the reason the old self-hosted gate was wrong).
   gate:
     name: gate
-    runs-on: [self-hosted, linux, x64, podman]
+    runs-on: ubuntu-latest
     steps:
       - name: noop
         run: echo "reopen workflow loaded"
 
   reopen:
-    name: Reopen issues closed off-main
+    name: Reopen epics closed off-main
     needs: [gate]
-    runs-on: [self-hosted, linux, x64, podman]
+    runs-on: ubuntu-latest
     if: >
       github.event_name == 'pull_request' &&
       github.event.pull_request.merged == true &&
       github.event.pull_request.base.ref != 'main' &&
       github.event.pull_request.base.ref != 'master'
     steps:
-      - name: Reopen linked issues
+      - name: Reopen linked epics
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR: ${{ github.event.pull_request.number }}
@@ -56,15 +68,32 @@ jobs:
             echo "No closing keywords — nothing to reopen"
             exit 0
           fi
+          # Is issue #$1 an epic? label `epic`, label prefix `epic:`/`epic/`, or `[Epic]` title.
+          is_epic() {
+            local n="$1" meta labels ititle
+            meta=$(gh api "repos/$REPO/issues/$n" 2>/dev/null) || return 1
+            labels=$(printf '%s' "$meta" | jq -r '.labels[].name' 2>/dev/null | tr '[:upper:]' '[:lower:]')
+            ititle=$(printf '%s' "$meta" | jq -r '.title // ""' | tr '[:upper:]' '[:lower:]')
+            if printf '%s\n' "$labels" | grep -qxE 'epic'; then return 0; fi
+            if printf '%s\n' "$labels" | grep -qE '^epic[:/]'; then return 0; fi
+            case "$ititle" in
+              '[epic]'*) return 0 ;;
+            esac
+            return 1
+          }
           while IFS= read -r n; do
             [ -z "$n" ] && continue
             state=$(gh api "repos/$REPO/issues/$n" --jq .state 2>/dev/null || echo missing)
-            if [ "$state" = "closed" ]; then
-              gh api -X PATCH "repos/$REPO/issues/$n" -f state=open >/dev/null
-              gh api -X POST "repos/$REPO/issues/$n/comments" \
-                -f body="Reopened automatically: closing keywords on PR #${PR} merged into \`${BASE}\` (not main). Issues close only when work reaches **main**. Prefer \`Refs #${n}\` on non-main PRs." >/dev/null
-              echo "reopened #$n"
-            else
+            if [ "$state" != "closed" ]; then
               echo "skip #$n state=$state"
+              continue
             fi
+            if ! is_epic "$n"; then
+              echo "skip #$n — not an epic (regular issues may close off-main)"
+              continue
+            fi
+            gh api -X PATCH "repos/$REPO/issues/$n" -f state=open >/dev/null
+            gh api -X POST "repos/$REPO/issues/$n/comments" \
+              -f body="Reopened automatically: this **epic** was closed by PR #${PR} merging into \`${BASE}\` (not main). Epics close only when the work reaches **main**. Prefer \`Refs #${n}\` on non-main PRs; use \`Closes #${n}\` only on the main-bound release PR." >/dev/null
+            echo "reopened epic #$n"
           done <<< "$nums"
