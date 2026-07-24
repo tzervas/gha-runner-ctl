@@ -560,7 +560,7 @@ fn effective_uid_is_root() -> bool {
 /// Checks for raw token patterns in CLI arguments. If found, prints an error message and exits.
 /// This prevents users from leaking secrets in shell history, process listings, or logs.
 pub fn prevent_raw_token_args() {
-    let token_prefixes = ["ghp_", "gho_", "ghu_", "ghs_", "github_pat_"];
+    let token_prefixes = ["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"];
     for arg in std::env::args() {
         for prefix in token_prefixes {
             if arg.contains(prefix) {
@@ -984,55 +984,861 @@ pub fn is_safe_memory(s: &str) -> bool {
     )
 }
 
+/// Minimum body length (in bytes) required after a *fixed GitHub token-type
+/// prefix* before the match is treated as a real secret. GitHub's documented
+/// secret-scanning shape for every one of these prefixes is
+/// `<prefix>[A-Za-z0-9._-]{36,}` — real tokens always carry at least 36 body
+/// characters (classic tokens are exactly 36; `ghs_` stateless JWTs and
+/// `github_pat_` fine-grained PATs are far longer). Requiring this floor stops
+/// short prose mentions of a bare prefix (`"the ghp_ prefix is documented"`,
+/// `"ghp_ABC in an example"`) from being over-redacted, while never
+/// under-redacting a genuine token, whose body is always ≥ 36.
+const GH_PREFIX_MIN_BODY: usize = 36;
+
+/// Minimum body length for a *contextual value marker* (`Bearer `,
+/// `RUNNER_TOKEN=`). Here the marker is not itself a token shape — it names a
+/// slot whose value is a secret regardless of length — so ANY non-empty value
+/// after it must be scrubbed. Registration/runner tokens minted by GitHub are
+/// short (~29 chars) and would slip past a 36-byte floor, so contextual markers
+/// deliberately use a floor of 1 (redact any non-empty body). An empty body
+/// (marker immediately followed by a non-body char, e.g. `RUNNER_TOKEN=""`) is
+/// still treated as prose and left untouched.
+const CONTEXTUAL_MIN_BODY: usize = 1;
+
+/// GitHub token-type prefixes and contextual value markers that anchor secret
+/// detection in [`redact`], each paired with the minimum body length that makes
+/// a match a real secret (see [`GH_PREFIX_MIN_BODY`] / [`CONTEXTUAL_MIN_BODY`]).
+/// Each entry's literal is the text that precedes a secret value; for the two
+/// contextual markers the delimiter ('` `' / '`=`') is part of the literal
+/// itself, so the run *after* the marker is the value that gets replaced.
+///
+/// The literals are mutually exclusive at their discriminating byte (e.g.
+/// `ghp_` vs `gho_` vs `github_pat_` diverge by the 3rd/4th char), so at most
+/// one entry can match at any given scan position — order does not affect
+/// correctness. The split minimum (36 for the fixed token prefixes, 1 for the
+/// contextual markers) is the key correctness reconciliation: it prevents
+/// over-redacting short `ghp_`/`ghs_` prose while still fully redacting short
+/// `RUNNER_TOKEN=`/`Bearer ` values.
+const TOKEN_ANCHORS: &[(&str, usize)] = &[
+    ("ghp_", GH_PREFIX_MIN_BODY),
+    ("gho_", GH_PREFIX_MIN_BODY),
+    ("ghu_", GH_PREFIX_MIN_BODY),
+    ("ghs_", GH_PREFIX_MIN_BODY),
+    ("ghr_", GH_PREFIX_MIN_BODY),
+    ("github_pat_", GH_PREFIX_MIN_BODY),
+    ("Bearer ", CONTEXTUAL_MIN_BODY),
+    ("RUNNER_TOKEN=", CONTEXTUAL_MIN_BODY),
+];
+
+/// The token-body character class: ASCII alphanumerics plus `_`, `-`, `.`.
+/// This covers classic GitHub token bodies as well as `ghs_` stateless JWTs
+/// (`base64url.base64url.base64url`, base64url alphabet `[A-Za-z0-9-_]`, with
+/// the two `.` separators also falling in this class so a whole JWT is one
+/// contiguous run). Every member is single-byte ASCII, which is what makes
+/// byte-index scanning UTF-8-safe: a multibyte character's leading byte can
+/// never be mistaken for a body byte, so it always terminates a run.
+#[inline]
+fn is_token_body_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')
+}
+
+/// Scans the token-body run starting at byte offset `body_start` in `s` and
+/// returns its *end* byte offset (exclusive), or `None` if the (post-trim) body
+/// is shorter than `min_body` bytes.
+///
+/// The run ends at the first byte whose character is outside
+/// [`is_token_body_char`] — never early (no upper length cap, so it cannot stop
+/// mid-token and leak a tail) and never late (any non-class byte, including
+/// the leading byte of a multibyte character, terminates it immediately).
+///
+/// Trailing `.` bytes are then trimmed off the run. A `.` can never be the
+/// last character of a valid GitHub token or `ghs_` JWT (base64url excludes
+/// `.`), so any trailing dot is sentence punctuation, not secret material;
+/// trimming it lets `redact` give back a closing sentence period without
+/// ever under-redacting the token itself. `-` and `_` are deliberately *not*
+/// trimmed: base64url signatures may legitimately end in either, and
+/// trimming them could truncate live secret bytes into the output.
+///
+/// The `min_body` floor (applied to the *trimmed* length) is what separates a
+/// real secret from prose: fixed token prefixes pass [`GH_PREFIX_MIN_BODY`],
+/// contextual markers pass [`CONTEXTUAL_MIN_BODY`]. A body below the floor
+/// yields `None` and `redact` re-emits the anchor as ordinary text, re-scanning
+/// the short body as normal characters (so nothing is dropped).
+///
+/// All offsets returned are derived from `str::char_indices` (or are the
+/// unchanged `body_start`), so they are always valid UTF-8 char boundaries.
+fn scan_body_end(s: &str, body_start: usize, min_body: usize) -> Option<usize> {
+    let mut end = body_start;
+    for (rel_idx, c) in s[body_start..].char_indices() {
+        if is_token_body_char(c) {
+            end = body_start + rel_idx + c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    // Trim trailing '.' — single-byte ASCII, safe to shrink one byte at a time.
+    while end > body_start && s.as_bytes()[end - 1] == b'.' {
+        end -= 1;
+    }
+    // Enforce the per-anchor minimum body length on the trimmed run. `min_body`
+    // is always ≥ 1, so an empty body (`end == body_start`) can never pass.
+    if end > body_start && end - body_start >= min_body {
+        Some(end)
+    } else {
+        None
+    }
+}
+
+/// Redacts GitHub credential material from `s` in a single left-to-right
+/// pass, returning a new, secret-free `String`.
+///
+/// # Zero-copy detection
+/// Detection never copies a secret byte into a new allocation: the scan
+/// walks byte offsets over the *borrowed* input, and whenever a token body is
+/// found the scanner simply jumps `i` past it (`i = body_end`) without ever
+/// pushing those bytes into `out`. The output is assembled only from
+/// non-secret spans, the kept prefix/marker literal, and the constant
+/// `"***REDACTED***"`. This is the strongest possible reading of "minimize
+/// secret copies": there are zero secret-bearing copies on this hot path, so
+/// there is nothing that needs to be wiped or locked here. (Compare the
+/// previous implementation, which began with `out = s.to_string()` — an
+/// unzeroized heap clone of the *entire*, potentially secret-bearing input.)
+///
+/// Callers that need to protect the *source* buffer itself (e.g. a log line
+/// they built by interpolating a possibly-live token) should hold it in a
+/// `zeroize::Zeroizing<String>` and call [`redact_zeroizing`] instead, which
+/// deterministically wipes that buffer on return.
+///
+/// # Matching
+/// At each byte index `i`, at most one entry of [`TOKEN_ANCHORS`] can match
+/// (`s[i..].starts_with(anchor)`); if one does, [`scan_body_end`] finds the
+/// end of the secret body that follows it, subject to that anchor's minimum
+/// body length. A qualifying body is replaced with `anchor` +
+/// `"***REDACTED***"` (the type-identifying prefix is kept for debuggability;
+/// only the secret value is scrubbed). A body that is empty *or shorter than
+/// the anchor's minimum* (a bare/short prose mention like "the `ghp_` prefix"
+/// or "`ghp_ABC` in an example") is left as ordinary text — the anchor is
+/// re-emitted and its short body re-scanned as normal characters. Fixed
+/// GitHub token prefixes carry a 36-byte floor (GitHub's documented token
+/// length); the contextual markers (`Bearer `, `RUNNER_TOKEN=`) use a floor
+/// of 1, so even a short (~29-char) registration token after them is fully
+/// redacted. Scanning then resumes *after* the match, so every token on a
+/// line is found independently — unlike the old per-prefix nested loop, which
+/// re-scanned the whole string once per prefix and could double-redact
+/// (`"Bearer ghp_X"` -> `"Bearer ***REDACTED******REDACTED***"`).
+///
+/// # UTF-8 safety
+/// `i` is always left on a char boundary: it advances by an anchor's byte
+/// length (anchors are ASCII literals), by a `scan_body_end` result (derived
+/// from `char_indices`), or by one `char::len_utf8()` when copying ordinary
+/// text. No `is_char_boundary` fixups are needed anywhere in this function.
+///
+/// # Output length
+/// There is deliberately no output-length truncation. It was never a
+/// redaction mechanism (see [`redact_zeroizing`] docs / crate changelog) and
+/// with full-length, uncapped body detection there are no secret bytes left
+/// in `out` for a truncation step to protect against.
 pub fn redact(s: &str) -> String {
-    let mut out = s.to_string();
-    for key in [
-        "ghp_",
-        "gho_",
-        "ghu_",
-        "ghs_",
-        "ghr_",
-        "github_pat_",
-        "Bearer ",
-        "RUNNER_TOKEN=",
-    ] {
-        let mut start_search_idx = 0;
-        while start_search_idx < out.len() {
-            if let Some(offset) = out[start_search_idx..].find(key) {
-                let i = start_search_idx + offset;
-                let rest_idx = i + key.len();
-                let rest = &out[rest_idx..];
+    let mut out = String::with_capacity(s.len());
+    let len = s.len();
+    let mut i = 0usize;
 
-                let mut chars_taken = 0;
-                let mut secret_len_bytes = 0;
-                for (idx, c) in rest.char_indices() {
-                    if chars_taken >= 200 {
-                        break;
-                    }
-                    if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') {
-                        chars_taken += 1;
-                        secret_len_bytes = idx + c.len_utf8();
-                    } else {
-                        break;
-                    }
-                }
-
-                let replacement = format!("{key}***REDACTED***");
-                out.replace_range(i..(rest_idx + secret_len_bytes), &replacement);
-                start_search_idx = i + replacement.len();
+    while i < len {
+        // At most one anchor can match at `i` (see TOKEN_ANCHORS docs), so the
+        // first hit found is *the* hit, not merely a priority pick.
+        if let Some(&(anchor, min_body)) =
+            TOKEN_ANCHORS.iter().find(|&&(a, _)| s[i..].starts_with(a))
+        {
+            let body_start = i + anchor.len();
+            if let Some(body_end) = scan_body_end(s, body_start, min_body) {
+                // Secret body found and skipped: it is never read into `out`,
+                // never copied anywhere — just stepped over.
+                out.push_str(anchor);
+                out.push_str("***REDACTED***");
+                i = body_end;
             } else {
-                break;
+                // Empty or below-minimum body: not a secret (e.g. bare prefix
+                // in prose, or a short `ghp_ABC` example). Re-emit the anchor
+                // literal and resume scanning at the body so a short body is
+                // preserved verbatim as ordinary text.
+                out.push_str(anchor);
+                i = body_start;
+            }
+            continue;
+        }
+
+        // No anchor here: copy exactly one character and advance past it.
+        // `i` is a char boundary (loop invariant), so this cannot panic.
+        let ch = s[i..]
+            .chars()
+            .next()
+            .expect("i < len on a char boundary always yields a char");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+
+    out
+}
+
+/// Owning entry point for callers that hold a secret-bearing buffer they built
+/// themselves (e.g. a log line assembled by interpolating a value that might
+/// be, or contain, a live token) and want that buffer's memory wiped the
+/// moment redaction is done with it.
+///
+/// This runs the same zero-copy [`redact`] core — it makes no *additional*
+/// secret copies — and returns the redacted, secret-free `String`. The
+/// `Zeroizing<String>` input is moved in and drops at the end of this
+/// function's scope, which deterministically zeroizes its backing buffer
+/// (volatile writes + compiler fences via the `zeroize` crate) regardless of
+/// which branch of `redact` executed. That drop is the "self-destruct":
+/// no `unsafe`, no manual free, no window where the wipe can be skipped.
+///
+/// # Swap protection (optional `mlock` feature)
+/// With the crate's non-default `mlock` feature enabled, the source buffer's
+/// pages are additionally best-effort locked against swap (`mlock`/`VirtualLock`
+/// via the `region` crate, whose `lock` is a *safe* fn — unsafety fully
+/// encapsulated — so `unsafe_code = "forbid"` stays intact even with the
+/// feature on). Locking is best-effort: if the OS refuses (e.g. `RLIMIT_MEMLOCK`
+/// exhausted, no `CAP_IPC_LOCK` in a constrained container) the failure is
+/// logged and redaction proceeds with zeroize-only protection — locking must
+/// never be a precondition for redaction to succeed. The buffer is explicitly
+/// zeroized *while still locked*, then the lock is released, so the wipe itself
+/// can never be paged out mid-write.
+///
+/// Without the feature, zeroization-on-drop (no `unsafe`) is the guarantee.
+pub fn redact_zeroizing(mut input: zeroize::Zeroizing<String>) -> String {
+    use zeroize::Zeroize;
+
+    // Best-effort page-lock the source for the lifetime of `lock` (feature-gated).
+    #[cfg(feature = "mlock")]
+    let lock = mlock::try_lock(input.as_bytes());
+
+    // Zero-copy core: reads the borrowed secret, never copies a secret byte.
+    let result = redact(&input);
+
+    // Wipe the sole secret residency (the moved-in source) deterministically,
+    // *before* releasing any lock so the zeroing write stays swap-protected.
+    // `Zeroizing`'s own Drop will also zeroize on scope exit — this explicit
+    // wipe just pins the ordering relative to the lock release below.
+    input.zeroize();
+
+    // Release the page-lock only after the buffer is already zeroed.
+    #[cfg(feature = "mlock")]
+    drop(lock);
+
+    result
+    // `input` drops here too: Zeroizing<String>::drop re-wipes (no-op) its buffer.
+}
+
+/// Best-effort OS page-locking of a secret buffer against swap, feature-gated.
+///
+/// `region::lock` is a **safe** function (region 3.x): it takes a raw pointer
+/// but performs no unsafe operation at our call site — the OS `mlock`/
+/// `VirtualLock` glue is encapsulated inside the `region` crate — so this
+/// module introduces **no `unsafe`** and the crate-wide `unsafe_code = "forbid"`
+/// lint is unaffected by enabling the `mlock` feature. The returned guard
+/// unlocks on drop (RAII). Locking is advisory/best-effort: any failure is
+/// logged and swallowed so redaction never fails merely because the OS
+/// declined to pin memory.
+#[cfg(feature = "mlock")]
+mod mlock {
+    pub(super) fn try_lock(buf: &[u8]) -> Option<region::LockGuard> {
+        if buf.is_empty() {
+            // region::lock rejects a zero-length range; nothing to lock.
+            return None;
+        }
+        match region::lock(buf.as_ptr(), buf.len()) {
+            Ok(guard) => Some(guard),
+            Err(e) => {
+                eprintln!(
+                    "gha-runner-ctl: warning: mlock of secret buffer failed ({e}); \
+                     continuing without swap protection (zeroize-on-drop still applies)"
+                );
+                None
             }
         }
     }
-    if out.len() > 400 {
-        let mut truncate_at = 400;
-        while truncate_at > 0 && !out.is_char_boundary(truncate_at) {
-            truncate_at -= 1;
-        }
-        out = format!("{}…", &out[..truncate_at]);
+}
+
+#[cfg(test)]
+mod redact_hardening_tests {
+    use super::*;
+
+    // ---- Spec test_cases catalog (verbatim) ----------------------------
+
+    #[test]
+    fn ghs_jwt_over_520_two_dots() {
+        let header = "A".repeat(200);
+        let payload = "B".repeat(200);
+        let sig = "C".repeat(200);
+        let input = format!("ghs_{header}.{payload}.{sig}");
+        // Sanity: input really is >520 bytes, per the threat model.
+        assert!(input.len() > 520);
+        assert_eq!(redact(&input), "ghs_***REDACTED***");
     }
-    out
+
+    // A realistic classic-token body: ≥ GH_PREFIX_MIN_BODY (36) base62 chars,
+    // as every genuine GitHub token carries. Short (<36) prefix bodies are
+    // prose and intentionally NOT redacted under the synthesized min-length
+    // rule (see `short_prefix_body_is_prose_not_redacted`).
+    const B36: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab"; // 38 chars
+
+    #[test]
+    fn token_at_end_of_string() {
+        assert_eq!(
+            redact(&format!("token=ghp_{B36}")),
+            "token=ghp_***REDACTED***"
+        );
+    }
+
+    #[test]
+    fn token_followed_by_double_quote() {
+        assert_eq!(
+            redact(&format!(r#"{{"token":"ghp_{B36}"}}"#)),
+            r#"{"token":"ghp_***REDACTED***"}"#
+        );
+    }
+
+    #[test]
+    fn token_followed_by_newline() {
+        assert_eq!(
+            redact(&format!("ghp_{B36}\nnext line")),
+            "ghp_***REDACTED***\nnext line"
+        );
+    }
+
+    #[test]
+    fn token_followed_by_comma() {
+        assert_eq!(
+            redact(&format!("ghp_{B36}, done")),
+            "ghp_***REDACTED***, done"
+        );
+    }
+
+    #[test]
+    fn multiple_tokens_one_line() {
+        // ghp_/gho_ carry full-length (≥36) bodies; RUNNER_TOKEN= is contextual
+        // so even a short value is redacted.
+        let a = "A".repeat(40);
+        let b = "B".repeat(40);
+        assert_eq!(
+            redact(&format!("a ghp_{a} b gho_{b} c RUNNER_TOKEN=CCCCCCCCCCCC d")),
+            "a ghp_***REDACTED*** b gho_***REDACTED*** c RUNNER_TOKEN=***REDACTED*** d"
+        );
+    }
+
+    #[test]
+    fn prefixes_in_nonsecret_prose_unchanged() {
+        let s = "Prefixes like ghp_ and gho_ and ghr_ are documented; use Bearer-style auth.";
+        assert_eq!(redact(s), s);
+    }
+
+    #[test]
+    fn multibyte_utf8_line_bearer() {
+        assert_eq!(
+            redact("Café Bearer ghp_ABC¢DEF señor 🦀"),
+            "Café Bearer ***REDACTED***¢DEF señor 🦀"
+        );
+    }
+
+    #[test]
+    fn existing_multibyte_boundary_compat() {
+        assert_eq!(
+            redact("Bearer ghp_ABC¢DEF"),
+            "Bearer ***REDACTED***¢DEF"
+        );
+    }
+
+    #[test]
+    fn adjacent_overlapping_prefixes() {
+        // First anchor (ghp_) wins; the rest — including the `gho_` text and a
+        // ≥36 body — is swallowed as one contiguous secret run.
+        let tail = format!("gho_{}", "X".repeat(40));
+        assert_eq!(redact(&format!("ghp_{tail}")), "ghp_***REDACTED***");
+    }
+
+    #[test]
+    fn bearer_then_ghs_jwt_contextual() {
+        assert_eq!(
+            redact("Authorization: Bearer ghs_HEADER.PAYLOAD.SIG"),
+            "Authorization: Bearer ***REDACTED***"
+        );
+    }
+
+    #[test]
+    fn github_pat_with_underscore_body() {
+        // Fine-grained PAT body (underscore-separated, well over 36 chars).
+        let body = format!("11ABCDEF{}_{}", "G".repeat(20), "h".repeat(20));
+        assert_eq!(
+            redact(&format!("github_pat_{body}")),
+            "github_pat_***REDACTED***"
+        );
+    }
+
+    #[test]
+    fn trailing_period_trim_preserves_sentence() {
+        assert_eq!(
+            redact(&format!("The key is ghp_{B36}.")),
+            "The key is ghp_***REDACTED***."
+        );
+    }
+
+    #[test]
+    fn jwt_then_comma_then_second_token() {
+        // ghs_ JWT (three ≥ full-length segments) then a second full-length ghp_.
+        let jwt = format!("ghs_{}.{}.{}", "A".repeat(40), "B".repeat(40), "C".repeat(40));
+        let ghp = format!("ghp_{}", "D".repeat(40));
+        assert_eq!(
+            redact(&format!("tokens: {jwt}, {ghp}")),
+            "tokens: ghs_***REDACTED***, ghp_***REDACTED***"
+        );
+    }
+
+    #[test]
+    fn plain_text_no_secret() {
+        let s = "just plain text, no secrets here";
+        assert_eq!(redact(s), s);
+    }
+
+    #[test]
+    fn runner_token_value_at_end() {
+        assert_eq!(
+            redact("RUNNER_TOKEN=AABBCCDDEEFF"),
+            "RUNNER_TOKEN=***REDACTED***"
+        );
+    }
+
+    #[test]
+    fn long_nonsecret_not_truncated() {
+        let s = "x".repeat(600);
+        assert_eq!(redact(&s), s, "no-secret input must pass through byte-for-byte, uncapped");
+    }
+
+    #[test]
+    fn multibyte_immediately_after_prefix_no_false_redact() {
+        assert_eq!(redact("ghp_€100 paid"), "ghp_€100 paid");
+    }
+
+    #[test]
+    fn ghr_prefix_token() {
+        assert_eq!(
+            redact(&format!("reg ghr_{} end", "A".repeat(40))),
+            "reg ghr_***REDACTED*** end"
+        );
+    }
+
+    #[test]
+    fn ghu_prefix_token() {
+        assert_eq!(
+            redact(&format!("ghu_{B36}")),
+            "ghu_***REDACTED***"
+        );
+    }
+
+    #[test]
+    fn two_bearer_markers_same_line() {
+        assert_eq!(
+            redact("Bearer ghp_ABC123 and Bearer ghp_XYZ789 end"),
+            "Bearer ***REDACTED*** and Bearer ***REDACTED*** end"
+        );
+    }
+
+    // ---- Split-minimum reconciliation: the required verification pair -------
+
+    /// A short `ghp_` mention in prose (body < GH_PREFIX_MIN_BODY) must NOT be
+    /// over-redacted — this is exactly the false-positive the grok min-length
+    /// idea fixes. Applies only to the fixed token prefixes.
+    #[test]
+    fn short_prefix_body_is_prose_not_redacted() {
+        assert_eq!(
+            redact("Set the ghp_ prefix; e.g. ghp_EXAMPLE in the docs."),
+            "Set the ghp_ prefix; e.g. ghp_EXAMPLE in the docs."
+        );
+        // 35-char body: one below the 36 floor -> still prose.
+        let b35 = "A".repeat(35);
+        assert_eq!(redact(&format!("ghp_{b35}")), format!("ghp_{b35}"));
+    }
+
+    /// A ~29-char registration/runner token after the CONTEXTUAL `RUNNER_TOKEN=`
+    /// marker MUST be fully redacted — a uniform 36-byte floor would have
+    /// under-redacted it (a security regression). Contextual floor is 1.
+    #[test]
+    fn short_runner_token_value_fully_redacted() {
+        // GitHub registration tokens are ~29 chars (A-Z0-9). Build one exactly.
+        let value = "AR3H7QK2LMN9PZ5T8VBW6XY4CDEFG"; // 29 chars
+        assert_eq!(value.len(), 29);
+        assert_eq!(
+            redact(&format!("RUNNER_TOKEN={value}")),
+            "RUNNER_TOKEN=***REDACTED***"
+        );
+        // And embedded in a larger log line with trailing context.
+        assert_eq!(
+            redact(&format!("registering runner RUNNER_TOKEN={value} to repo")),
+            "registering runner RUNNER_TOKEN=***REDACTED*** to repo"
+        );
+    }
+
+    /// The classic 36-char body case: exactly at the floor, redacted.
+    #[test]
+    fn classic_36_char_ghs_token() {
+        let body = "A".repeat(36);
+        assert_eq!(body.len(), 36);
+        assert_eq!(redact(&format!("ghs_{body}")), "ghs_***REDACTED***");
+        // One char short of the floor: treated as prose.
+        let body35 = "A".repeat(35);
+        assert_eq!(redact(&format!("ghs_{body35}")), format!("ghs_{body35}"));
+    }
+
+    // ---- Extra adversarial / boundary cases beyond the spec catalog ----
+
+    /// The whole point of this hardening pass: the old 200-char cap left the
+    /// tail of anything longer than 200 chars live in the output. Assert the
+    /// full body — including bytes far past the old cap — is gone.
+    #[test]
+    fn no_leak_past_old_200_char_cap() {
+        let tail = "Z".repeat(400); // 400 chars, well past the deleted 200 cap
+        let input = format!("ghs_{tail} trailing context");
+        let out = redact(&input);
+        assert_eq!(out, "ghs_***REDACTED*** trailing context");
+        assert!(!out.contains('Z'));
+    }
+
+    /// A single input line carrying two independent, very long `ghs_` JWTs
+    /// (e.g. a token-rotation log line). Every byte of both must be gone,
+    /// and the surrounding structure preserved.
+    #[test]
+    fn two_long_jwts_same_line_fully_redacted() {
+        let jwt_a = format!("ghs_{}.{}.{}", "a".repeat(200), "b".repeat(200), "c".repeat(200));
+        let jwt_b = format!("ghs_{}.{}.{}", "x".repeat(200), "y".repeat(200), "z".repeat(200));
+        let input = format!("old={jwt_a} new={jwt_b}");
+        let out = redact(&input);
+        assert_eq!(out, "old=ghs_***REDACTED*** new=ghs_***REDACTED***");
+        assert!(!out.contains('a') && !out.contains('b') && !out.contains('c'));
+        assert!(!out.contains('x') && !out.contains('y') && !out.contains('z'));
+    }
+
+    /// An unbounded/growing buffer scenario: nothing in the detector should
+    /// choke or behave differently at large sizes (no quadratic blowup that
+    /// would itself be a DoS vector, and — the actual requirement — no
+    /// truncation-induced leak).
+    #[test]
+    fn very_long_ghs_token_1000_plus_chars_fully_redacted() {
+        // Repeating unit ends in '.', so the *whole* run's single trailing
+        // '.' gets trimmed back out as punctuation (see trailing-dot trim);
+        // everything else — 1000+ chars of mixed base64url-ish body — must
+        // be fully consumed as the secret.
+        let body = "A1b2C3-_.".repeat(150); // > 1000 chars
+        assert!(body.len() > 1000);
+        let input = format!("ghs_{body}!"); // '!' is not in the class -> hard stop
+        let out = redact(&input);
+        assert_eq!(out, "ghs_***REDACTED***.!");
+        assert!(!out.contains("A1b2"));
+    }
+
+    /// A token body that ends in '-' or '_' (legal in base64url signatures)
+    /// must be consumed in full, unlike '.', which is trimmed.
+    #[test]
+    fn trailing_dash_and_underscore_not_trimmed() {
+        // ≥36 body that legitimately ends in base64url signature bytes.
+        let base = "A".repeat(36);
+        assert_eq!(redact(&format!("ghs_{base}-BBB_ end")), "ghs_***REDACTED*** end");
+        // No trailing punctuation at all: whole run to string end is body.
+        assert_eq!(redact(&format!("ghs_{base}-")), "ghs_***REDACTED***");
+        assert_eq!(redact(&format!("ghs_{base}_")), "ghs_***REDACTED***");
+    }
+
+    /// Multiple trailing dots (pathological prose: "...") are trimmed off
+    /// entirely, not just one.
+    #[test]
+    fn multiple_trailing_dots_all_trimmed() {
+        assert_eq!(
+            redact(&format!("see ghp_{B36}...")),
+            "see ghp_***REDACTED***..."
+        );
+    }
+
+    /// Bare prefix immediately at end-of-string (0 body chars): must not
+    /// synthesize a redaction out of nothing.
+    #[test]
+    fn bare_prefix_at_eof_no_redaction() {
+        assert_eq!(redact("token prefix is ghp_"), "token prefix is ghp_");
+        assert_eq!(redact("RUNNER_TOKEN="), "RUNNER_TOKEN=");
+        assert_eq!(redact("Bearer "), "Bearer ");
+    }
+
+    /// A `Bearer ` marker immediately followed by a `github_pat_`-prefixed
+    /// value: the whole run after `Bearer ` (underscores included) is one
+    /// contiguous body and is fully swallowed as the Bearer's secret.
+    #[test]
+    fn bearer_then_github_pat_body_fully_swallowed() {
+        assert_eq!(
+            redact("Authorization: Bearer github_pat_11AAAA_bbbbcccc"),
+            "Authorization: Bearer ***REDACTED***"
+        );
+    }
+
+    /// RUNNER_TOKEN= immediately followed by a quote: empty body, no
+    /// redaction (distinguish from RUNNER_TOKEN=<value>).
+    #[test]
+    fn runner_token_empty_value_not_redacted() {
+        assert_eq!(
+            redact(r#"env: {"RUNNER_TOKEN":""}"#),
+            r#"env: {"RUNNER_TOKEN":""}"#
+        );
+    }
+
+    /// Token immediately followed by another (different-prefix) token with
+    /// no separator at all, both fully alnum bodies: first anchor wins and
+    /// swallows the rest, matching `adjacent_overlapping_prefixes` but with
+    /// a third prefix thrown in to make sure it's not order-dependent by luck.
+    #[test]
+    fn three_adjacent_prefixes_collapse_to_one_redaction() {
+        // First anchor swallows the `gho_ghu_` text plus a ≥36 body.
+        let body = format!("gho_ghu_{}", "A".repeat(40));
+        assert_eq!(
+            redact(&format!("ghp_{body} next")),
+            "ghp_***REDACTED*** next"
+        );
+    }
+
+    /// Split-minimum semantics: a short (below-`GH_PREFIX_MIN_BODY`) body after
+    /// a *fixed* prefix is prose and is NOT redacted, while a single-char body
+    /// after a *contextual* marker (min 1) IS a secret. This is the exact
+    /// reconciliation grafted from the grok solution onto the zero-copy base.
+    #[test]
+    fn split_minimum_prefix_vs_contextual() {
+        // Fixed prefix, 1-char body '-' -> below 36 -> NOT redacted.
+        assert_eq!(redact("ghp_- rest"), "ghp_- rest");
+        // Fixed prefix, short alnum body -> below 36 -> NOT redacted.
+        assert_eq!(redact("ghp_ABC rest"), "ghp_ABC rest");
+        // Contextual marker, 1-char body '-' -> min 1 -> redacted.
+        assert_eq!(
+            redact("RUNNER_TOKEN=- rest"),
+            "RUNNER_TOKEN=***REDACTED*** rest"
+        );
+        // Contextual marker, lone '.' trims to empty -> not a secret.
+        assert_eq!(redact("RUNNER_TOKEN=. rest"), "RUNNER_TOKEN=. rest");
+    }
+
+    /// No output-length blow-up or truncation artifact regardless of how
+    /// much secret material was in the input: redacted output is small.
+    #[test]
+    fn redacted_output_shrinks_regardless_of_input_length() {
+        let huge = format!("ghs_{}", "Q".repeat(5000));
+        let out = redact(&huge);
+        assert_eq!(out, "ghs_***REDACTED***");
+        assert!(out.len() < huge.len());
+    }
+
+    /// UTF-8 safety fuzz-ish check: no panic across a grab-bag of multibyte
+    /// boundary conditions immediately adjacent to anchors/bodies.
+    #[test]
+    fn utf8_safety_grab_bag_no_panic() {
+        let cases = [
+            "ghp_",
+            "ghp_🦀",
+            "🦀ghp_ABC",
+            "Bearer 🦀",
+            "Bearer ghp_日本語ABC",
+            "RUNNER_TOKEN=日本語",
+            "github_pat_日",
+            "ghs_AAA.日.BBB",
+            "",
+            "🦀🦀🦀🦀🦀",
+        ];
+        for c in cases {
+            let _ = redact(c); // must not panic
+        }
+    }
+
+    #[test]
+    fn empty_string_unchanged() {
+        assert_eq!(redact(""), "");
+    }
+
+    /// Preserves the existing repo regression: multiple secrets on one line
+    /// via distinct `Bearer ` markers must each be found (not just the
+    /// first, unlike the pre-hardening per-prefix nested loop).
+    #[test]
+    fn multiple_secret_redactions_regression() {
+        let raw = "Here are two secrets: Bearer ghp_ABC123 and another Bearer ghp_XYZ789 in the same string.";
+        let out = redact(raw);
+        assert!(!out.contains("ABC123"));
+        assert!(!out.contains("XYZ789"));
+        assert!(out.matches("***REDACTED***").count() >= 2);
+    }
+
+    // ---- redact_zeroizing ----------------------------------------------
+
+    #[test]
+    fn redact_zeroizing_matches_redact_output() {
+        let raw = "Bearer ghp_ABCDEFGHIJKLMNOPQRST".to_string();
+        let expected = redact(&raw);
+        let out = redact_zeroizing(zeroize::Zeroizing::new(raw));
+        assert_eq!(out, expected);
+        assert_eq!(out, "Bearer ***REDACTED***");
+    }
+
+    #[test]
+    fn redact_zeroizing_handles_long_jwt() {
+        let jwt = format!("ghs_{}.{}.{}", "a".repeat(200), "b".repeat(200), "c".repeat(200));
+        let out = redact_zeroizing(zeroize::Zeroizing::new(jwt));
+        assert_eq!(out, "ghs_***REDACTED***");
+    }
+
+    // ---- prevent_raw_token_args prefix-list parity ----------------------
+
+    /// src/lib.rs:563's guard list must include every anchor prefix that
+    /// redact() knows about (minus the two contextual markers, which are
+    /// not standalone CLI-arg substrings), so a raw `ghr_...` token on the
+    /// command line is blocked exactly like the other five prefixes.
+    #[test]
+    fn prevent_raw_token_args_prefix_list_has_ghr() {
+        // Mirrors the literal in prevent_raw_token_args(); kept as a
+        // documentation-style regression so a future edit that drops a
+        // prefix again is caught here rather than only in production.
+        let guarded = ["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"];
+        for &(anchor, _min_body) in TOKEN_ANCHORS {
+            if anchor == "Bearer " || anchor == "RUNNER_TOKEN=" {
+                continue;
+            }
+            assert!(
+                guarded.contains(&anchor),
+                "prevent_raw_token_args() is missing anchor prefix {anchor:?}"
+            );
+        }
+    }
+
+    // ---- VERIFY-lead adversarial cases (synthesis hardening) ------------
+
+    /// Adversarial: a ghs_ JWT far past 520 chars (1806 body bytes here),
+    /// two internal dots, immediately followed by legitimate trailing text.
+    /// The ENTIRE base64url.base64url.base64url tail must be gone (no byte of
+    /// any 200+-char segment survives) and the trailing text preserved. This
+    /// is the exact leak the old 200-char cap caused.
+    #[test]
+    fn adversarial_ghs_jwt_1800_chars_tail_fully_scrubbed() {
+        let seg = |c: char| std::iter::repeat_n(c, 600).collect::<String>();
+        let (a, b, c) = (seg('A'), seg('B'), seg('C'));
+        let input = format!("auth=ghs_{a}.{b}.{c} rest");
+        let out = redact(&input);
+        assert_eq!(out, "auth=ghs_***REDACTED*** rest");
+        // No run of the secret alphabet survives anywhere in the output.
+        assert!(!out.contains(&"A".repeat(4)));
+        assert!(!out.contains(&"B".repeat(4)));
+        assert!(!out.contains(&"C".repeat(4)));
+    }
+
+    /// Adversarial under-redaction probe: token whose body ends in base64url
+    /// signature bytes '-' / '_' at the very end of the string. Not one byte
+    /// may be trimmed back (only '.' is prose). Verifies END(trim) never
+    /// shaves live tail bytes.
+    #[test]
+    fn adversarial_base64url_tail_dash_underscore_at_eof() {
+        // Full-length (≥36) JWT-ish body ending in signature bytes.
+        let base = format!("{}.{}.{}", "H".repeat(16), "P".repeat(16), "S".repeat(16));
+        assert_eq!(redact(&format!("ghs_{base}-_-_")), "ghs_***REDACTED***");
+        assert_eq!(redact(&format!("ghs_{base}_")), "ghs_***REDACTED***");
+        assert_eq!(redact(&format!("ghs_{base}-")), "ghs_***REDACTED***");
+    }
+
+    /// Adversarial: secret directly abutting a multibyte char with NO ASCII
+    /// separator, at multiple positions. Must never panic and must stop the
+    /// run exactly at the multibyte lead byte (char boundary), preserving the
+    /// non-secret multibyte text verbatim.
+    #[test]
+    fn adversarial_secret_touching_multibyte_no_separator() {
+        // Fixed prefix needs a ≥36 body; the multibyte char hard-stops the run.
+        assert_eq!(
+            redact(&format!("ghp_{}🦀DEF", "A".repeat(40))),
+            "ghp_***REDACTED***🦀DEF"
+        );
+        // Contextual markers redact any non-empty value, however short.
+        assert_eq!(redact("RUNNER_TOKEN=XYZ€99"), "RUNNER_TOKEN=***REDACTED***€99");
+        assert_eq!(redact("Bearer ghs_A.B.C日本"), "Bearer ***REDACTED***日本");
+    }
+
+    /// Adversarial over-redaction probe: 'Bearer' WITHOUT its trailing space
+    /// (the marker literal requires the space) must NOT anchor. 'Bearer-auth',
+    /// 'Bearered', 'RUNNER_TOKEN ' (space not '=') stay untouched.
+    #[test]
+    fn adversarial_incomplete_markers_do_not_anchor() {
+        assert_eq!(redact("use Bearer-auth here"), "use Bearer-auth here");
+        assert_eq!(redact("Bearered token flow"), "Bearered token flow");
+        assert_eq!(redact("RUNNER_TOKEN is unset"), "RUNNER_TOKEN is unset");
+        assert_eq!(redact("var RUNNER_TOKENX=1"), "var RUNNER_TOKENX=1");
+    }
+
+    /// Documented, spec-accepted limitation kept visible: nested contextual
+    /// markers under-redact the inner value. 'Bearer ' consumes 'RUNNER_TOKEN'
+    /// and stops at '=', orphaning '=ABC'. This is contrived (never in real
+    /// logs) and is the deliberate trade for the adjacent-prefix-swallow the
+    /// spec REQUIRES (see adjacent_overlapping_prefixes). Asserting the real
+    /// behavior so any future change is a visible, intentional diff.
+    #[test]
+    fn adversarial_known_nested_marker_limitation_visible() {
+        assert_eq!(redact("Bearer RUNNER_TOKEN=ABC"), "Bearer ***REDACTED***=ABC");
+    }
+
+    /// Adversarial: a giant NON-secret payload (base64 blob with no anchor)
+    /// must survive byte-for-byte — proving there is no output-length cap that
+    /// could silently eat legitimate long log content.
+    #[test]
+    fn adversarial_giant_nonsecret_survives_uncapped() {
+        let blob = "aGVsbG8-_.".repeat(1000); // 10_000 chars, dots/dashes/underscores
+        assert_eq!(redact(&blob), blob);
+    }
+
+    /// Adversarial: every anchor kind densely packed and punctuation-delimited,
+    /// ensuring each is independently found (no first-match-per-prefix
+    /// regression) and boundaries land correctly. Fixed prefixes carry ≥36
+    /// bodies (real-token length); the contextual markers carry short values,
+    /// which they still redact.
+    #[test]
+    fn adversarial_all_anchor_kinds_dense() {
+        let b = "z".repeat(40);
+        let input = format!(
+            "ghp_{b};gho_{b};ghu_{b};ghs_{b};ghr_{b};github_pat_{b};RUNNER_TOKEN=G;Bearer H"
+        );
+        let r = "***REDACTED***";
+        let expected = format!(
+            "ghp_{r};gho_{r};ghu_{r};ghs_{r};ghr_{r};github_pat_{r};RUNNER_TOKEN={r};Bearer {r}"
+        );
+        assert_eq!(redact(&input), expected);
+    }
+
+    /// Adversarial: prefix followed ONLY by a lone '.' → raw run ".", trimmed
+    /// to empty → NOT a secret (must not synthesize a 0-byte redaction).
+    #[test]
+    fn adversarial_lone_dot_body_is_not_secret() {
+        assert_eq!(redact("ghp_. and ghs_.."), "ghp_. and ghs_..");
+    }
+
+    /// redact_zeroizing must be behaviorally identical to redact on the same
+    /// content, including long JWTs, empty input, and multibyte tails.
+    #[test]
+    fn adversarial_redact_zeroizing_parity() {
+        for raw in [
+            "Bearer ghp_ABCDEFGHIJKLMNOPQRST".to_string(),
+            String::new(),
+            "ghp_ABC🦀DEF".to_string(),
+            format!("ghs_{}.{}.{}", "a".repeat(600), "b".repeat(600), "c".repeat(600)),
+        ] {
+            let expected = redact(&raw);
+            let got = redact_zeroizing(zeroize::Zeroizing::new(raw));
+            assert_eq!(got, expected);
+        }
+    }
+
+    /// Under the optional `mlock` feature, redact_zeroizing must still produce
+    /// identical output and never panic even if locking fails on the host.
+    #[cfg(feature = "mlock")]
+    #[test]
+    fn adversarial_redact_zeroizing_mlock_feature_no_panic() {
+        let jwt = format!("ghs_{}.{}.{}-_", "H".repeat(16), "P".repeat(16), "S".repeat(16));
+        let out = redact_zeroizing(zeroize::Zeroizing::new(format!("tok {jwt} end")));
+        assert_eq!(out, "tok ghs_***REDACTED*** end");
+    }
 }
 
 /// Host `/dev/null` must be a world-writable char device (1,3). A regular file

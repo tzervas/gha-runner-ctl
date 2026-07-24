@@ -26,9 +26,12 @@ fn redacts_bearer() {
 
 #[test]
 fn redacts_first_ghp_secret() {
-    // redact() currently replaces the first match per key prefix (not all occurrences).
-    let s = redact("Here is token1 ghp_ABCDEFGHIJKLMNOP and more text.");
-    assert!(!s.contains("ABCDEFGHIJKLMNOP"));
+    // A full-length (>=36 body) ghp_ token is redacted in place; the prefix is
+    // kept and only the secret body is scrubbed. (Short <36 prefix bodies are
+    // treated as prose under the hardened min-length rule and left intact.)
+    let body = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab"; // 38 chars
+    let s = redact(&format!("Here is token1 ghp_{body} and more text."));
+    assert!(!s.contains(body));
     assert!(s.contains("ghp_***REDACTED***"));
 }
 
