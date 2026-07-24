@@ -1,0 +1,19 @@
+{
+  "images": {
+    "ubuntu-24.04": "docker.io/library/ubuntu:24.04",
+    "ubuntu-22.04": "docker.io/library/ubuntu:22.04",
+    "debian-bookworm": "docker.io/library/debian:bookworm",
+    "debian-12": "docker.io/library/debian:bookworm",
+    "rocky-9": "docker.io/library/rockylinux:9",
+    "fedora-40": "docker.io/library/fedora:40",
+    "alpine-3.20": "docker.io/library/alpine:3.20",
+    "custom-ci": "ghcr.io/example/ci-base:2026.07"
+  },
+  "arches": {
+    "arm64": "linux/arm64",
+    "aarch64": "linux/arm64",
+    "riscv64": "linux/riscv64",
+    "x86": "linux/386",
+    "x64": "linux/amd64"
+  }
+}

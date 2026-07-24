@@ -10,8 +10,14 @@
 //! multiple ephemeral workers sized from job complexity within a host budget
 //! (default 8 CPU / 8 GiB shared across all managers).
 
+mod image_arch;
 mod pool;
 
+pub use image_arch::{
+    binfmt_lists_arch, binfmt_missing_error, ensure_binfmt_for_arch, extra_image_arch_labels,
+    load_image_map, parse_image_map, podman_platform_args, resolve_arch_from_labels,
+    resolve_job_image_arch, ImageMap, JobImageArch, TargetArch,
+};
 pub use pool::{
     demand_empty_confirmed, empty_sweep_ticks, fit_to_budget, format_cpus, format_memory_mib,
     is_busy, parse_cpus_f64, parse_memory_mib, plan_scale, resources_for_tier, size_for_job,
@@ -336,6 +342,16 @@ pub struct Cli {
     /// Enable dynamic multi-worker pool sizing (default true).
     #[arg(long, env = "GHA_POOL_MODE", default_value = "dynamic", global = true)]
     pool_mode: String,
+
+    /// Path to label→image map (JSON or minimal TOML). Merged over built-in distro defaults.
+    /// See docs/WORK_IMAGES.md and packaging/image-map.example.json. Issue #28.
+    #[arg(long, env = "GHA_IMAGE_MAP", global = true)]
+    image_map: Option<PathBuf>,
+
+    /// Podman `--platform` for work containers (e.g. `linux/arm64`). Usually set from
+    /// job arch labels at spawn; CLI/env override applies to single-container `up`.
+    #[arg(long, env = "GHA_PLATFORM", global = true)]
+    platform: Option<String>,
 }
 
 #[derive(Debug, Subcommand, Clone)]
@@ -1166,6 +1182,21 @@ fn validate_cli(cli: &Cli) -> Result<(), String> {
         if tok.len() < 16 {
             return Err("GHA_WAKE_TOKEN must be at least 16 characters when set".into());
         }
+    }
+    if let Some(p) = cli.platform.as_ref() {
+        let p = p.trim();
+        if p.is_empty()
+            || p.len() > 64
+            || !p
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.'))
+        {
+            return Err("invalid --platform (expected e.g. linux/arm64)".into());
+        }
+    }
+    if let Some(path) = cli.image_map.as_ref() {
+        // Validate map is readable/parseable early (listen/up/prepare).
+        load_image_map(Some(path.as_path()))?;
     }
     Ok(())
 }
@@ -2340,7 +2371,27 @@ fn prepare_build_image(cli: &Cli) -> Result<(), String> {
 }
 
 fn ensure_image_present(image: &str, pull: &PullPolicy) -> Result<(), String> {
+    ensure_image_present_platform(image, pull, None)
+}
+
+/// Ensure image is local; when `platform` is set, pull with `--platform` so the
+/// correct arch manifest is fetched for cross-arch emulation (#28).
+fn ensure_image_present_platform(
+    image: &str,
+    pull: &PullPolicy,
+    platform: Option<&str>,
+) -> Result<(), String> {
     let exists = podman(&["image", "exists", image]).is_ok();
+    let pull_with_platform = |img: &str| -> Result<(), String> {
+        if let Some(plat) = platform {
+            if !plat.is_empty() {
+                eprintln!("prepare: pulling {img} --platform {plat}");
+                return podman(&["pull", "--platform", plat, img]).map(|_| ());
+            }
+        }
+        eprintln!("prepare: pulling {img}");
+        podman(&["pull", img]).map(|_| ())
+    };
     match pull {
         PullPolicy::Never => {
             if !exists {
@@ -2353,17 +2404,17 @@ fn ensure_image_present(image: &str, pull: &PullPolicy) -> Result<(), String> {
         }
         PullPolicy::Missing => {
             if exists {
+                // Local tag may be host-arch only; `podman run --platform` + --pull=missing
+                // fetches the right manifest at spawn when needed.
                 eprintln!("prepare: image {image} already present (pull=missing)");
                 Ok(())
             } else {
-                eprintln!("prepare: pulling {image} (pull=missing)");
-                podman(&["pull", image])?;
+                pull_with_platform(image)?;
                 Ok(())
             }
         }
         PullPolicy::Always => {
-            eprintln!("prepare: pulling {image} (pull=always)");
-            podman(&["pull", image])?;
+            pull_with_platform(image)?;
             Ok(())
         }
     }
@@ -2677,6 +2728,25 @@ fn up(cli: &Cli) -> Result<(), String> {
     if matches!(cli.scope, Scope::User) && cli.repo.is_none() {
         return Err("user batch: no active repo with demand (listen selects it)".into());
     }
+    // Explicit GHA_PLATFORM / --platform: refuse when binfmt cannot run that arch.
+    if let Some(plat) = cli.platform.as_deref() {
+        let host = TargetArch::host();
+        let target = match plat {
+            "linux/amd64" | "linux/x86_64" => Some(TargetArch::Amd64),
+            "linux/arm64" | "linux/aarch64" => Some(TargetArch::Arm64),
+            "linux/arm/v7" | "linux/arm" => Some(TargetArch::Arm),
+            "linux/riscv64" => Some(TargetArch::Riscv64),
+            "linux/386" => Some(TargetArch::X86),
+            "linux/s390x" => Some(TargetArch::S390x),
+            "linux/ppc64le" => Some(TargetArch::Ppc64le),
+            _ => None,
+        };
+        if let Some(arch) = target {
+            if arch != host {
+                ensure_binfmt_for_arch(arch, true, None)?;
+            }
+        }
+    }
 
     let ephemeral = effective_ephemeral(cli);
     // Retain reuse: if we already have runner config on the volume for this repo,
@@ -2704,10 +2774,12 @@ fn up(cli: &Cli) -> Result<(), String> {
     let img_mode = effective_image_mode(&cli.image_mode, &cli.image);
     let pull_arg = work_image_pull_arg(cli);
     eprintln!(
-        "up: scope={:?} mode={:?} image_mode={img_mode:?} pull={pull_arg} ephemeral={ephemeral} user={} url={}",
+        "up: scope={:?} mode={:?} image_mode={img_mode:?} pull={pull_arg} platform={:?} ephemeral={ephemeral} user={} image={} url={}",
         cli.scope,
         cli.mode,
+        cli.platform,
         cli.runner_user,
+        cli.image,
         github_url(cli)
     );
     let env_path_str = env_path.to_str().ok_or("env path not utf-8")?.to_string();
@@ -2730,9 +2802,16 @@ fn up(cli: &Cli) -> Result<(), String> {
         )
     });
 
-    let mut args: Vec<&str> = vec![
-        "run",
-        "-d",
+    // Cross-arch: --platform before image (issue #28). Empty when native / unset.
+    let platform_owned: Vec<String> = podman_platform_args(cli.platform.as_deref());
+    let platform_refs: Vec<&str> = platform_owned.iter().map(String::as_str).collect();
+
+    let mut args: Vec<&str> = Vec::with_capacity(48);
+    args.push("run");
+    args.push("-d");
+    // Platform must apply to the create/pull of this container.
+    args.extend_from_slice(&platform_refs);
+    args.extend_from_slice(&[
         "--name",
         cli.container.as_str(),
         "--cpus",
@@ -2760,7 +2839,7 @@ fn up(cli: &Cli) -> Result<(), String> {
         ret_kv.as_str(),
         "-v",
         vol.as_str(),
-    ];
+    ]);
     if let Some(m) = entrypoint_mount.as_ref() {
         args.push("-v");
         args.push(m.as_str());
@@ -3838,9 +3917,19 @@ fn recover(cli: &Cli, prune_exited: bool, json: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// Merge fleet base labels with job-requested size/capability labels + tier tag.
+/// Merge fleet base labels with job-requested size/capability/image/arch labels + tier tag.
 /// GitHub requires the runner to advertise every `runs-on` label.
 pub fn runner_labels_for_job(base_labels: &str, job_labels: &[String], tier: SizeTier) -> String {
+    runner_labels_for_job_with_map(base_labels, job_labels, tier, None)
+}
+
+/// Like [`runner_labels_for_job`], plus image/arch labels resolved from the map (#28).
+pub fn runner_labels_for_job_with_map(
+    base_labels: &str,
+    job_labels: &[String],
+    tier: SizeTier,
+    resolved: Option<&JobImageArch>,
+) -> String {
     use std::collections::BTreeSet;
     let mut set: BTreeSet<String> = base_labels
         .split(',')
@@ -3855,7 +3944,7 @@ pub fn runner_labels_for_job(base_labels: &str, job_labels: &[String], tier: Siz
         if l.is_empty() || !is_safe_ident(&l) {
             continue;
         }
-        // Only capability/size extras — never drop self-hosted/linux/x64/podman from base.
+        // Size / GPU capability extras.
         if matches!(
             l.as_str(),
             "micro"
@@ -3877,6 +3966,41 @@ pub fn runner_labels_for_job(base_labels: &str, job_labels: &[String], tier: Siz
             || l.starts_with("size-")
         {
             set.insert(l);
+            continue;
+        }
+        // Arch tokens (arm64, riscv64, …) — advertised so matrix cells match.
+        if TargetArch::from_label(&l).is_some() {
+            set.insert(l);
+            continue;
+        }
+        // Distro / image-map keys present on the job (e.g. ubuntu-24.04).
+        // We re-check against resolved image_label when available; otherwise accept
+        // safe idents that look like distro tags (contain a digit or known prefix).
+        if let Some(r) = resolved {
+            if r.image_label.as_deref() == Some(l.as_str()) {
+                set.insert(l);
+            }
+        }
+    }
+    if let Some(r) = resolved {
+        for extra in extra_image_arch_labels(r) {
+            if is_safe_ident(&extra) {
+                set.insert(extra);
+            }
+        }
+        // When advertising a non-host arch, drop conflicting host arch from base
+        // so the runner is not dual-labelled x64+arm64 unless the job asked for both.
+        if let Some(arch) = r.arch {
+            if arch != TargetArch::Amd64 {
+                set.remove("x64");
+                set.remove("amd64");
+                set.remove("x86_64");
+            }
+            if arch != TargetArch::Arm64 {
+                set.remove("arm64");
+                set.remove("aarch64");
+            }
+            set.insert(arch.label().to_string());
         }
     }
     set.into_iter().collect::<Vec<_>>().join(",")
@@ -3920,6 +4044,16 @@ fn spawn_worker_with_resources(
     cpus: f64,
     memory_mib: u64,
 ) -> Result<bool, String> {
+    // Per-job image + arch from runs-on labels (issue #28). No change when absent.
+    // Lives in the shared spawn path so both plan_scale spawns and live-fit spawns
+    // resolve image/arch identically.
+    let map = load_image_map(base.image_map.as_deref())?;
+    let resolved = resolve_job_image_arch(&job.labels, &map, &base.image);
+    if resolved.needs_emulation {
+        if let Some(arch) = resolved.arch {
+            ensure_binfmt_for_arch(arch, true, None)?;
+        }
+    }
     let worker_id = format!("{}-w{slot}", base.runner_name);
     let container = format!("{}-w{slot}", base.container);
     let volume = format!("{container}-data");
@@ -3945,14 +4079,42 @@ fn spawn_worker_with_resources(
     unit.runner_name = worker_id.clone();
     unit.cpus = format_cpus(cpus);
     unit.memory = format_memory_mib(memory_mib);
-    // Register base fleet labels + job-requested size/capability labels so
-    // `runs-on: [self-hosted, linux, x64, podman, large|xlarge|gpu]` matches.
-    unit.labels = runner_labels_for_job(&base.labels, &job.labels, tier);
+
+    // Apply workflow-selected image (forces external mode for non-stock OCI refs).
+    if resolved.image != base.image || resolved.image_label.is_some() {
+        unit.image = resolved.image.clone();
+        if !is_default_stock_image(&unit.image) {
+            unit.image_mode = ImageMode::External;
+        }
+        let mode = effective_image_mode(&unit.image_mode, &unit.image);
+        let pull = effective_pull_policy(unit.pull_policy.as_ref(), &mode);
+        if let Err(e) =
+            ensure_image_present_platform(&unit.image, &pull, resolved.platform.as_deref())
+        {
+            let _ = pool.release(&worker_id);
+            return Err(e);
+        }
+    }
+    // CLI --platform wins; else job-resolved platform for cross-arch.
+    if unit.platform.is_none() {
+        unit.platform = resolved.platform.clone();
+    }
+    // Align actions/runner asset arch hint when we know the mapping (SHA still operator pin).
+    if let Some(arch) = resolved.arch {
+        if let Some(ra) = arch.runner_arch() {
+            unit.runner_arch = ra.to_string();
+        }
+    }
+
+    // Register base fleet labels + job size/image/arch labels so GitHub routes the cell.
+    unit.labels = runner_labels_for_job_with_map(&base.labels, &job.labels, tier, Some(&resolved));
     eprintln!(
-        "pool: up {container} tier={} cpus={} mem={} labels={} repo={} job={}",
+        "pool: up {container} tier={} cpus={} mem={} image={} platform={:?} labels={} repo={} job={}",
         tier.as_str(),
         unit.cpus,
         unit.memory,
+        unit.image,
+        unit.platform,
         unit.labels,
         job.repo,
         job.job_name
@@ -4483,6 +4645,8 @@ impl Cli {
             pool_memory: self.pool_memory.clone(),
             pool_max_workers: self.pool_max_workers,
             pool_mode: self.pool_mode.clone(),
+            image_map: self.image_map.clone(),
+            platform: self.platform.clone(),
             build_dir: self.build_dir.clone(),
             mode: self.mode.clone(),
             wake_token: self.wake_token.clone(),
@@ -4538,6 +4702,8 @@ struct CliSnap {
     pool_memory: String,
     pool_max_workers: u32,
     pool_mode: String,
+    image_map: Option<PathBuf>,
+    platform: Option<String>,
     mode: Mode,
     wake_token: Option<String>,
     full_auto: bool,
@@ -4591,6 +4757,8 @@ fn cli_snapshot(cli: &Cli) -> CliSnap {
         pool_memory: cli.pool_memory.clone(),
         pool_max_workers: cli.pool_max_workers,
         pool_mode: cli.pool_mode.clone(),
+        image_map: cli.image_map.clone(),
+        platform: cli.platform.clone(),
         mode: cli.mode.clone(),
         wake_token: cli.wake_token.clone(),
         full_auto: cli.full_auto,
@@ -4646,6 +4814,8 @@ fn snap_to_cli(s: &CliSnap) -> Cli {
         pool_memory: s.pool_memory.clone(),
         pool_max_workers: s.pool_max_workers,
         pool_mode: s.pool_mode.clone(),
+        image_map: s.image_map.clone(),
+        platform: s.platform.clone(),
         build_dir: None,
         mode: s.mode.clone(),
         wake_token: s.wake_token.clone(),

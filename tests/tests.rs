@@ -384,6 +384,149 @@ fn test_runner_user_and_sha_validation() {
     assert!(!is_safe_url("file:///etc/passwd"));
 }
 
+/// Issue #28: label → image resolution (builtin map + workflow distro labels).
+#[test]
+fn test_label_parsing_to_image_resolution() {
+    let map = ImageMap::builtin();
+    let labels = vec![
+        "self-hosted".into(),
+        "linux".into(),
+        "x64".into(),
+        "podman".into(),
+        "ubuntu-24.04".into(),
+    ];
+    let r = resolve_job_image_arch(&labels, &map, "localhost/gha-runner-ctl:latest");
+    assert_eq!(r.image_label.as_deref(), Some("ubuntu-24.04"));
+    assert_eq!(r.image, "docker.io/library/ubuntu:24.04");
+
+    // mycelium-lang draw-in cells
+    for (lab, img) in [
+        ("debian-bookworm", "docker.io/library/debian:bookworm"),
+        ("rocky-9", "docker.io/library/rockylinux:9"),
+        ("ubuntu-22.04", "docker.io/library/ubuntu:22.04"),
+    ] {
+        let labs = vec![
+            "self-hosted".into(),
+            "linux".into(),
+            "x64".into(),
+            "podman".into(),
+            lab.into(),
+        ];
+        let r = resolve_job_image_arch(&labs, &map, "localhost/stock:latest");
+        assert_eq!(r.image, img, "label {lab}");
+    }
+
+    // No image label → default unchanged
+    let bare = vec![
+        "self-hosted".into(),
+        "linux".into(),
+        "x64".into(),
+        "podman".into(),
+    ];
+    let r = resolve_job_image_arch(&bare, &map, "localhost/gha-runner-ctl:latest");
+    assert!(r.image_label.is_none());
+    assert_eq!(r.image, "localhost/gha-runner-ctl:latest");
+}
+
+/// Issue #28: arch label → podman --platform args.
+#[test]
+fn test_arch_label_to_podman_platform_args() {
+    assert_eq!(TargetArch::from_label("arm64"), Some(TargetArch::Arm64));
+    assert_eq!(TargetArch::from_label("aarch64"), Some(TargetArch::Arm64));
+    assert_eq!(TargetArch::from_label("riscv64"), Some(TargetArch::Riscv64));
+    assert_eq!(TargetArch::Arm64.platform(), "linux/arm64");
+    assert_eq!(TargetArch::Riscv64.platform(), "linux/riscv64");
+
+    let args = podman_platform_args(Some("linux/arm64"));
+    assert_eq!(args, vec!["--platform", "linux/arm64"]);
+    assert!(podman_platform_args(None).is_empty());
+
+    let labs = vec![
+        "self-hosted".into(),
+        "linux".into(),
+        "arm64".into(),
+        "podman".into(),
+    ];
+    assert_eq!(resolve_arch_from_labels(&labs), Some(TargetArch::Arm64));
+    // Prefer arm64 over ambient x64 when both appear
+    let mixed = vec!["x64".into(), "arm64".into()];
+    assert_eq!(resolve_arch_from_labels(&mixed), Some(TargetArch::Arm64));
+}
+
+/// Issue #28: binfmt-missing guard (clear error, not silent wrong-arch).
+#[test]
+fn test_binfmt_missing_guard() {
+    let empty: Vec<String> = vec![];
+    let err = ensure_binfmt_for_arch(TargetArch::Arm64, true, Some(&empty)).unwrap_err();
+    assert!(err.contains("binfmt_misc"), "{err}");
+    assert!(err.contains("Refusing"), "{err}");
+    assert!(
+        err.contains("arm64") || err.contains("linux/arm64"),
+        "{err}"
+    );
+
+    let present = vec!["qemu-aarch64".into(), "qemu-riscv64".into()];
+    ensure_binfmt_for_arch(TargetArch::Arm64, true, Some(&present)).unwrap();
+    ensure_binfmt_for_arch(TargetArch::Riscv64, true, Some(&present)).unwrap();
+    // needs_emulation=false → never errors
+    ensure_binfmt_for_arch(TargetArch::Arm64, false, Some(&empty)).unwrap();
+    assert!(binfmt_lists_arch(TargetArch::Arm64, &present));
+    assert!(!binfmt_lists_arch(TargetArch::S390x, &present));
+    assert!(binfmt_missing_error(TargetArch::Arm64).contains("tonistiigi/binfmt"));
+}
+
+#[test]
+fn test_image_map_json_and_toml_parse() {
+    let j = parse_image_map(
+        r#"{"images":{"my-ci":"ghcr.io/org/ci:1"},"arches":{"arm64":"linux/arm64"}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        j.images.get("my-ci").map(String::as_str),
+        Some("ghcr.io/org/ci:1")
+    );
+
+    let t = parse_image_map(
+        r#"
+[images]
+my-ci = "ghcr.io/org/ci:1"
+[arches]
+arm64 = "linux/arm64"
+"#,
+    )
+    .unwrap();
+    assert_eq!(t.images.get("my-ci"), j.images.get("my-ci"));
+    assert!(parse_image_map(r#"{"images":{"x":"bad;img"}}"#).is_err());
+}
+
+#[test]
+fn test_runner_labels_include_image_arch() {
+    let resolved = JobImageArch {
+        image: "docker.io/library/ubuntu:24.04".into(),
+        image_label: Some("ubuntu-24.04".into()),
+        arch: Some(TargetArch::Arm64),
+        platform: Some("linux/arm64".into()),
+        needs_emulation: true,
+    };
+    let labs = runner_labels_for_job_with_map(
+        "self-hosted,linux,x64,podman",
+        &[
+            "self-hosted".into(),
+            "linux".into(),
+            "arm64".into(),
+            "podman".into(),
+            "ubuntu-24.04".into(),
+        ],
+        SizeTier::Medium,
+        Some(&resolved),
+    );
+    assert!(labs.contains("ubuntu-24.04"), "{labs}");
+    assert!(labs.contains("arm64"), "{labs}");
+    assert!(labs.contains("medium"), "{labs}");
+    // Conflicting host x64 stripped when advertising arm64
+    assert!(!labs.split(',').any(|l| l == "x64"), "{labs}");
+}
+
 /// Regression: work image must force JS actions onto node24 via the documented
 /// runner env (FORCE_JAVASCRIPT_ACTIONS_TO_NODE24). The internal-only knob
 /// ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION does not affect JS actions.

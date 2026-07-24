@@ -74,6 +74,8 @@ All global options accept the same name as env var (clap `env =`); boolean env v
 | `--auto` | `GHA_AUTO` | bool | false | — |
 | `--image` | `GHA_IMAGE` | OCI image ref | `localhost/gha-runner-ctl:latest` | Any registry/path:tag or `@sha256:`; see [WORK_IMAGES](../WORK_IMAGES.md) |
 | `--image-mode` | `GHA_IMAGE_MODE` | `auto`, `build`, `external` | `auto` | auto→build for stock tag; else external |
+| `--image-map` | `GHA_IMAGE_MAP` | path | — | Label→image map (JSON/TOML); merges over builtins; issue #28 |
+| `--platform` | `GHA_PLATFORM` | OCI platform | — | e.g. `linux/arm64`; also set from job arch labels at spawn |
 | `--pull-policy` | `GHA_PULL_POLICY` | `never`, `missing`, `always` | (mode default) | build→never, external→missing when unset |
 | `--runner-user` | `GHA_RUNNER_USER` | uid:gid or name | `1001:1001` | Podman `--user` |
 | `--seed-helper-image` | `GHA_SEED_HELPER_IMAGE` | OCI ref | `docker.io/library/ubuntu:24.04` | Seeds runner kit into volumes |
