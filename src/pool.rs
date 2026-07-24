@@ -584,6 +584,15 @@ mod tests {
         );
     }
 
+    /// Bare product `build` job name (ci.yml) must not land on Medium — OOM 137.
+    #[test]
+    fn tier_bare_build_large() {
+        assert_eq!(
+            size_for_job("build", &["self-hosted".into()], false),
+            SizeTier::Large
+        );
+    }
+
     #[test]
     fn resources_medium_has_headroom() {
         let (c, m) = resources_for_tier(SizeTier::Medium);

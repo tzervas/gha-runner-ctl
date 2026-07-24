@@ -2918,7 +2918,7 @@ struct NamedRepo {
 
 fn parse_repo_csv(s: &str) -> Vec<String> {
     let mut out = Vec::new();
-    for part in s.split(|c| c == ',' || c == '\n' || c == '\r') {
+    for part in s.split([',', '\n', '\r']) {
         let p = part.split('#').next().unwrap_or("").trim();
         if p.is_empty() {
             continue;
@@ -3524,10 +3524,8 @@ fn list_demand_jobs(
     // Priority repos every tick (full set, capped), then RR the rest once.
     let mut scan: Vec<String> = Vec::new();
     for p in &priority {
-        if repos.iter().any(|r| r == p) || is_safe_repo(p) {
-            if !scan.contains(p) {
-                scan.push(p.clone());
-            }
+        if (repos.iter().any(|r| r == p) || is_safe_repo(p)) && !scan.contains(p) {
+            scan.push(p.clone());
         }
     }
     let rest: Vec<String> = repos
