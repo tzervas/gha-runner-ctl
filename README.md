@@ -125,9 +125,10 @@ Full matrix, systemd, containers/VMs for testing: **[docs/HOST_PLATFORMS.md](doc
 6. Scopes: `repo` | `user` (batch personal) | `org` (org-level registration).
 7. Hardened container: Configurable `--runner-user` (default `1001:1001`), `no-new-privileges`, pull policy (`never`/`missing`/`always`).
 8. **Any work image (0.2.9+):** set `GHA_IMAGE` to any OCI ref; `image-mode=external` injects actions/runner into the volume (see [WORK_IMAGES](docs/WORK_IMAGES.md)).
-9. Demand filters (0.2.4+): `--demand-require-labels` / `--demand-exclude-labels` so CPU listeners ignore GPU jobs and GPU listeners only wake on `gpu`.
-10. Sticky user-batch: do not recycle registration while the active repo still has matching work.
-11. Multi-instance locks: `up`/`listen` locks namespaced by `--container`.
+9. **Workflow-selectable image + arch (issue #28 draft):** `runs-on` labels such as `ubuntu-24.04` or `arm64` select the work OCI image and/or `podman --platform` at spawn (label→image map via `GHA_IMAGE_MAP`; binfmt guard for emulation). Avoids nested podman/docker inside runners — see [WORK_IMAGES](docs/WORK_IMAGES.md#workflow-selectable-image--arch-issue-28) (mycelium-lang draw-in use case).
+10. Demand filters (0.2.4+): `--demand-require-labels` / `--demand-exclude-labels` so CPU listeners ignore GPU jobs and GPU listeners only wake on `gpu`.
+11. Sticky user-batch: do not recycle registration while the active repo still has matching work.
+12. Multi-instance locks: `up`/`listen` locks namespaced by `--container`.
 
 ## Requirements
 

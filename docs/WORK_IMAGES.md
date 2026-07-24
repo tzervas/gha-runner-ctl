@@ -6,6 +6,126 @@ the image; the fleet agent injects the runner kit and entrypoint when needed.
 Nothing is locked to `localhost/gha-runner-ctl` except the **default** convenience
 tag used by `image-mode=auto`.
 
+## Workflow-selectable image + arch (issue #28)
+
+Fleet runners are Podman containers with **no in-container engine**. Jobs must
+**not** nest `podman`/`docker` (e.g. mycelium-lang `draw-in-container.sh` fails
+with `need podman or docker`). Instead, select the target distro/arch at
+**spawn** via `runs-on` labels so the job runs **natively inside** that runner.
+
+### Label → image map
+
+| Source | Role |
+|--------|------|
+| **Built-in defaults** | Common distro tags (`ubuntu-24.04`, `debian-bookworm`, `rocky-9`, …) → Docker Hub library images |
+| **`GHA_IMAGE_MAP` / `--image-map`** | JSON or minimal TOML file; **overrides/extends** builtins |
+
+Example workflow cell (mycelium-lang draw-in / multi-distro CI):
+
+```yaml
+jobs:
+  draw-in-ubuntu:
+    runs-on: [self-hosted, linux, x64, podman, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v4
+      - run: uname -a && cat /etc/os-release
+  draw-in-arm64:
+    # Requires QEMU/binfmt on the fleet host (see below)
+    runs-on: [self-hosted, linux, arm64, podman, ubuntu-24.04]
+    steps:
+      - run: uname -m   # aarch64 inside emulated runner
+```
+
+When the listen pool sees `ubuntu-24.04` on the job, it sets the work image to
+the mapped OCI ref (`docker.io/library/ubuntu:24.04` by default), forces
+`image-mode=external`, pulls per policy, and registers the runner **with that
+label** so GitHub routes the job. No nested container.
+
+#### Config file format
+
+**JSON** (`packaging/image-map.example.json`):
+
+```json
+{
+  "images": {
+    "ubuntu-24.04": "docker.io/library/ubuntu:24.04",
+    "custom-ci": "ghcr.io/org/ci:1"
+  },
+  "arches": {
+    "arm64": "linux/arm64"
+  }
+}
+```
+
+**TOML** (`packaging/image-map.example.toml`):
+
+```toml
+[images]
+ubuntu-24.04 = "docker.io/library/ubuntu:24.04"
+custom-ci = "ghcr.io/org/ci:1"
+
+[arches]
+arm64 = "linux/arm64"
+```
+
+```bash
+# Fleet host env (instance .env or systemd)
+export GHA_IMAGE_MAP=/etc/gha-runner-ctl/image-map.json
+# or: --image-map /path/to/image-map.toml
+```
+
+#### Built-in image labels (subset)
+
+| Label | Default image |
+|-------|----------------|
+| `ubuntu-24.04` | `docker.io/library/ubuntu:24.04` |
+| `ubuntu-22.04` | `docker.io/library/ubuntu:22.04` |
+| `debian-bookworm` / `debian-12` | `docker.io/library/debian:bookworm` |
+| `rocky-9` | `docker.io/library/rockylinux:9` |
+| `fedora-40` | `docker.io/library/fedora:40` |
+| `alpine-3.20` | `docker.io/library/alpine:3.20` |
+
+If **no** image label matches, behavior is unchanged: `GHA_IMAGE` / stock packaging image.
+
+### Cross-arch emulation (`--platform` / arch labels)
+
+| `runs-on` arch token | Podman `--platform` | notes |
+|----------------------|---------------------|--------|
+| `x64` / `amd64` / `x86_64` | (native on amd64 hosts — no flag) | default fleet |
+| `arm64` / `aarch64` | `linux/arm64` | needs binfmt on non-arm hosts |
+| `riscv64` | `linux/riscv64` | experimental; runner kit may need custom seed |
+| `x86` / `i386` | `linux/386` | |
+| `arm` / `armv7` | `linux/arm/v7` | |
+
+CLI override: `GHA_PLATFORM=linux/arm64` / `--platform linux/arm64` on single-container `up`.
+
+#### Fleet-host prerequisite: binfmt_misc / QEMU
+
+Cross-arch spawn **checks** `/proc/sys/fs/binfmt_misc` for a QEMU handler matching
+the target. If missing, spawn **fails with a clear error** (never a silent
+wrong-arch run):
+
+```text
+cannot spawn arm64 runner (platform linux/arm64): QEMU/binfmt_misc is not registered …
+```
+
+Register handlers on the **fleet host** (once per boot, or via systemd):
+
+```bash
+# Privileged one-shot (common with Podman):
+podman run --privileged --rm tonistiigi/binfmt --install all
+
+# Or distro packages, e.g. Debian/Ubuntu:
+# sudo apt-get install -y qemu-user-static
+# sudo systemctl restart systemd-binfmt
+```
+
+The actions/runner kit in the volume is still the host-arch seed by default.
+For production multi-arch, prefer matching `GHA_RUNNER_ARCH` / `GHA_RUNNER_SHA256`
+(or a custom `GHA_RUNNER_SEED_URL`) to the emulated arch, or use a multi-arch
+aware seed pipeline. Draft behavior sets `runner_arch` from the arch label when
+known (`x64`/`arm64`/`arm`).
+
 ## Modes (`GHA_IMAGE_MODE` / `--image-mode`)
 
 | Mode | Behavior |
