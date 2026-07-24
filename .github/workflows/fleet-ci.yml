@@ -52,7 +52,33 @@ jobs:
     runs-on: [self-hosted, linux, x64, podman]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Pin to package MSRV / rust-toolchain.toml (1.96). Prefer ambient cargo from the
+      # work image when present; otherwise install via rustup (no Docker — Podman fleet).
+      - name: Ensure Rust toolchain (1.96)
+        run: |
+          set -euo pipefail
+          want="1.96"
+          if command -v rustc >/dev/null 2>&1 && command -v cargo >/dev/null 2>&1; then
+            ver="$(rustc --version 2>/dev/null || true)"
+            echo "ambient rustc: $ver"
+            if echo "$ver" | grep -qE "rustc ${want}"; then
+              rustup component add rustfmt clippy 2>/dev/null || true
+              exit 0
+            fi
+          fi
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o /tmp/rustup-init.sh
+            sh /tmp/rustup-init.sh -y --default-toolchain "${want}" --profile minimal \
+              --component rustfmt --component clippy
+            # shellcheck disable=SC1091
+            . "$HOME/.cargo/env" 2>/dev/null || export PATH="$HOME/.cargo/bin:$PATH"
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          else
+            rustup toolchain install "${want}" --profile minimal -c rustfmt -c clippy
+            rustup default "${want}"
+          fi
+          rustc --version
+          cargo --version
       - name: cargo check
         run: cargo check --workspace --all-targets
       - name: cargo test
