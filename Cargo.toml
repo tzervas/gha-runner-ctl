@@ -9,7 +9,7 @@ repository = "https://github.com/tzervas/gha-runner-ctl"
 readme = "README.md"
 keywords = ["github-actions", "self-hosted", "podman", "runner"]
 categories = ["command-line-utilities", "development-tools"]
-publish = false
+publish = true
 
 [lib]
 name = "gha_runner_ctl"
