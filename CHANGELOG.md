@@ -1,3 +1,23 @@
+## Unreleased
+
+### Fixed — capacity-safe idle scale-in (demand-driven autoscaler)
+
+Idle scale-in no longer kills mid-job pool workers when the partial prefer-repo
+round-robin demand sample looks empty.
+
+- **Per-worker busy detection:** `WorkerSnapshot.busy` / `is_busy(worker)` from the
+  local actions/runner process tree (`Runner.Worker` via `podman top`) — **not**
+  the demand scan. `plan_scale` only scales in `running && !busy` workers; a
+  busy worker on an un-scanned prefer-repo is held. Fail-closed if process
+  inspection fails.
+- **Demand-empty full-sweep gate:** `idle_secs` starts only after consecutive empty
+  ticks cover a full prefer-list sweep:
+  `empty_sweep_ticks = ceil(prefer_len / max(scan_per_tick, 1))`
+  (`demand_empty_confirmed`). One empty partial RR tick is never enough.
+- Scale-out clamp math (`max_workers` / CPU / mem / `max_spawn_per_tick` +
+  `try_claim`) unchanged.
+- Regression tests: busy worker not scaled in; empty gate requires full sweep.
+
 ## 0.2.12
 
 ### Added — safe recovery (queue-preserving)
