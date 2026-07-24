@@ -3,7 +3,7 @@
 **Contract ID:** `ctl/cli-env`  
 **Producer:** W1b (code/contracts)  
 **Status:** STABLE  
-**Version:** 0.2.12  
+**Version:** 0.3.0  
 **Consumers:** W1c (docs narrative), W2 (host/env), W3 (PR test plan)  
 **Depends-on:** `framework/bulletin@STABLE`
 
@@ -12,9 +12,9 @@
 | Artifact | Value |
 |----------|--------|
 | Crate / binary | `gha-runner-ctl` |
-| `VERSION` file | `0.2.12` |
-| `Cargo.toml` `package.version` | `0.2.12` |
-| GitHub HTTP User-Agent | `gha-runner-ctl/0.2.12` (`src/lib.rs` `UA`) |
+| `VERSION` file | `0.3.0` |
+| `Cargo.toml` `package.version` | `0.3.0` |
+| GitHub HTTP User-Agent | `gha-runner-ctl/0.3.0` (`src/lib.rs` `UA`) |
 
 ## Entry behavior
 

@@ -48,7 +48,7 @@ const DEFAULT_RUNNER_VERSION: &str = "2.335.1";
 const DEFAULT_RUNNER_SHA256: &str =
     "4ef2f25285f0ae4477f1fe1e346db76d2f3ebf03824e2ddd1973a2819bf6c8cf";
 const DEFAULT_RUNNER_ARCH: &str = "x64";
-const UA: &str = "gha-runner-ctl/0.2.12";
+const UA: &str = "gha-runner-ctl/0.3.0";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 const MIN_POLL_SECS: u64 = 5;
 const MAX_POLL_SECS: u64 = 3600;

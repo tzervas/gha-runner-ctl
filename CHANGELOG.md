@@ -1,4 +1,4 @@
-## Unreleased
+## v0.3.0 (2026-07-24)
 
 ### Fixed — capacity-safe idle scale-in (demand-driven autoscaler)
 
