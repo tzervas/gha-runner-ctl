@@ -1276,7 +1276,7 @@ impl InstanceLock {
     }
 }
 
-fn lock_is_stale(path: &Path) -> bool {
+pub(crate) fn lock_is_stale(path: &Path) -> bool {
     let Ok(s) = fs::read_to_string(path) else {
         return true;
     };
@@ -1850,6 +1850,16 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+struct ExclusiveLockGuard {
+    path: PathBuf,
+}
+
+impl Drop for ExclusiveLockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 /// Wait for host-wide registration budget (min gap + max per hour).
 fn pace_registration(cli: &Cli) -> Result<(), String> {
     let (lock_path, state_path) = reg_pace_paths();
@@ -1871,6 +1881,9 @@ fn pace_registration(cli: &Cli) -> Result<(), String> {
         {
             Ok(mut f) => {
                 let _ = writeln!(f, "{}", std::process::id());
+                let _guard = ExclusiveLockGuard {
+                    path: exclusive.clone(),
+                };
                 let mut state: RegPaceState = fs::read_to_string(&state_path)
                     .ok()
                     .and_then(|s| serde_json::from_str(&s).ok())
@@ -1878,7 +1891,6 @@ fn pace_registration(cli: &Cli) -> Result<(), String> {
                 let now = now_unix();
                 state.recent.retain(|t| now.saturating_sub(*t) < 3600);
                 if state.recent.len() as u32 >= max_hour {
-                    let _ = fs::remove_file(&exclusive);
                     // Do NOT spin-sleep here — that freezes the listen loop (no reap, no other
                     // repos). Surface budget pressure and let the outer loop continue.
                     let oldest = state.recent.iter().copied().min().unwrap_or(now);
@@ -1893,17 +1905,20 @@ fn pace_registration(cli: &Cli) -> Result<(), String> {
                     let elapsed = now.saturating_sub(state.last_unix);
                     if elapsed < min_gap {
                         let wait = min_gap - elapsed;
-                        let _ = fs::remove_file(&exclusive);
                         eprintln!("register: pacing {wait}s before next registration-token POST");
+                        drop(_guard);
                         thread::sleep(Duration::from_secs(wait));
                         continue;
                     }
                 }
                 // Budget enforced here; slot committed only after successful token mint.
-                let _ = fs::remove_file(&exclusive);
                 return Ok(());
             }
             Err(_) => {
+                if attempt == 0 && lock_is_stale(&exclusive) {
+                    let _ = fs::remove_file(&exclusive);
+                    continue;
+                }
                 thread::sleep(Duration::from_millis(200 + (attempt as u64 % 5) * 100));
             }
         }
@@ -1915,12 +1930,16 @@ fn pace_registration(cli: &Cli) -> Result<(), String> {
 fn commit_registration_slot() {
     let (lock_path, state_path) = reg_pace_paths();
     let exclusive = lock_path.with_extension("exclusive");
-    if OpenOptions::new()
+    if lock_is_stale(&exclusive) {
+        let _ = fs::remove_file(&exclusive);
+    }
+    if let Ok(mut f) = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&exclusive)
-        .is_ok()
     {
+        let _ = writeln!(f, "{}", std::process::id());
+        let _guard = ExclusiveLockGuard { path: exclusive };
         let mut state: RegPaceState = fs::read_to_string(&state_path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
@@ -1932,19 +1951,22 @@ fn commit_registration_slot() {
         if let Ok(s) = serde_json::to_string(&state) {
             let _ = fs::write(&state_path, s);
         }
-        let _ = fs::remove_file(&exclusive);
     }
 }
 
 fn note_registration_failure_backoff(secs: u64) {
     let (lock_path, state_path) = reg_pace_paths();
     let exclusive = lock_path.with_extension("exclusive");
-    if OpenOptions::new()
+    if lock_is_stale(&exclusive) {
+        let _ = fs::remove_file(&exclusive);
+    }
+    if let Ok(mut f) = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&exclusive)
-        .is_ok()
     {
+        let _ = writeln!(f, "{}", std::process::id());
+        let _guard = ExclusiveLockGuard { path: exclusive };
         let mut state: RegPaceState = fs::read_to_string(&state_path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
@@ -1954,7 +1976,6 @@ fn note_registration_failure_backoff(secs: u64) {
         if let Ok(s) = serde_json::to_string(&state) {
             let _ = fs::write(&state_path, s);
         }
-        let _ = fs::remove_file(&exclusive);
     }
     eprintln!("register: backing off {secs}s after failed registration-token POST");
     thread::sleep(Duration::from_secs(secs));
