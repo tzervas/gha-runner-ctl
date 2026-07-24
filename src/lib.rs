@@ -1322,7 +1322,9 @@ mod redact_hardening_tests {
         let a = "A".repeat(40);
         let b = "B".repeat(40);
         assert_eq!(
-            redact(&format!("a ghp_{a} b gho_{b} c RUNNER_TOKEN=CCCCCCCCCCCC d")),
+            redact(&format!(
+                "a ghp_{a} b gho_{b} c RUNNER_TOKEN=CCCCCCCCCCCC d"
+            )),
             "a ghp_***REDACTED*** b gho_***REDACTED*** c RUNNER_TOKEN=***REDACTED*** d"
         );
     }
@@ -1343,10 +1345,7 @@ mod redact_hardening_tests {
 
     #[test]
     fn existing_multibyte_boundary_compat() {
-        assert_eq!(
-            redact("Bearer ghp_ABC¢DEF"),
-            "Bearer ***REDACTED***¢DEF"
-        );
+        assert_eq!(redact("Bearer ghp_ABC¢DEF"), "Bearer ***REDACTED***¢DEF");
     }
 
     #[test]
@@ -1386,7 +1385,12 @@ mod redact_hardening_tests {
     #[test]
     fn jwt_then_comma_then_second_token() {
         // ghs_ JWT (three ≥ full-length segments) then a second full-length ghp_.
-        let jwt = format!("ghs_{}.{}.{}", "A".repeat(40), "B".repeat(40), "C".repeat(40));
+        let jwt = format!(
+            "ghs_{}.{}.{}",
+            "A".repeat(40),
+            "B".repeat(40),
+            "C".repeat(40)
+        );
         let ghp = format!("ghp_{}", "D".repeat(40));
         assert_eq!(
             redact(&format!("tokens: {jwt}, {ghp}")),
@@ -1411,7 +1415,11 @@ mod redact_hardening_tests {
     #[test]
     fn long_nonsecret_not_truncated() {
         let s = "x".repeat(600);
-        assert_eq!(redact(&s), s, "no-secret input must pass through byte-for-byte, uncapped");
+        assert_eq!(
+            redact(&s),
+            s,
+            "no-secret input must pass through byte-for-byte, uncapped"
+        );
     }
 
     #[test]
@@ -1429,10 +1437,7 @@ mod redact_hardening_tests {
 
     #[test]
     fn ghu_prefix_token() {
-        assert_eq!(
-            redact(&format!("ghu_{B36}")),
-            "ghu_***REDACTED***"
-        );
+        assert_eq!(redact(&format!("ghu_{B36}")), "ghu_***REDACTED***");
     }
 
     #[test]
@@ -1508,8 +1513,18 @@ mod redact_hardening_tests {
     /// and the surrounding structure preserved.
     #[test]
     fn two_long_jwts_same_line_fully_redacted() {
-        let jwt_a = format!("ghs_{}.{}.{}", "a".repeat(200), "b".repeat(200), "c".repeat(200));
-        let jwt_b = format!("ghs_{}.{}.{}", "x".repeat(200), "y".repeat(200), "z".repeat(200));
+        let jwt_a = format!(
+            "ghs_{}.{}.{}",
+            "a".repeat(200),
+            "b".repeat(200),
+            "c".repeat(200)
+        );
+        let jwt_b = format!(
+            "ghs_{}.{}.{}",
+            "x".repeat(200),
+            "y".repeat(200),
+            "z".repeat(200)
+        );
         let input = format!("old={jwt_a} new={jwt_b}");
         let out = redact(&input);
         assert_eq!(out, "old=ghs_***REDACTED*** new=ghs_***REDACTED***");
@@ -1541,7 +1556,10 @@ mod redact_hardening_tests {
     fn trailing_dash_and_underscore_not_trimmed() {
         // ≥36 body that legitimately ends in base64url signature bytes.
         let base = "A".repeat(36);
-        assert_eq!(redact(&format!("ghs_{base}-BBB_ end")), "ghs_***REDACTED*** end");
+        assert_eq!(
+            redact(&format!("ghs_{base}-BBB_ end")),
+            "ghs_***REDACTED*** end"
+        );
         // No trailing punctuation at all: whole run to string end is body.
         assert_eq!(redact(&format!("ghs_{base}-")), "ghs_***REDACTED***");
         assert_eq!(redact(&format!("ghs_{base}_")), "ghs_***REDACTED***");
@@ -1681,7 +1699,12 @@ mod redact_hardening_tests {
 
     #[test]
     fn redact_zeroizing_handles_long_jwt() {
-        let jwt = format!("ghs_{}.{}.{}", "a".repeat(200), "b".repeat(200), "c".repeat(200));
+        let jwt = format!(
+            "ghs_{}.{}.{}",
+            "a".repeat(200),
+            "b".repeat(200),
+            "c".repeat(200)
+        );
         let out = redact_zeroizing(zeroize::Zeroizing::new(jwt));
         assert_eq!(out, "ghs_***REDACTED***");
     }
@@ -1754,7 +1777,10 @@ mod redact_hardening_tests {
             "ghp_***REDACTED***🦀DEF"
         );
         // Contextual markers redact any non-empty value, however short.
-        assert_eq!(redact("RUNNER_TOKEN=XYZ€99"), "RUNNER_TOKEN=***REDACTED***€99");
+        assert_eq!(
+            redact("RUNNER_TOKEN=XYZ€99"),
+            "RUNNER_TOKEN=***REDACTED***€99"
+        );
         assert_eq!(redact("Bearer ghs_A.B.C日本"), "Bearer ***REDACTED***日本");
     }
 
@@ -1777,7 +1803,10 @@ mod redact_hardening_tests {
     /// behavior so any future change is a visible, intentional diff.
     #[test]
     fn adversarial_known_nested_marker_limitation_visible() {
-        assert_eq!(redact("Bearer RUNNER_TOKEN=ABC"), "Bearer ***REDACTED***=ABC");
+        assert_eq!(
+            redact("Bearer RUNNER_TOKEN=ABC"),
+            "Bearer ***REDACTED***=ABC"
+        );
     }
 
     /// Adversarial: a giant NON-secret payload (base64 blob with no anchor)
@@ -1822,7 +1851,12 @@ mod redact_hardening_tests {
             "Bearer ghp_ABCDEFGHIJKLMNOPQRST".to_string(),
             String::new(),
             "ghp_ABC🦀DEF".to_string(),
-            format!("ghs_{}.{}.{}", "a".repeat(600), "b".repeat(600), "c".repeat(600)),
+            format!(
+                "ghs_{}.{}.{}",
+                "a".repeat(600),
+                "b".repeat(600),
+                "c".repeat(600)
+            ),
         ] {
             let expected = redact(&raw);
             let got = redact_zeroizing(zeroize::Zeroizing::new(raw));
@@ -1835,7 +1869,12 @@ mod redact_hardening_tests {
     #[cfg(feature = "mlock")]
     #[test]
     fn adversarial_redact_zeroizing_mlock_feature_no_panic() {
-        let jwt = format!("ghs_{}.{}.{}-_", "H".repeat(16), "P".repeat(16), "S".repeat(16));
+        let jwt = format!(
+            "ghs_{}.{}.{}-_",
+            "H".repeat(16),
+            "P".repeat(16),
+            "S".repeat(16)
+        );
         let out = redact_zeroizing(zeroize::Zeroizing::new(format!("tok {jwt} end")));
         assert_eq!(out, "tok ghs_***REDACTED*** end");
     }
