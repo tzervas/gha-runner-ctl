@@ -1307,13 +1307,40 @@ impl InstanceLock {
     }
 }
 
+/// A lock file is written in two steps — `create_new` then `writeln!(pid)` — so an
+/// empty or partially-written file may belong to a *live* holder that is mid-creation,
+/// not a crashed remnant. Reclaiming it in that window would steal a live lock (TOCTOU).
+/// Only treat an unreadable/unparseable lock as stale once it has aged past this grace,
+/// which is far longer than the microsecond create→write gap but short enough to clear a
+/// genuinely crashed-mid-write lock promptly.
+const LOCK_WRITE_GRACE_SECS: u64 = 5;
+
+/// True iff `path` is older than [`LOCK_WRITE_GRACE_SECS`] (or its mtime can't be read /
+/// it's already gone). Used only for the incomplete-content branches of [`lock_is_stale`].
+fn lock_incomplete_and_aged(path: &Path) -> bool {
+    match fs::metadata(path).and_then(|m| m.modified()) {
+        Ok(mtime) => mtime
+            .elapsed()
+            .map(|age| age.as_secs() >= LOCK_WRITE_GRACE_SECS)
+            // Clock went backwards → be conservative, keep it (not yet stale).
+            .unwrap_or(false),
+        // No metadata: nothing to protect (already removed / unreadable) → stale.
+        Err(_) => true,
+    }
+}
+
 pub(crate) fn lock_is_stale(path: &Path) -> bool {
     let Ok(s) = fs::read_to_string(path) else {
-        return true;
+        // Unreadable: only stale if it is not a lock being created right now.
+        return lock_incomplete_and_aged(path);
     };
     let Ok(pid) = s.trim().parse::<u32>() else {
-        return true;
+        // Empty/partial content: a holder may be between create_new and writeln!(pid).
+        return lock_incomplete_and_aged(path);
     };
+    // Parseable PID: stale iff the process is gone. (`kill -0` EPERM would mean the
+    // process exists under another uid; on the single-user fleet host that does not
+    // arise, and ESRCH is the stale signal we want.)
     Command::new("kill")
         .args(["-0", &pid.to_string()])
         .stdout(Stdio::null())
@@ -1957,47 +1984,58 @@ fn pace_registration(cli: &Cli) -> Result<(), String> {
     Err("register: could not acquire registration pace lock".into())
 }
 
+/// Best-effort acquire of a short-lived `create_new` exclusive lock, returning an RAII
+/// guard that unlinks it on drop, or `None` if the lock is held by a live process (the
+/// caller then skips its best-effort update — the same "skip if locked" semantics the
+/// old code had). Reclaims a lock only when a *failed* `create_new` (`AlreadyExists`) is
+/// followed by a positive [`lock_is_stale`] check; it never removes the file
+/// preemptively, so it cannot delete a live holder's lock that is merely mid-creation.
+fn try_acquire_exclusive(path: &Path) -> Option<ExclusiveLockGuard> {
+    for attempt in 0..2 {
+        match OpenOptions::new().write(true).create_new(true).open(path) {
+            Ok(mut f) => {
+                let _ = writeln!(f, "{}", std::process::id());
+                return Some(ExclusiveLockGuard {
+                    path: path.to_path_buf(),
+                });
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if attempt == 0 && lock_is_stale(path) {
+                    let _ = fs::remove_file(path);
+                    continue;
+                }
+                return None;
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
 /// Record a successful registration-token mint in the host-wide hourly budget.
 fn commit_registration_slot() {
     let (lock_path, state_path) = reg_pace_paths();
     let exclusive = lock_path.with_extension("exclusive");
-    if lock_is_stale(&exclusive) {
-        let _ = fs::remove_file(&exclusive);
-    }
-    if let Ok(mut f) = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&exclusive)
-    {
-        let _ = writeln!(f, "{}", std::process::id());
-        let _guard = ExclusiveLockGuard { path: exclusive };
-        let mut state: RegPaceState = fs::read_to_string(&state_path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-        let now = now_unix();
-        state.recent.retain(|t| now.saturating_sub(*t) < 3600);
-        state.last_unix = now;
-        state.recent.push(now);
-        if let Ok(s) = serde_json::to_string(&state) {
-            let _ = fs::write(&state_path, s);
-        }
+    let Some(_guard) = try_acquire_exclusive(&exclusive) else {
+        return;
+    };
+    let mut state: RegPaceState = fs::read_to_string(&state_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let now = now_unix();
+    state.recent.retain(|t| now.saturating_sub(*t) < 3600);
+    state.last_unix = now;
+    state.recent.push(now);
+    if let Ok(s) = serde_json::to_string(&state) {
+        let _ = fs::write(&state_path, s);
     }
 }
 
 fn note_registration_failure_backoff(secs: u64) {
     let (lock_path, state_path) = reg_pace_paths();
     let exclusive = lock_path.with_extension("exclusive");
-    if lock_is_stale(&exclusive) {
-        let _ = fs::remove_file(&exclusive);
-    }
-    if let Ok(mut f) = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&exclusive)
-    {
-        let _ = writeln!(f, "{}", std::process::id());
-        let _guard = ExclusiveLockGuard { path: exclusive };
+    if let Some(_guard) = try_acquire_exclusive(&exclusive) {
         let mut state: RegPaceState = fs::read_to_string(&state_path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
@@ -4947,6 +4985,40 @@ fn wake_server(port: u16, snap: CliSnap, token: String) {
 #[cfg(test)]
 mod robust_queue_tests {
     use super::*;
+
+    #[test]
+    fn lock_is_stale_grace_protects_mid_creation_and_live_pid() {
+        use std::io::Write as _;
+        let base = std::env::temp_dir().join(format!("ghar-stale-test-{}", std::process::id()));
+
+        // A just-created empty lock (holder is between create_new and writeln!(pid))
+        // must NOT be judged stale — reclaiming it would steal a live lock (TOCTOU).
+        let empty = base.with_extension("empty");
+        let _ = fs::remove_file(&empty);
+        fs::File::create(&empty).unwrap();
+        assert!(
+            !lock_is_stale(&empty),
+            "fresh empty lock must be treated as live within the write grace"
+        );
+
+        // A lock owned by a live PID (ourselves) must NOT be stale.
+        let live = base.with_extension("live");
+        let mut f = fs::File::create(&live).unwrap();
+        writeln!(f, "{}", std::process::id()).unwrap();
+        drop(f);
+        assert!(!lock_is_stale(&live), "our own live PID must not be stale");
+
+        // A non-existent lock path is trivially reclaimable (nothing to protect).
+        let missing = base.with_extension("missing");
+        let _ = fs::remove_file(&missing);
+        assert!(
+            lock_is_stale(&missing),
+            "a non-existent lock is stale (nothing to protect)"
+        );
+
+        let _ = fs::remove_file(&empty);
+        let _ = fs::remove_file(&live);
+    }
 
     #[test]
     fn parse_repo_csv_dedupes_and_strips_comments() {
