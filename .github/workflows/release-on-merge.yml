@@ -1,0 +1,117 @@
+name: release-on-merge
+# Single-source release + crates.io publish, triggered by merging a release PR to main.
+#
+# On push to main: read the VERSION file; if v<version> is not already tagged, then
+#   1. build the dist tarball (scripts/dist.sh),
+#   2. publish the crate to crates.io (idempotent — skips if the version already exists),
+#   3. cut the GitHub release and upload assets,
+#   4. push the v<version> tag (record of what shipped).
+#
+# Fully self-contained: it does NOT delegate to release.yml, so it does not depend on
+# the GITHUB_TOKEN "won't trigger downstream workflows" limitation. Idempotent — a
+# re-run after a partial failure is a no-op once the version is tagged/published.
+#
+# All steps run on the self-hosted Podman fleet. No Docker-based actions.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-on-merge
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: [self-hosted, linux, x64, podman]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@1.96
+
+      - name: Ensure GitHub CLI
+        run: |
+          set -euo pipefail
+          if command -v gh >/dev/null 2>&1; then gh --version; exit 0; fi
+          GH_VERSION="2.65.0"
+          gh_dir="${RUNNER_TEMP}/gh"
+          mkdir -p "${gh_dir}"
+          curl -fsSL \
+            "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" \
+            | tar -xz -C "${gh_dir}" --strip-components=1
+          echo "${gh_dir}/bin" >> "${GITHUB_PATH}"
+          "${gh_dir}/bin/gh" --version
+
+      - name: Gate — has this version already shipped?
+        id: gate
+        run: |
+          set -euo pipefail
+          if [ -f VERSION ]; then
+            VER="$(tr -d '[:space:]' < VERSION)"
+          else
+            VER="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+          fi
+          VER="${VER#v}"
+          TAG="v${VER}"
+          echo "ver=${VER}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists on remote — nothing to release."
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Version ${VER} not yet tagged — proceeding with release."
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build dist tarball
+        if: steps.gate.outputs.go == 'true'
+        run: bash scripts/dist.sh
+
+      - name: Publish to crates.io
+        if: steps.gate.outputs.go == 'true'
+        env:
+          # crates.io token lives in the CARGO_REGISTRY_KEY secret; cargo reads the
+          # CARGO_REGISTRY_TOKEN env var. GitHub secrets can't be renamed, so map it here.
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_KEY }}
+        run: |
+          set -uo pipefail
+          # Idempotent publish: if a prior run already published this version but failed
+          # before tagging, cargo errors with "already exists" — treat that as success
+          # rather than failing the release. Any other failure is fatal. Name-agnostic
+          # (works whether crates.io canonicalizes to gha_runner_ctl or gha-runner-ctl).
+          out="$(cargo publish --locked 2>&1)"; rc=$?
+          printf '%s\n' "$out"
+          if [ "$rc" -eq 0 ]; then
+            echo "published to crates.io"
+          elif printf '%s' "$out" | grep -qiE 'already (exists|uploaded)|crate version .* is already'; then
+            echo "this version is already on crates.io — treating as success (idempotent)."
+          else
+            echo "cargo publish failed (rc=$rc)"; exit "$rc"
+          fi
+
+      - name: Tag + GitHub release with assets
+        if: steps.gate.outputs.go == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.gate.outputs.tag }}"
+          VER="${{ steps.gate.outputs.ver }}"
+          ARCHIVE="dist/gha-runner-ctl-${VER}-x86_64-unknown-linux-gnu.tar.gz"
+          SUMS="dist/SHA256SUMS-${VER}.txt"
+          test -f "$ARCHIVE" && test -f "$SUMS"
+          # Create the annotated tag if it is not already present (belt-and-suspenders with the gate).
+          if ! git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            git tag -a "${TAG}" -m "gha-runner-ctl ${TAG}"
+            git push origin "${TAG}"
+          fi
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "gha-runner-ctl ${TAG}" --generate-notes
+          fi
+          gh release upload "$TAG" "$ARCHIVE" "$SUMS" --clobber
