@@ -139,3 +139,32 @@ jobs:
           echo "::notice title=SKIP_STUB::No Cargo.toml/pyproject — fleet-ci has no product gates"
           echo "HONEST_CI class=SKIP_STUB detail=no_stack"
           echo "Add stack files or product CI for real coverage. Do not treat this job as multi-language CI."
+
+  gate:
+    # Single aggregate required check for fleet-ci. Passes only if every needed job
+    # succeeded or was legitimately skipped (rust/python/noop are mutually exclusive by
+    # stack detection). Runs on ubuntu-latest — it does no fleet work, so keeping it off
+    # the self-hosted pool means the required check still reports promptly when the fleet
+    # is saturated.
+    name: gate
+    needs: [detect, rust, python, noop]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Aggregate fleet-ci job results
+        run: |
+          set -euo pipefail
+          fail=0
+          for jr in \
+            "detect=${{ needs.detect.result }}" \
+            "rust=${{ needs.rust.result }}" \
+            "python=${{ needs.python.result }}" \
+            "noop=${{ needs.noop.result }}"; do
+            name="${jr%%=*}"; res="${jr#*=}"
+            case "$res" in
+              success|skipped) echo "ok: $name=$res" ;;
+              *) echo "FAIL: $name=$res"; fail=1 ;;
+            esac
+          done
+          [ "$fail" -eq 0 ] || { echo "gate: a required fleet-ci job did not pass"; exit 1; }
+          echo "gate: all fleet-ci jobs passed or were legitimately skipped"

@@ -70,23 +70,45 @@ jobs:
           fi
 
   trivy-fs:
-    # Name must include advisory/experimental when continue-on-error (HONEST_CI).
-    name: trivy filesystem (advisory/experimental)
+    # Required security gate (HONEST_CI): a real vuln+secret+license scan. No
+    # continue-on-error and no skip-if-missing — the job installs a pinned+checksummed
+    # trivy so the gate always runs and can genuinely fail on findings.
+    name: trivy filesystem (vuln+secret+license)
     runs-on: [self-hosted, linux, x64, podman]
-    # Non-gating until trivy is required on fleet images. Findings fail when present.
-    continue-on-error: true
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Trivy fs
+
+      - name: Ensure trivy (pinned + checksum)
+        run: |
+          set -euo pipefail
+          # Pin must match packaging/Containerfile when image is rebuilt.
+          TRIVY_VERSION="0.72.0"
+          TRIVY_SHA256="bbb64b9695866ce4a7a8f5c9592002c5961cab378577fa3f8a040df362b9b2ea"
+          if command -v trivy >/dev/null 2>&1; then
+            echo "using preinstalled $(command -v trivy) ($(trivy --version 2>/dev/null | head -1 || true))"
+            exit 0
+          fi
+          install_dir="${RUNNER_TEMP:-/tmp}/trivy-bin"
+          mkdir -p "$install_dir"
+          archive="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          url="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${archive}"
+          tmp="${RUNNER_TEMP:-/tmp}/${archive}"
+          curl -fsSL "$url" -o "$tmp"
+          echo "${TRIVY_SHA256}  ${tmp}" | sha256sum -c -
+          tar -xzf "$tmp" -C "$install_dir" trivy
+          chmod 0755 "$install_dir/trivy"
+          echo "$install_dir" >> "$GITHUB_PATH"
+          "$install_dir/trivy" --version
+
+      - name: Trivy fs (vuln+secret+license)
         run: |
           set -euo pipefail
           if ! command -v trivy >/dev/null 2>&1; then
-            echo "::notice title=SKIP_STUB::trivy missing on runner — advisory job only"
-            echo "HONEST_CI class=SKIP_STUB detail=trivy_missing"
-            exit 0
+            echo "trivy not available after install — FAIL (honest security gate)" >&2
+            exit 1
           fi
           trivy fs --scanners vuln,secret,license \
             --severity HIGH,CRITICAL \
