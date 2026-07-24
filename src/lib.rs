@@ -40,7 +40,7 @@ const DEFAULT_RUNNER_VERSION: &str = "2.335.1";
 const DEFAULT_RUNNER_SHA256: &str =
     "4ef2f25285f0ae4477f1fe1e346db76d2f3ebf03824e2ddd1973a2819bf6c8cf";
 const DEFAULT_RUNNER_ARCH: &str = "x64";
-const UA: &str = "gha-runner-ctl/0.2.10";
+const UA: &str = "gha-runner-ctl/0.2.12";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 const MIN_POLL_SECS: u64 = 5;
 const MAX_POLL_SECS: u64 = 3600;
@@ -55,8 +55,9 @@ const DEFAULT_API_BACKOFF_SECS: u64 = 90;
 const MAX_API_BACKOFF_SECS: u64 = 900;
 /// Default listen interval for scale-up demand polling (seconds). 2–5 min band.
 const DEFAULT_LISTEN_INTERVAL_SECS: u64 = 180;
-/// Floor for user-batch demand interval (seconds).
-const USER_BATCH_MIN_INTERVAL_SECS: u64 = 120;
+/// Floor for user-batch demand interval (seconds). Overridable via GHA_LISTEN_MIN_INTERVAL.
+/// Historical 120s starved large prefer-lists under multi-job ephemeral load (see fleet debug 2026-07-22).
+const USER_BATCH_MIN_INTERVAL_SECS: u64 = 45;
 /// Default: check this many allowlisted repos per tick (round-robin stagger).
 /// 0 = all allowlisted repos each tick (still paced by min-gap).
 const DEFAULT_REPOS_PER_TICK: u32 = 1;
@@ -249,6 +250,44 @@ pub struct Cli {
     #[arg(long, env = "GHA_PREFER_REPOS", global = true)]
     prefer_repos: Option<String>,
 
+    /// Path to prefer-repos file (one `owner/repo` per line and/or CSV). Merged with GHA_PREFER_REPOS.
+    /// Survives large allowlists without overflowing env. Example: `$XDG_DATA_HOME/.../prefer.list`
+    #[arg(long, env = "GHA_PREFER_REPOS_FILE", global = true)]
+    prefer_repos_file: Option<String>,
+
+    /// Comma-separated `owner/repo` polled **every tick before** round-robin allowlist.
+    /// Use for hot queues (e.g. mycelium-lang) so they never wait a full RR cycle.
+    #[arg(long, env = "GHA_PRIORITY_REPOS", global = true)]
+    priority_repos: Option<String>,
+
+    /// Floor for listen poll interval under scope=user (seconds). Default 45.
+    #[arg(long, env = "GHA_LISTEN_MIN_INTERVAL", default_value_t = USER_BATCH_MIN_INTERVAL_SECS, global = true)]
+    listen_min_interval: u64,
+
+    /// Max repos scanned for demand in dynamic pool mode per tick (after priority set). Default 12.
+    #[arg(
+        long,
+        env = "GHA_POOL_SCAN_PER_TICK",
+        default_value_t = 12,
+        global = true
+    )]
+    pool_scan_per_tick: u32,
+
+    /// On listen start, stop+rm worker containers older than this many seconds that are not in the pool claim set.
+    /// Targets stale retain/warm leftovers. `0` disables. Default 3600.
+    #[arg(
+        long,
+        env = "GHA_REAP_STALE_SECS",
+        default_value_t = 3600,
+        global = true
+    )]
+    reap_stale_secs: u64,
+
+    /// Append one JSON line per listen tick to this path (dir created). Empty = disabled.
+    /// Default: `$XDG_DATA_HOME/gha-runner-ctl/logs/listen-ticks.jsonl` when unset via env empty string.
+    #[arg(long, env = "GHA_TICK_LOG", default_value = "auto", global = true)]
+    tick_log: String,
+
     /// Minimum milliseconds between GitHub API calls in this process (paced batching).
     #[arg(long, env = "GHA_API_MIN_GAP_MS", default_value_t = DEFAULT_API_MIN_GAP_MS, global = true)]
     api_min_gap_ms: u64,
@@ -336,6 +375,16 @@ pub enum Cmd {
         /// If true, also start containers after register (default true).
         #[arg(long, default_value_t = true)]
         start: bool,
+    },
+    /// Safe local recovery: free orphan pool claims + exited workers so new jobs can be picked up.
+    /// **Never** cancels GitHub workflow runs or deletes the Actions queue.
+    Recover {
+        /// Also force-rm exited fleet containers not in the claim set (default true).
+        #[arg(long, default_value_t = true)]
+        prune_exited: bool,
+        /// Print JSON summary to stdout (default false).
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 }
 
@@ -569,6 +618,7 @@ pub fn run() -> Result<(), String> {
             listen(&cli, interval, idle_secs, wake_port)
         }
         Cmd::Warm { gap_secs, start } => warm(&cli, gap_secs, start),
+        Cmd::Recover { prune_exited, json } => recover(&cli, prune_exited, json),
     }
 }
 
@@ -2866,6 +2916,217 @@ struct NamedRepo {
     private: Option<bool>,
 }
 
+fn parse_repo_csv(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for part in s.split([',', '\n', '\r']) {
+        let p = part.split('#').next().unwrap_or("").trim();
+        if p.is_empty() {
+            continue;
+        }
+        if is_safe_repo(p) && !out.iter().any(|x: &String| x == p) {
+            out.push(p.to_string());
+        }
+    }
+    out
+}
+
+/// Prefer list: file (if set) then env CSV. Deduped, order preserved.
+fn prefer_repos_list(cli: &Cli) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(path) = cli.prefer_repos_file.as_ref() {
+        match fs::read_to_string(path) {
+            Ok(s) => {
+                for p in parse_repo_csv(&s) {
+                    if !out.contains(&p) {
+                        out.push(p);
+                    }
+                }
+            }
+            Err(e) => eprintln!("listen: prefer-repos-file {path}: {e}"),
+        }
+    }
+    if let Some(pref) = cli.prefer_repos.as_ref() {
+        for p in parse_repo_csv(pref) {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+fn priority_repos_list(cli: &Cli) -> Vec<String> {
+    cli.priority_repos
+        .as_ref()
+        .map(|s| parse_repo_csv(s))
+        .unwrap_or_default()
+}
+
+fn tick_log_path(cli: &Cli) -> Option<PathBuf> {
+    let raw = cli.tick_log.trim();
+    if raw.is_empty()
+        || raw.eq_ignore_ascii_case("off")
+        || raw.eq_ignore_ascii_case("false")
+        || raw == "0"
+    {
+        return None;
+    }
+    if raw.eq_ignore_ascii_case("auto") {
+        let base = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        return Some(base.join("gha-runner-ctl/logs/listen-ticks.jsonl"));
+    }
+    Some(PathBuf::from(raw))
+}
+
+fn append_tick_log(path: &Path, obj: &serde_json::Value) {
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let line = obj.to_string();
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        use std::io::Write;
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+/// Normalize Podman/Go time for GNU `date -d`.
+/// Podman prints e.g. `2026-07-21 15:52:33.909118621 -0400 EDT` which GNU date rejects.
+fn normalize_podman_started_at(raw: &str) -> String {
+    let parts: Vec<&str> = raw.split_whitespace().collect();
+    // Common forms:
+    //   2026-07-21 15:52:33.909118621 -0400 EDT
+    //   2026-07-21T15:52:33.909118621-04:00
+    if parts.len() >= 3 && parts[0].contains('-') && !parts[0].contains('T') {
+        let date = parts[0];
+        let mut time = parts[1].to_string();
+        if let Some(dot) = time.find('.') {
+            time.truncate(dot);
+        }
+        let offset = parts[2]; // -0400 / +0000
+        return format!("{date} {time} {offset}");
+    }
+    // ISO-8601 single token: strip fractional seconds before offset
+    let s = raw.trim();
+    if let Some(tpos) = s.find('T') {
+        let (date, rest) = s.split_at(tpos);
+        // rest starts with T...
+        let body = &rest[1..];
+        // split time from offset (+/- or Z)
+        let mut time = body;
+        let mut offset = "";
+        if let Some(z) = body.find('Z') {
+            time = &body[..z];
+            offset = "Z";
+        } else if let Some(i) = body.rfind('+').or_else(|| {
+            // last '-' after time (skip date-style)
+            body.char_indices()
+                .skip(8)
+                .find(|(_, c)| *c == '-')
+                .map(|(i, _)| i)
+        }) {
+            time = &body[..i];
+            offset = &body[i..];
+        }
+        if let Some(dot) = time.find('.') {
+            time = &time[..dot];
+        }
+        if offset.is_empty() || offset == "Z" {
+            return format!("{date} {time} UTC");
+        }
+        // normalize +04:00 → +0400
+        let off = offset.replace(':', "");
+        return format!("{date} {time} {off}");
+    }
+    s.to_string()
+}
+
+fn container_started_age_secs(name: &str) -> Option<u64> {
+    let out = std::process::Command::new("podman")
+        .args(["inspect", "-f", "{{.State.StartedAt}}", name])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let started_raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if started_raw.is_empty() {
+        return None;
+    }
+    let started = normalize_podman_started_at(&started_raw);
+    // GNU date
+    let age = std::process::Command::new("date")
+        .args(["-d", &started, "+%s"])
+        .output()
+        .ok()?;
+    if !age.status.success() {
+        eprintln!(
+            "listen: cannot parse container start time for {name}: raw={started_raw:?} norm={started:?}"
+        );
+        return None;
+    }
+    let started_unix: u64 = String::from_utf8_lossy(&age.stdout).trim().parse().ok()?;
+    let now = now_unix();
+    Some(now.saturating_sub(started_unix))
+}
+
+/// Stop+rm fleet worker containers that are running, not in pool claims, older than reap_stale_secs.
+fn reap_stale_containers(cli: &Cli, pool: &ResourcePool) {
+    if cli.reap_stale_secs == 0 {
+        return;
+    }
+    let claimed: std::collections::HashSet<String> = pool
+        .claims()
+        .map(|c| c.into_iter().map(|x| x.container).collect())
+        .unwrap_or_default();
+    let out = match std::process::Command::new("podman")
+        .args(["ps", "--format", "{{.Names}}"])
+        .output()
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => {
+            eprintln!("listen: reap_stale: podman ps failed");
+            return;
+        }
+    };
+    let prefix = cli.container.as_str();
+    let mut considered = 0u32;
+    let mut reaped = 0u32;
+    for name in out.lines().map(str::trim).filter(|s| !s.is_empty()) {
+        // Only touch our fleet naming: base prefix, or historical retain leftovers.
+        let ours = name.starts_with(prefix)
+            || name.starts_with("gha-runner-cpu")
+            || name.starts_with("gha-runner-ctl");
+        if !ours {
+            continue;
+        }
+        if claimed.contains(name) {
+            continue;
+        }
+        considered += 1;
+        let Some(age) = container_started_age_secs(name) else {
+            continue;
+        };
+        if age < cli.reap_stale_secs {
+            continue;
+        }
+        eprintln!(
+            "listen: reap stale container {name} age={age}s (threshold={}s, not in pool claims)",
+            cli.reap_stale_secs
+        );
+        // Force-rm (no 30s graceful stop) — retain/warm leftovers must not block listen.
+        let _ = podman(&["rm", "-f", name]);
+        reaped += 1;
+    }
+    eprintln!(
+        "listen: reap_stale done considered={considered} reaped={reaped} threshold={}s claims={}",
+        cli.reap_stale_secs,
+        claimed.len()
+    );
+}
+
 fn repos_round_robin_state_path(container: &str) -> PathBuf {
     let dir = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
@@ -2916,7 +3177,27 @@ fn poll_allowlist_repos(
     pacer: &mut ApiPacer,
     repos: &[String],
 ) -> Result<(bool, Option<String>), String> {
-    for name in select_repos_for_tick(cli, repos) {
+    // Priority repos every tick, then RR subset of the rest.
+    let priority = priority_repos_list(cli);
+    let mut order: Vec<String> = priority
+        .iter()
+        .filter(|p| repos.iter().any(|r| r == *p))
+        .cloned()
+        .collect();
+    let rest: Vec<String> = repos
+        .iter()
+        .filter(|r| !priority.iter().any(|p| p == *r))
+        .cloned()
+        .collect();
+    for name in select_repos_for_tick(cli, &rest) {
+        if !order.contains(&name) {
+            order.push(name);
+        }
+    }
+    if order.is_empty() {
+        order = select_repos_for_tick(cli, repos);
+    }
+    for name in order {
         match repo_needs_runner(cli, &name, api, pacer) {
             Ok(true) => return Ok((true, Some(name))),
             Ok(false) => {}
@@ -2953,16 +3234,11 @@ fn demand(cli: &Cli, api: &str, pacer: &mut ApiPacer) -> Result<(bool, Option<St
                 let repo = repo.clone();
                 return Ok((repo_needs_runner(cli, &repo, api, pacer)?, Some(repo)));
             }
-            if let Some(pref) = cli.prefer_repos.as_ref() {
-                let repos: Vec<String> = pref
-                    .split(',')
-                    .map(|x| x.trim())
-                    .filter(|x| !x.is_empty() && is_safe_repo(x))
-                    .map(|s| s.to_string())
-                    .collect();
+            let repos = prefer_repos_list(cli);
+            if !repos.is_empty() {
                 return poll_allowlist_repos(cli, api, pacer, &repos);
             }
-            Err("repo scope: missing --repo or --prefer-repos".into())
+            Err("repo scope: missing --repo, --prefer-repos, or --prefer-repos-file".into())
         }
         Scope::Org => {
             let owner = cli.owner.as_ref().expect("validated");
@@ -2995,20 +3271,19 @@ fn demand(cli: &Cli, api: &str, pacer: &mut ApiPacer) -> Result<(bool, Option<St
         }
         Scope::User => {
             let user = cli.user.as_ref().expect("validated");
-            // Allowlist mode: when prefer_repos is set, ONLY poll those repos.
-            if let Some(pref) = cli.prefer_repos.as_ref() {
+            // Allowlist mode: when prefer list is set, ONLY poll those repos.
+            let pref = prefer_repos_list(cli);
+            if !pref.is_empty() {
+                let prefix = format!("{user}/");
                 let repos: Vec<String> = pref
-                    .split(',')
-                    .map(|x| x.trim())
-                    .filter(|x| !x.is_empty() && is_safe_repo(x))
-                    .filter(|name| name.starts_with(&format!("{user}/")))
-                    .map(|s| s.to_string())
+                    .into_iter()
+                    .filter(|name| name.starts_with(&prefix))
                     .collect();
                 return poll_allowlist_repos(cli, api, pacer, &repos);
             }
-            // Full owner list — paced + budget-capped; prefer setting GHA_PREFER_REPOS.
+            // Full owner list — paced + budget-capped; prefer GHA_PREFER_REPOS / _FILE.
             eprintln!(
-                "listen: user-batch without GHA_PREFER_REPOS scans owned repos (budget {} GETs/poll, gap {}ms)",
+                "listen: user-batch without prefer list scans owned repos (budget {} GETs/poll, gap {}ms)",
                 pacer.max_per_poll,
                 pacer.min_gap.as_millis()
             );
@@ -3237,31 +3512,46 @@ fn list_demand_jobs(
     max_jobs: usize,
 ) -> Result<Vec<DemandJob>, String> {
     let mut out = Vec::new();
-    let repos: Vec<String> = if let Some(pref) = cli.prefer_repos.as_ref() {
-        pref.split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| is_safe_repo(s))
-            .collect()
-    } else if let Some(r) = cli.repo.as_ref() {
-        vec![r.clone()]
-    } else {
-        return Ok(out);
-    };
-    let tick = select_repos_for_tick(cli, &repos);
-    // When pool-scaling, scan a modest number of repos per tick (staggered).
-    // Keep this small so budget remains for job detail GETs + registration POSTs.
-    let scan = if pool_mode_on(cli) {
-        // Always stagger via round-robin; never pin to allowlist head (starves tail repos).
-        let mut cli_scan = cli.clone_for_listen();
-        if cli.repos_per_tick == 0 {
-            cli_scan.repos_per_tick = 6;
+    let mut repos = prefer_repos_list(cli);
+    if repos.is_empty() {
+        if let Some(r) = cli.repo.as_ref() {
+            repos = vec![r.clone()];
         } else {
-            cli_scan.repos_per_tick = cli.repos_per_tick.min(6);
+            return Ok(out);
         }
-        select_repos_for_tick(&cli_scan, &repos)
+    }
+    let priority = priority_repos_list(cli);
+    // Priority repos every tick (full set, capped), then RR the rest once.
+    let mut scan: Vec<String> = Vec::new();
+    for p in &priority {
+        if (repos.iter().any(|r| r == p) || is_safe_repo(p)) && !scan.contains(p) {
+            scan.push(p.clone());
+        }
+    }
+    let rest: Vec<String> = repos
+        .iter()
+        .filter(|r| !priority.iter().any(|p| p == *r))
+        .cloned()
+        .collect();
+    let tick = if rest.is_empty() {
+        Vec::new()
+    } else if pool_mode_on(cli) {
+        let mut cli_scan = cli.clone_for_listen();
+        let cap = cli.pool_scan_per_tick.max(1);
+        if cli.repos_per_tick == 0 {
+            cli_scan.repos_per_tick = cap;
+        } else {
+            cli_scan.repos_per_tick = cli.repos_per_tick.min(cap).max(1);
+        }
+        select_repos_for_tick(&cli_scan, &rest)
     } else {
-        tick
+        select_repos_for_tick(cli, &rest)
     };
+    for r in tick {
+        if !scan.contains(&r) {
+            scan.push(r);
+        }
+    }
 
     // Prefer queued runs; also sample in_progress (multi-job matrices can still have
     // queued jobs while the run is overall in_progress). Cap hard for API budget.
@@ -3382,11 +3672,13 @@ fn ensure_worker_volume(cli: &Cli, worker_volume: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn reap_pool_workers(cli: &Cli, pool: &ResourcePool) {
+/// Returns number of claims released.
+fn reap_pool_workers(cli: &Cli, pool: &ResourcePool) -> u32 {
     let Ok(claims) = pool.claims() else {
-        return;
+        return 0;
     };
     let now = now_unix();
+    let mut n = 0u32;
     for c in claims {
         // Only reap workers owned by this listen base name prefix
         if !c.container.starts_with(&cli.container) {
@@ -3410,8 +3702,114 @@ fn reap_pool_workers(cli: &Cli, pool: &ResourcePool) {
                 eprintln!("pool: release {} failed: {}", c.worker_id, redact(&e));
                 let _ = pool.release_container(&c.container);
             }
+            n += 1;
         }
     }
+    n
+}
+
+/// Prune exited fleet worker containers that are not in active claims.
+/// Does **not** touch running workers or cancel any GitHub Actions runs.
+fn prune_exited_fleet_workers(cli: &Cli, pool: &ResourcePool) -> u32 {
+    let claimed: std::collections::HashSet<String> = pool
+        .claims()
+        .map(|c| c.into_iter().map(|x| x.container).collect())
+        .unwrap_or_default();
+    let out = match std::process::Command::new("podman")
+        .args(["ps", "-a", "--format", "{{.Names}}\t{{.Status}}"])
+        .output()
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => return 0,
+    };
+    let prefix = cli.container.as_str();
+    let mut n = 0u32;
+    for line in out.lines() {
+        let Some((name, status)) = line.split_once('\t') else {
+            continue;
+        };
+        let name = name.trim();
+        let status = status.trim().to_ascii_lowercase();
+        if name.is_empty() {
+            continue;
+        }
+        let ours = name.starts_with(prefix)
+            || name.starts_with("gha-runner-cpu")
+            || name.starts_with("gha-runner-ctl");
+        if !ours || claimed.contains(name) {
+            continue;
+        }
+        // Only remove clearly stopped/exited/created leftovers — never "up".
+        let removable = status.starts_with("exited")
+            || status.starts_with("created")
+            || status.starts_with("dead")
+            || status.contains("exited");
+        if !removable {
+            continue;
+        }
+        eprintln!("recover: prune exited leftover {name} ({status})");
+        let _ = podman(&["rm", "-f", name]);
+        n += 1;
+    }
+    n
+}
+
+/// Safe recovery: free local capacity so listen can pick up **queued** GitHub jobs.
+/// Explicitly does **not** cancel or delete workflow runs (queue is preserved on GitHub).
+fn recover(cli: &Cli, prune_exited: bool, json: bool) -> Result<(), String> {
+    std::env::set_var("GHA_POOL_CPUS", &cli.pool_cpus);
+    std::env::set_var("GHA_POOL_MEMORY", &cli.pool_memory);
+    std::env::set_var("GHA_POOL_MAX_WORKERS", cli.pool_max_workers.to_string());
+    std::env::set_var("GHA_POOL_MODE", &cli.pool_mode);
+    let pool = ResourcePool::from_env();
+
+    let (c0, m0, n0) = pool.usage().unwrap_or((0.0, 0, 0));
+    eprintln!(
+        "recover: start usage={c0:.2}/{:.0}c {m0}/{}MiB claims={n0} (will NOT cancel GitHub runs)",
+        pool.max_cpus, pool.max_memory_mib
+    );
+
+    let reaped = reap_pool_workers(cli, &pool);
+    let mut pruned = 0u32;
+    if prune_exited {
+        pruned = prune_exited_fleet_workers(cli, &pool);
+    }
+    // Second pass: claims may point at containers we just pruned.
+    let reaped2 = reap_pool_workers(cli, &pool);
+
+    if matches!(cli.mode, Mode::Ephemeral) {
+        reap_stale_containers(cli, &pool);
+    }
+
+    let (c1, m1, n1) = pool.usage().unwrap_or((0.0, 0, 0));
+    let free_c = (pool.max_cpus - c1).max(0.0);
+    let free_m = pool.max_memory_mib.saturating_sub(m1);
+    eprintln!(
+        "recover: done reaped_claims={} pruned_containers={pruned} usage={c1:.2}/{:.0}c {m1}/{}MiB claims={n1} free≈{free_c:.2}c/{free_m}MiB",
+        reaped + reaped2,
+        pool.max_cpus,
+        pool.max_memory_mib
+    );
+    eprintln!(
+        "recover: next — leave listen running (or restart gha-runner-ctl@cpu); queued Actions jobs stay on GitHub and will be claimed when demand poll runs"
+    );
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "reaped_claims": reaped + reaped2,
+                "pruned_containers": pruned,
+                "pool_cpus_used": c1,
+                "pool_mem_mib_used": m1,
+                "pool_claims": n1,
+                "pool_cpus_free": free_c,
+                "pool_mem_mib_free": free_m,
+                "cancels_github_runs": false,
+            })
+        );
+    }
+    Ok(())
 }
 
 /// Merge fleet base labels with job-requested size/capability labels + tier tag.
@@ -3514,8 +3912,9 @@ fn spawn_sized_worker(
 }
 
 fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> Result<(), String> {
+    let floor = cli.listen_min_interval.max(15);
     let interval = if matches!(cli.scope, Scope::User) {
-        interval.max(USER_BATCH_MIN_INTERVAL_SECS)
+        interval.max(floor)
     } else {
         interval
     };
@@ -3527,8 +3926,11 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
 
     let pool = ResourcePool::from_env();
     let dynamic = pool_mode_on(cli);
+    let prefer_n = prefer_repos_list(cli).len();
+    let prio_n = priority_repos_list(cli).len();
+    let tick_path = tick_log_path(cli);
     eprintln!(
-        "listen: scope={:?} poll={interval}s idle={idle_secs}s mode={:?} api_gap={}ms max_per_poll={} pool={} ({:.0}c/{}MiB max_workers={})",
+        "listen: scope={:?} poll={interval}s (floor={floor}) idle={idle_secs}s mode={:?} api_gap={}ms max_per_poll={} pool={} ({:.0}c/{}MiB max_workers={}) prefer={prefer_n} priority={prio_n} scan/tick={} reap_stale={}s",
         cli.scope,
         cli.mode,
         cli.api_min_gap_ms,
@@ -3537,11 +3939,20 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
         pool.max_cpus,
         pool.max_memory_mib,
         pool.max_workers.min(cli.pool_max_workers),
+        cli.pool_scan_per_tick,
+        cli.reap_stale_secs,
     );
-    if matches!(cli.scope, Scope::User) && cli.prefer_repos.is_none() {
+    if matches!(cli.scope, Scope::User) && prefer_n == 0 {
         eprintln!(
-            "listen: warning: set GHA_PREFER_REPOS=owner/r1,owner/r2 (allowlist) to stay within API budgets"
+            "listen: warning: set GHA_PREFER_REPOS or GHA_PREFER_REPOS_FILE (allowlist) to stay within API budgets"
         );
+    }
+    if let Some(ref path) = tick_path {
+        eprintln!("listen: tick log → {}", path.display());
+    }
+    // Drop stale retain/warm leftovers so they cannot steal confusion or budget.
+    if matches!(cli.mode, Mode::Ephemeral) {
+        reap_stale_containers(cli, &pool);
     }
     if !volume_exists(&cli.volume) {
         eprintln!("listen: snapshot missing — prepare…");
@@ -3575,7 +3986,10 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
 
         // Always reap finished pool workers first (frees budget).
         if dynamic {
-            reap_pool_workers(&cli, &pool);
+            let n = reap_pool_workers(&cli, &pool);
+            if n > 0 {
+                eprintln!("listen: reaped {n} finished/orphan claim(s) before poll");
+            }
         }
 
         let api = match github_token() {
@@ -3590,6 +4004,8 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
         if dynamic {
             // Reset per-poll GET budget every tick (demand() does this; dynamic path must too).
             pacer.begin_poll();
+            // Free capacity again if workers finished during API cool-down.
+            let _ = reap_pool_workers(&cli, &pool);
             let jobs = match list_demand_jobs(&cli, &api, &mut pacer, max_local as usize * 2) {
                 Ok(j) => j,
                 Err(e) => {
@@ -3652,8 +4068,19 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
                         eprintln!("pool: local max workers {max_local} reached");
                         break;
                     }
+                    // Free any workers that finished mid-batch before claiming budget.
+                    let _ = reap_pool_workers(&cli, &pool);
                     if let Err(e) = spawn_sized_worker(&cli, &pool, slot, job) {
                         eprintln!("pool: spawn failed: {}", redact(&e));
+                        // Budget may be stuck on exited claims — reap and retry once.
+                        let freed = reap_pool_workers(&cli, &pool);
+                        if freed > 0 {
+                            if let Err(e2) = spawn_sized_worker(&cli, &pool, slot, job) {
+                                eprintln!("pool: spawn retry failed: {}", redact(&e2));
+                            } else {
+                                spawned += 1;
+                            }
+                        }
                     } else {
                         spawned += 1;
                     }
@@ -3664,6 +4091,24 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
                     eprintln!(
                         "pool: spawned={spawned} usage={uc:.2}/{:.0}c {um}/{}MiB claims={n}",
                         pool.max_cpus, pool.max_memory_mib
+                    );
+                }
+                if let Some(ref path) = tick_path {
+                    let (uc, um, n) = pool.usage().unwrap_or((0.0, 0, 0));
+                    append_tick_log(
+                        path,
+                        &serde_json::json!({
+                            "ts_unix": now_unix(),
+                            "jobs": jobs.len(),
+                            "spawned": spawned,
+                            "running": running_n,
+                            "pool_cpus_used": uc,
+                            "pool_mem_mib_used": um,
+                            "pool_claims": n,
+                            "prefer": prefer_n,
+                            "priority": prio_n,
+                            "mode": "dynamic",
+                        }),
                     );
                 }
             }
@@ -3757,6 +4202,20 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
             } else {
                 idle_since = None;
             }
+            if let Some(ref path) = tick_path {
+                append_tick_log(
+                    path,
+                    &serde_json::json!({
+                        "ts_unix": now_unix(),
+                        "need": need,
+                        "target": target_repo,
+                        "running": container_running(&cli.container),
+                        "prefer": prefer_n,
+                        "priority": prio_n,
+                        "mode": "legacy",
+                    }),
+                );
+            }
         }
 
         thread::sleep(Duration::from_secs(interval));
@@ -3794,6 +4253,12 @@ impl Cli {
             demand_require_labels: self.demand_require_labels.clone(),
             demand_exclude_labels: self.demand_exclude_labels.clone(),
             prefer_repos: self.prefer_repos.clone(),
+            prefer_repos_file: self.prefer_repos_file.clone(),
+            priority_repos: self.priority_repos.clone(),
+            listen_min_interval: self.listen_min_interval,
+            pool_scan_per_tick: self.pool_scan_per_tick,
+            reap_stale_secs: self.reap_stale_secs,
+            tick_log: self.tick_log.clone(),
             api_min_gap_ms: self.api_min_gap_ms,
             api_max_per_poll: self.api_max_per_poll,
             api_backoff_secs: self.api_backoff_secs,
@@ -3843,6 +4308,12 @@ struct CliSnap {
     demand_require_labels: Option<String>,
     demand_exclude_labels: Option<String>,
     prefer_repos: Option<String>,
+    prefer_repos_file: Option<String>,
+    priority_repos: Option<String>,
+    listen_min_interval: u64,
+    pool_scan_per_tick: u32,
+    reap_stale_secs: u64,
+    tick_log: String,
     api_min_gap_ms: u64,
     api_max_per_poll: u32,
     api_backoff_secs: u64,
@@ -3890,6 +4361,12 @@ fn cli_snapshot(cli: &Cli) -> CliSnap {
         demand_require_labels: cli.demand_require_labels.clone(),
         demand_exclude_labels: cli.demand_exclude_labels.clone(),
         prefer_repos: cli.prefer_repos.clone(),
+        prefer_repos_file: cli.prefer_repos_file.clone(),
+        priority_repos: cli.priority_repos.clone(),
+        listen_min_interval: cli.listen_min_interval,
+        pool_scan_per_tick: cli.pool_scan_per_tick,
+        reap_stale_secs: cli.reap_stale_secs,
+        tick_log: cli.tick_log.clone(),
         api_min_gap_ms: cli.api_min_gap_ms,
         api_max_per_poll: cli.api_max_per_poll,
         api_backoff_secs: cli.api_backoff_secs,
@@ -3939,6 +4416,12 @@ fn snap_to_cli(s: &CliSnap) -> Cli {
         demand_require_labels: s.demand_require_labels.clone(),
         demand_exclude_labels: s.demand_exclude_labels.clone(),
         prefer_repos: s.prefer_repos.clone(),
+        prefer_repos_file: s.prefer_repos_file.clone(),
+        priority_repos: s.priority_repos.clone(),
+        listen_min_interval: s.listen_min_interval,
+        pool_scan_per_tick: s.pool_scan_per_tick,
+        reap_stale_secs: s.reap_stale_secs,
+        tick_log: s.tick_log.clone(),
         api_min_gap_ms: s.api_min_gap_ms,
         api_max_per_poll: s.api_max_per_poll,
         api_backoff_secs: s.api_backoff_secs,
@@ -4053,5 +4536,45 @@ fn wake_server(port: u16, snap: CliSnap, token: String) {
             "HTTP/1.1 {code}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod robust_queue_tests {
+    use super::*;
+
+    #[test]
+    fn parse_repo_csv_dedupes_and_strips_comments() {
+        let s = "tzervas/mycelium-lang, tzervas/cabal-devmelopner\n# comment\ntzervas/mycelium-lang\nbad;repo\n";
+        let v = parse_repo_csv(s);
+        assert_eq!(
+            v,
+            vec![
+                "tzervas/mycelium-lang".to_string(),
+                "tzervas/cabal-devmelopner".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_repo_csv_newlines_and_hash_inline() {
+        let s = "owner/a # note\nowner/b\r\nowner/c";
+        let v = parse_repo_csv(s);
+        assert_eq!(v, vec!["owner/a", "owner/b", "owner/c"]);
+    }
+
+    #[test]
+    fn normalize_podman_started_at_go_format() {
+        let raw = "2026-07-21 15:52:33.909118621 -0400 EDT";
+        assert_eq!(
+            normalize_podman_started_at(raw),
+            "2026-07-21 15:52:33 -0400"
+        );
+    }
+
+    #[test]
+    fn normalize_podman_started_at_iso() {
+        let raw = "2026-07-21T19:52:33.909118621Z";
+        assert_eq!(normalize_podman_started_at(raw), "2026-07-21 19:52:33 UTC");
     }
 }

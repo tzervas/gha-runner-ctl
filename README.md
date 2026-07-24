@@ -233,6 +233,21 @@ gha-runner-ctl down
 
 Global flags (selection): `--scope`, `--repo`, `--owner`, `--user`, `--auto`, `--full-auto`, `--mode ephemeral|retain`, `--public-only` / `--private-only` / `--all-repos`, `--skip-host-update` (prepare), `GHA_WAKE_TOKEN` + `listen --wake-port`.
 
+### Robust queue drain (0.2.12+)
+
+Large prefer-lists + ephemeral multi-job CI can starve hot repos under pure round-robin. Prefer:
+
+| Knob | Env | Purpose |
+|------|-----|---------|
+| `--prefer-repos-file` | `GHA_PREFER_REPOS_FILE` | Durable allowlist file (one `owner/repo` per line) |
+| `--priority-repos` | `GHA_PRIORITY_REPOS` | Polled **every tick** before RR (umbrellas / hot queues) |
+| `--pool-scan-per-tick` | `GHA_POOL_SCAN_PER_TICK` | Non-priority scan width (default 12) |
+| `--listen-min-interval` | `GHA_LISTEN_MIN_INTERVAL` | User-batch poll floor (default 45s) |
+| `--reap-stale-secs` | `GHA_REAP_STALE_SECS` | Reap unclaimed retain/warm leftovers on listen start |
+| `--tick-log` | `GHA_TICK_LOG` | `auto` → JSONL tick metrics under `$XDG_DATA_HOME` |
+
+See [docs/troubleshoot/FLEET_QUEUE_STALL_2026-07-22.md](docs/troubleshoot/FLEET_QUEUE_STALL_2026-07-22.md).
+
 ## Modes
 
 | Mode | Behavior |
@@ -263,7 +278,7 @@ See [docs/CONSUMERS.md](docs/CONSUMERS.md).
 
 Install and listen are safe unattended on a prepared machine; host package upgrades touch the workstation and stay human-gated.
 
-1. Install 0.2.10 (release tarball above, or `bash packaging/install-ctl.sh` from source).
+1. Install 0.2.12 (release tarball above, or `bash packaging/install-ctl.sh` from source).
 2. Authenticate: `gh auth login` and/or GCM and/or `GH_TOKEN` (least privilege for registration).
 3. Prepare (builds image + snapshot; by default also runs host `apt`/`dnf` upgrade):
 
