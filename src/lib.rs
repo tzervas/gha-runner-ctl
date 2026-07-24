@@ -10,11 +10,19 @@
 //! multiple ephemeral workers sized from job complexity within a host budget
 //! (default 8 CPU / 8 GiB shared across all managers).
 
+mod image_arch;
 mod pool;
 
+pub use image_arch::{
+    binfmt_lists_arch, binfmt_missing_error, ensure_binfmt_for_arch, extra_image_arch_labels,
+    load_image_map, parse_image_map, podman_platform_args, resolve_arch_from_labels,
+    resolve_job_image_arch, ImageMap, JobImageArch, TargetArch,
+};
 pub use pool::{
-    fit_to_budget, format_cpus, format_memory_mib, parse_cpus_f64, parse_memory_mib,
-    resources_for_tier, size_for_job, ResourcePool, SizeTier,
+    demand_empty_confirmed, empty_sweep_ticks, fit_to_budget, format_cpus, format_memory_mib,
+    is_busy, parse_cpus_f64, parse_memory_mib, plan_scale, resources_for_tier, size_for_job,
+    DemandSignal, ResourcePool, ScaleInput, ScalePlan, SizeTier, SpawnRequest, WorkerSnapshot,
+    DEFAULT_MAX_SPAWN_PER_TICK,
 };
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -40,7 +48,7 @@ const DEFAULT_RUNNER_VERSION: &str = "2.335.1";
 const DEFAULT_RUNNER_SHA256: &str =
     "4ef2f25285f0ae4477f1fe1e346db76d2f3ebf03824e2ddd1973a2819bf6c8cf";
 const DEFAULT_RUNNER_ARCH: &str = "x64";
-const UA: &str = "gha-runner-ctl/0.2.10";
+const UA: &str = "gha-runner-ctl/0.3.0";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 const MIN_POLL_SECS: u64 = 5;
 const MAX_POLL_SECS: u64 = 3600;
@@ -55,8 +63,9 @@ const DEFAULT_API_BACKOFF_SECS: u64 = 90;
 const MAX_API_BACKOFF_SECS: u64 = 900;
 /// Default listen interval for scale-up demand polling (seconds). 2–5 min band.
 const DEFAULT_LISTEN_INTERVAL_SECS: u64 = 180;
-/// Floor for user-batch demand interval (seconds).
-const USER_BATCH_MIN_INTERVAL_SECS: u64 = 120;
+/// Floor for user-batch demand interval (seconds). Overridable via GHA_LISTEN_MIN_INTERVAL.
+/// Historical 120s starved large prefer-lists under multi-job ephemeral load (see fleet debug 2026-07-22).
+const USER_BATCH_MIN_INTERVAL_SECS: u64 = 45;
 /// Default: check this many allowlisted repos per tick (round-robin stagger).
 /// 0 = all allowlisted repos each tick (still paced by min-gap).
 const DEFAULT_REPOS_PER_TICK: u32 = 1;
@@ -249,6 +258,44 @@ pub struct Cli {
     #[arg(long, env = "GHA_PREFER_REPOS", global = true)]
     prefer_repos: Option<String>,
 
+    /// Path to prefer-repos file (one `owner/repo` per line and/or CSV). Merged with GHA_PREFER_REPOS.
+    /// Survives large allowlists without overflowing env. Example: `$XDG_DATA_HOME/.../prefer.list`
+    #[arg(long, env = "GHA_PREFER_REPOS_FILE", global = true)]
+    prefer_repos_file: Option<String>,
+
+    /// Comma-separated `owner/repo` polled **every tick before** round-robin allowlist.
+    /// Use for hot queues (e.g. mycelium-lang) so they never wait a full RR cycle.
+    #[arg(long, env = "GHA_PRIORITY_REPOS", global = true)]
+    priority_repos: Option<String>,
+
+    /// Floor for listen poll interval under scope=user (seconds). Default 45.
+    #[arg(long, env = "GHA_LISTEN_MIN_INTERVAL", default_value_t = USER_BATCH_MIN_INTERVAL_SECS, global = true)]
+    listen_min_interval: u64,
+
+    /// Max repos scanned for demand in dynamic pool mode per tick (after priority set). Default 12.
+    #[arg(
+        long,
+        env = "GHA_POOL_SCAN_PER_TICK",
+        default_value_t = 12,
+        global = true
+    )]
+    pool_scan_per_tick: u32,
+
+    /// On listen start, stop+rm worker containers older than this many seconds that are not in the pool claim set.
+    /// Targets stale retain/warm leftovers. `0` disables. Default 3600.
+    #[arg(
+        long,
+        env = "GHA_REAP_STALE_SECS",
+        default_value_t = 3600,
+        global = true
+    )]
+    reap_stale_secs: u64,
+
+    /// Append one JSON line per listen tick to this path (dir created). Empty = disabled.
+    /// Default: `$XDG_DATA_HOME/gha-runner-ctl/logs/listen-ticks.jsonl` when unset via env empty string.
+    #[arg(long, env = "GHA_TICK_LOG", default_value = "auto", global = true)]
+    tick_log: String,
+
     /// Minimum milliseconds between GitHub API calls in this process (paced batching).
     #[arg(long, env = "GHA_API_MIN_GAP_MS", default_value_t = DEFAULT_API_MIN_GAP_MS, global = true)]
     api_min_gap_ms: u64,
@@ -295,6 +342,16 @@ pub struct Cli {
     /// Enable dynamic multi-worker pool sizing (default true).
     #[arg(long, env = "GHA_POOL_MODE", default_value = "dynamic", global = true)]
     pool_mode: String,
+
+    /// Path to label→image map (JSON or minimal TOML). Merged over built-in distro defaults.
+    /// See docs/WORK_IMAGES.md and packaging/image-map.example.json. Issue #28.
+    #[arg(long, env = "GHA_IMAGE_MAP", global = true)]
+    image_map: Option<PathBuf>,
+
+    /// Podman `--platform` for work containers (e.g. `linux/arm64`). Usually set from
+    /// job arch labels at spawn; CLI/env override applies to single-container `up`.
+    #[arg(long, env = "GHA_PLATFORM", global = true)]
+    platform: Option<String>,
 }
 
 #[derive(Debug, Subcommand, Clone)]
@@ -336,6 +393,16 @@ pub enum Cmd {
         /// If true, also start containers after register (default true).
         #[arg(long, default_value_t = true)]
         start: bool,
+    },
+    /// Safe local recovery: free orphan pool claims + exited workers so new jobs can be picked up.
+    /// **Never** cancels GitHub workflow runs or deletes the Actions queue.
+    Recover {
+        /// Also force-rm exited fleet containers not in the claim set (default true).
+        #[arg(long, default_value_t = true)]
+        prune_exited: bool,
+        /// Print JSON summary to stdout (default false).
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 }
 
@@ -569,6 +636,7 @@ pub fn run() -> Result<(), String> {
             listen(&cli, interval, idle_secs, wake_port)
         }
         Cmd::Warm { gap_secs, start } => warm(&cli, gap_secs, start),
+        Cmd::Recover { prune_exited, json } => recover(&cli, prune_exited, json),
     }
 }
 
@@ -1115,6 +1183,21 @@ fn validate_cli(cli: &Cli) -> Result<(), String> {
             return Err("GHA_WAKE_TOKEN must be at least 16 characters when set".into());
         }
     }
+    if let Some(p) = cli.platform.as_ref() {
+        let p = p.trim();
+        if p.is_empty()
+            || p.len() > 64
+            || !p
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.'))
+        {
+            return Err("invalid --platform (expected e.g. linux/arm64)".into());
+        }
+    }
+    if let Some(path) = cli.image_map.as_ref() {
+        // Validate map is readable/parseable early (listen/up/prepare).
+        load_image_map(Some(path.as_path()))?;
+    }
     Ok(())
 }
 
@@ -1224,13 +1307,40 @@ impl InstanceLock {
     }
 }
 
-fn lock_is_stale(path: &Path) -> bool {
+/// A lock file is written in two steps — `create_new` then `writeln!(pid)` — so an
+/// empty or partially-written file may belong to a *live* holder that is mid-creation,
+/// not a crashed remnant. Reclaiming it in that window would steal a live lock (TOCTOU).
+/// Only treat an unreadable/unparseable lock as stale once it has aged past this grace,
+/// which is far longer than the microsecond create→write gap but short enough to clear a
+/// genuinely crashed-mid-write lock promptly.
+const LOCK_WRITE_GRACE_SECS: u64 = 5;
+
+/// True iff `path` is older than [`LOCK_WRITE_GRACE_SECS`] (or its mtime can't be read /
+/// it's already gone). Used only for the incomplete-content branches of [`lock_is_stale`].
+fn lock_incomplete_and_aged(path: &Path) -> bool {
+    match fs::metadata(path).and_then(|m| m.modified()) {
+        Ok(mtime) => mtime
+            .elapsed()
+            .map(|age| age.as_secs() >= LOCK_WRITE_GRACE_SECS)
+            // Clock went backwards → be conservative, keep it (not yet stale).
+            .unwrap_or(false),
+        // No metadata: nothing to protect (already removed / unreadable) → stale.
+        Err(_) => true,
+    }
+}
+
+pub(crate) fn lock_is_stale(path: &Path) -> bool {
     let Ok(s) = fs::read_to_string(path) else {
-        return true;
+        // Unreadable: only stale if it is not a lock being created right now.
+        return lock_incomplete_and_aged(path);
     };
     let Ok(pid) = s.trim().parse::<u32>() else {
-        return true;
+        // Empty/partial content: a holder may be between create_new and writeln!(pid).
+        return lock_incomplete_and_aged(path);
     };
+    // Parseable PID: stale iff the process is gone. (`kill -0` EPERM would mean the
+    // process exists under another uid; on the single-user fleet host that does not
+    // arise, and ESRCH is the stale signal we want.)
     Command::new("kill")
         .args(["-0", &pid.to_string()])
         .stdout(Stdio::null())
@@ -1798,6 +1908,16 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+struct ExclusiveLockGuard {
+    path: PathBuf,
+}
+
+impl Drop for ExclusiveLockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 /// Wait for host-wide registration budget (min gap + max per hour).
 fn pace_registration(cli: &Cli) -> Result<(), String> {
     let (lock_path, state_path) = reg_pace_paths();
@@ -1819,6 +1939,9 @@ fn pace_registration(cli: &Cli) -> Result<(), String> {
         {
             Ok(mut f) => {
                 let _ = writeln!(f, "{}", std::process::id());
+                let _guard = ExclusiveLockGuard {
+                    path: exclusive.clone(),
+                };
                 let mut state: RegPaceState = fs::read_to_string(&state_path)
                     .ok()
                     .and_then(|s| serde_json::from_str(&s).ok())
@@ -1826,7 +1949,6 @@ fn pace_registration(cli: &Cli) -> Result<(), String> {
                 let now = now_unix();
                 state.recent.retain(|t| now.saturating_sub(*t) < 3600);
                 if state.recent.len() as u32 >= max_hour {
-                    let _ = fs::remove_file(&exclusive);
                     // Do NOT spin-sleep here — that freezes the listen loop (no reap, no other
                     // repos). Surface budget pressure and let the outer loop continue.
                     let oldest = state.recent.iter().copied().min().unwrap_or(now);
@@ -1841,17 +1963,20 @@ fn pace_registration(cli: &Cli) -> Result<(), String> {
                     let elapsed = now.saturating_sub(state.last_unix);
                     if elapsed < min_gap {
                         let wait = min_gap - elapsed;
-                        let _ = fs::remove_file(&exclusive);
                         eprintln!("register: pacing {wait}s before next registration-token POST");
+                        drop(_guard);
                         thread::sleep(Duration::from_secs(wait));
                         continue;
                     }
                 }
                 // Budget enforced here; slot committed only after successful token mint.
-                let _ = fs::remove_file(&exclusive);
                 return Ok(());
             }
             Err(_) => {
+                if attempt == 0 && lock_is_stale(&exclusive) {
+                    let _ = fs::remove_file(&exclusive);
+                    continue;
+                }
                 thread::sleep(Duration::from_millis(200 + (attempt as u64 % 5) * 100));
             }
         }
@@ -1859,40 +1984,58 @@ fn pace_registration(cli: &Cli) -> Result<(), String> {
     Err("register: could not acquire registration pace lock".into())
 }
 
+/// Best-effort acquire of a short-lived `create_new` exclusive lock, returning an RAII
+/// guard that unlinks it on drop, or `None` if the lock is held by a live process (the
+/// caller then skips its best-effort update — the same "skip if locked" semantics the
+/// old code had). Reclaims a lock only when a *failed* `create_new` (`AlreadyExists`) is
+/// followed by a positive [`lock_is_stale`] check; it never removes the file
+/// preemptively, so it cannot delete a live holder's lock that is merely mid-creation.
+fn try_acquire_exclusive(path: &Path) -> Option<ExclusiveLockGuard> {
+    for attempt in 0..2 {
+        match OpenOptions::new().write(true).create_new(true).open(path) {
+            Ok(mut f) => {
+                let _ = writeln!(f, "{}", std::process::id());
+                return Some(ExclusiveLockGuard {
+                    path: path.to_path_buf(),
+                });
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if attempt == 0 && lock_is_stale(path) {
+                    let _ = fs::remove_file(path);
+                    continue;
+                }
+                return None;
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
 /// Record a successful registration-token mint in the host-wide hourly budget.
 fn commit_registration_slot() {
     let (lock_path, state_path) = reg_pace_paths();
     let exclusive = lock_path.with_extension("exclusive");
-    if OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&exclusive)
-        .is_ok()
-    {
-        let mut state: RegPaceState = fs::read_to_string(&state_path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-        let now = now_unix();
-        state.recent.retain(|t| now.saturating_sub(*t) < 3600);
-        state.last_unix = now;
-        state.recent.push(now);
-        if let Ok(s) = serde_json::to_string(&state) {
-            let _ = fs::write(&state_path, s);
-        }
-        let _ = fs::remove_file(&exclusive);
+    let Some(_guard) = try_acquire_exclusive(&exclusive) else {
+        return;
+    };
+    let mut state: RegPaceState = fs::read_to_string(&state_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let now = now_unix();
+    state.recent.retain(|t| now.saturating_sub(*t) < 3600);
+    state.last_unix = now;
+    state.recent.push(now);
+    if let Ok(s) = serde_json::to_string(&state) {
+        let _ = fs::write(&state_path, s);
     }
 }
 
 fn note_registration_failure_backoff(secs: u64) {
     let (lock_path, state_path) = reg_pace_paths();
     let exclusive = lock_path.with_extension("exclusive");
-    if OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&exclusive)
-        .is_ok()
-    {
+    if let Some(_guard) = try_acquire_exclusive(&exclusive) {
         let mut state: RegPaceState = fs::read_to_string(&state_path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
@@ -1902,7 +2045,6 @@ fn note_registration_failure_backoff(secs: u64) {
         if let Ok(s) = serde_json::to_string(&state) {
             let _ = fs::write(&state_path, s);
         }
-        let _ = fs::remove_file(&exclusive);
     }
     eprintln!("register: backing off {secs}s after failed registration-token POST");
     thread::sleep(Duration::from_secs(secs));
@@ -2034,6 +2176,30 @@ fn podman_ok(args: &[&str]) -> bool {
 
 fn container_running(name: &str) -> bool {
     podman(&["inspect", "-f", "{{.State.Running}}", name]).is_ok_and(|s| s == "true")
+}
+
+/// Local per-worker busy signal for scale-in safety.
+///
+/// Does **not** consult the demand scan (which is only a partial prefer-repo RR
+/// sample). Uses the actions/runner process tree inside the container:
+/// `Runner.Worker` is present only while a job is executing; idle online
+/// runners only have `Runner.Listener`.
+///
+/// Fail-closed: if the container is running but process inspection fails, treat
+/// as busy so we never tear down a mid-job worker under uncertainty.
+fn container_worker_busy(name: &str) -> bool {
+    if !container_running(name) {
+        return false;
+    }
+    match podman(&["top", name]) {
+        Ok(out) => {
+            let lower = out.to_ascii_lowercase();
+            // actions/runner spawns Runner.Worker (any path / casing) for the job.
+            lower.contains("runner.worker")
+        }
+        // Cannot prove idle → not eligible for scale-in.
+        Err(_) => true,
+    }
 }
 
 fn container_exists(name: &str) -> bool {
@@ -2264,7 +2430,27 @@ fn prepare_build_image(cli: &Cli) -> Result<(), String> {
 }
 
 fn ensure_image_present(image: &str, pull: &PullPolicy) -> Result<(), String> {
+    ensure_image_present_platform(image, pull, None)
+}
+
+/// Ensure image is local; when `platform` is set, pull with `--platform` so the
+/// correct arch manifest is fetched for cross-arch emulation (#28).
+fn ensure_image_present_platform(
+    image: &str,
+    pull: &PullPolicy,
+    platform: Option<&str>,
+) -> Result<(), String> {
     let exists = podman(&["image", "exists", image]).is_ok();
+    let pull_with_platform = |img: &str| -> Result<(), String> {
+        if let Some(plat) = platform {
+            if !plat.is_empty() {
+                eprintln!("prepare: pulling {img} --platform {plat}");
+                return podman(&["pull", "--platform", plat, img]).map(|_| ());
+            }
+        }
+        eprintln!("prepare: pulling {img}");
+        podman(&["pull", img]).map(|_| ())
+    };
     match pull {
         PullPolicy::Never => {
             if !exists {
@@ -2277,17 +2463,17 @@ fn ensure_image_present(image: &str, pull: &PullPolicy) -> Result<(), String> {
         }
         PullPolicy::Missing => {
             if exists {
+                // Local tag may be host-arch only; `podman run --platform` + --pull=missing
+                // fetches the right manifest at spawn when needed.
                 eprintln!("prepare: image {image} already present (pull=missing)");
                 Ok(())
             } else {
-                eprintln!("prepare: pulling {image} (pull=missing)");
-                podman(&["pull", image])?;
+                pull_with_platform(image)?;
                 Ok(())
             }
         }
         PullPolicy::Always => {
-            eprintln!("prepare: pulling {image} (pull=always)");
-            podman(&["pull", image])?;
+            pull_with_platform(image)?;
             Ok(())
         }
     }
@@ -2601,6 +2787,25 @@ fn up(cli: &Cli) -> Result<(), String> {
     if matches!(cli.scope, Scope::User) && cli.repo.is_none() {
         return Err("user batch: no active repo with demand (listen selects it)".into());
     }
+    // Explicit GHA_PLATFORM / --platform: refuse when binfmt cannot run that arch.
+    if let Some(plat) = cli.platform.as_deref() {
+        let host = TargetArch::host();
+        let target = match plat {
+            "linux/amd64" | "linux/x86_64" => Some(TargetArch::Amd64),
+            "linux/arm64" | "linux/aarch64" => Some(TargetArch::Arm64),
+            "linux/arm/v7" | "linux/arm" => Some(TargetArch::Arm),
+            "linux/riscv64" => Some(TargetArch::Riscv64),
+            "linux/386" => Some(TargetArch::X86),
+            "linux/s390x" => Some(TargetArch::S390x),
+            "linux/ppc64le" => Some(TargetArch::Ppc64le),
+            _ => None,
+        };
+        if let Some(arch) = target {
+            if arch != host {
+                ensure_binfmt_for_arch(arch, true, None)?;
+            }
+        }
+    }
 
     let ephemeral = effective_ephemeral(cli);
     // Retain reuse: if we already have runner config on the volume for this repo,
@@ -2628,10 +2833,12 @@ fn up(cli: &Cli) -> Result<(), String> {
     let img_mode = effective_image_mode(&cli.image_mode, &cli.image);
     let pull_arg = work_image_pull_arg(cli);
     eprintln!(
-        "up: scope={:?} mode={:?} image_mode={img_mode:?} pull={pull_arg} ephemeral={ephemeral} user={} url={}",
+        "up: scope={:?} mode={:?} image_mode={img_mode:?} pull={pull_arg} platform={:?} ephemeral={ephemeral} user={} image={} url={}",
         cli.scope,
         cli.mode,
+        cli.platform,
         cli.runner_user,
+        cli.image,
         github_url(cli)
     );
     let env_path_str = env_path.to_str().ok_or("env path not utf-8")?.to_string();
@@ -2654,9 +2861,16 @@ fn up(cli: &Cli) -> Result<(), String> {
         )
     });
 
-    let mut args: Vec<&str> = vec![
-        "run",
-        "-d",
+    // Cross-arch: --platform before image (issue #28). Empty when native / unset.
+    let platform_owned: Vec<String> = podman_platform_args(cli.platform.as_deref());
+    let platform_refs: Vec<&str> = platform_owned.iter().map(String::as_str).collect();
+
+    let mut args: Vec<&str> = Vec::with_capacity(48);
+    args.push("run");
+    args.push("-d");
+    // Platform must apply to the create/pull of this container.
+    args.extend_from_slice(&platform_refs);
+    args.extend_from_slice(&[
         "--name",
         cli.container.as_str(),
         "--cpus",
@@ -2684,7 +2898,7 @@ fn up(cli: &Cli) -> Result<(), String> {
         ret_kv.as_str(),
         "-v",
         vol.as_str(),
-    ];
+    ]);
     if let Some(m) = entrypoint_mount.as_ref() {
         args.push("-v");
         args.push(m.as_str());
@@ -2866,6 +3080,217 @@ struct NamedRepo {
     private: Option<bool>,
 }
 
+fn parse_repo_csv(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for part in s.split([',', '\n', '\r']) {
+        let p = part.split('#').next().unwrap_or("").trim();
+        if p.is_empty() {
+            continue;
+        }
+        if is_safe_repo(p) && !out.iter().any(|x: &String| x == p) {
+            out.push(p.to_string());
+        }
+    }
+    out
+}
+
+/// Prefer list: file (if set) then env CSV. Deduped, order preserved.
+fn prefer_repos_list(cli: &Cli) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(path) = cli.prefer_repos_file.as_ref() {
+        match fs::read_to_string(path) {
+            Ok(s) => {
+                for p in parse_repo_csv(&s) {
+                    if !out.contains(&p) {
+                        out.push(p);
+                    }
+                }
+            }
+            Err(e) => eprintln!("listen: prefer-repos-file {path}: {e}"),
+        }
+    }
+    if let Some(pref) = cli.prefer_repos.as_ref() {
+        for p in parse_repo_csv(pref) {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+fn priority_repos_list(cli: &Cli) -> Vec<String> {
+    cli.priority_repos
+        .as_ref()
+        .map(|s| parse_repo_csv(s))
+        .unwrap_or_default()
+}
+
+fn tick_log_path(cli: &Cli) -> Option<PathBuf> {
+    let raw = cli.tick_log.trim();
+    if raw.is_empty()
+        || raw.eq_ignore_ascii_case("off")
+        || raw.eq_ignore_ascii_case("false")
+        || raw == "0"
+    {
+        return None;
+    }
+    if raw.eq_ignore_ascii_case("auto") {
+        let base = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        return Some(base.join("gha-runner-ctl/logs/listen-ticks.jsonl"));
+    }
+    Some(PathBuf::from(raw))
+}
+
+fn append_tick_log(path: &Path, obj: &serde_json::Value) {
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let line = obj.to_string();
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        use std::io::Write;
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+/// Normalize Podman/Go time for GNU `date -d`.
+/// Podman prints e.g. `2026-07-21 15:52:33.909118621 -0400 EDT` which GNU date rejects.
+fn normalize_podman_started_at(raw: &str) -> String {
+    let parts: Vec<&str> = raw.split_whitespace().collect();
+    // Common forms:
+    //   2026-07-21 15:52:33.909118621 -0400 EDT
+    //   2026-07-21T15:52:33.909118621-04:00
+    if parts.len() >= 3 && parts[0].contains('-') && !parts[0].contains('T') {
+        let date = parts[0];
+        let mut time = parts[1].to_string();
+        if let Some(dot) = time.find('.') {
+            time.truncate(dot);
+        }
+        let offset = parts[2]; // -0400 / +0000
+        return format!("{date} {time} {offset}");
+    }
+    // ISO-8601 single token: strip fractional seconds before offset
+    let s = raw.trim();
+    if let Some(tpos) = s.find('T') {
+        let (date, rest) = s.split_at(tpos);
+        // rest starts with T...
+        let body = &rest[1..];
+        // split time from offset (+/- or Z)
+        let mut time = body;
+        let mut offset = "";
+        if let Some(z) = body.find('Z') {
+            time = &body[..z];
+            offset = "Z";
+        } else if let Some(i) = body.rfind('+').or_else(|| {
+            // last '-' after time (skip date-style)
+            body.char_indices()
+                .skip(8)
+                .find(|(_, c)| *c == '-')
+                .map(|(i, _)| i)
+        }) {
+            time = &body[..i];
+            offset = &body[i..];
+        }
+        if let Some(dot) = time.find('.') {
+            time = &time[..dot];
+        }
+        if offset.is_empty() || offset == "Z" {
+            return format!("{date} {time} UTC");
+        }
+        // normalize +04:00 → +0400
+        let off = offset.replace(':', "");
+        return format!("{date} {time} {off}");
+    }
+    s.to_string()
+}
+
+fn container_started_age_secs(name: &str) -> Option<u64> {
+    let out = std::process::Command::new("podman")
+        .args(["inspect", "-f", "{{.State.StartedAt}}", name])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let started_raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if started_raw.is_empty() {
+        return None;
+    }
+    let started = normalize_podman_started_at(&started_raw);
+    // GNU date
+    let age = std::process::Command::new("date")
+        .args(["-d", &started, "+%s"])
+        .output()
+        .ok()?;
+    if !age.status.success() {
+        eprintln!(
+            "listen: cannot parse container start time for {name}: raw={started_raw:?} norm={started:?}"
+        );
+        return None;
+    }
+    let started_unix: u64 = String::from_utf8_lossy(&age.stdout).trim().parse().ok()?;
+    let now = now_unix();
+    Some(now.saturating_sub(started_unix))
+}
+
+/// Stop+rm fleet worker containers that are running, not in pool claims, older than reap_stale_secs.
+fn reap_stale_containers(cli: &Cli, pool: &ResourcePool) {
+    if cli.reap_stale_secs == 0 {
+        return;
+    }
+    let claimed: std::collections::HashSet<String> = pool
+        .claims()
+        .map(|c| c.into_iter().map(|x| x.container).collect())
+        .unwrap_or_default();
+    let out = match std::process::Command::new("podman")
+        .args(["ps", "--format", "{{.Names}}"])
+        .output()
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => {
+            eprintln!("listen: reap_stale: podman ps failed");
+            return;
+        }
+    };
+    let prefix = cli.container.as_str();
+    let mut considered = 0u32;
+    let mut reaped = 0u32;
+    for name in out.lines().map(str::trim).filter(|s| !s.is_empty()) {
+        // Only touch our fleet naming: base prefix, or historical retain leftovers.
+        let ours = name.starts_with(prefix)
+            || name.starts_with("gha-runner-cpu")
+            || name.starts_with("gha-runner-ctl");
+        if !ours {
+            continue;
+        }
+        if claimed.contains(name) {
+            continue;
+        }
+        considered += 1;
+        let Some(age) = container_started_age_secs(name) else {
+            continue;
+        };
+        if age < cli.reap_stale_secs {
+            continue;
+        }
+        eprintln!(
+            "listen: reap stale container {name} age={age}s (threshold={}s, not in pool claims)",
+            cli.reap_stale_secs
+        );
+        // Force-rm (no 30s graceful stop) — retain/warm leftovers must not block listen.
+        let _ = podman(&["rm", "-f", name]);
+        reaped += 1;
+    }
+    eprintln!(
+        "listen: reap_stale done considered={considered} reaped={reaped} threshold={}s claims={}",
+        cli.reap_stale_secs,
+        claimed.len()
+    );
+}
+
 fn repos_round_robin_state_path(container: &str) -> PathBuf {
     let dir = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
@@ -2916,7 +3341,27 @@ fn poll_allowlist_repos(
     pacer: &mut ApiPacer,
     repos: &[String],
 ) -> Result<(bool, Option<String>), String> {
-    for name in select_repos_for_tick(cli, repos) {
+    // Priority repos every tick, then RR subset of the rest.
+    let priority = priority_repos_list(cli);
+    let mut order: Vec<String> = priority
+        .iter()
+        .filter(|p| repos.iter().any(|r| r == *p))
+        .cloned()
+        .collect();
+    let rest: Vec<String> = repos
+        .iter()
+        .filter(|r| !priority.iter().any(|p| p == *r))
+        .cloned()
+        .collect();
+    for name in select_repos_for_tick(cli, &rest) {
+        if !order.contains(&name) {
+            order.push(name);
+        }
+    }
+    if order.is_empty() {
+        order = select_repos_for_tick(cli, repos);
+    }
+    for name in order {
         match repo_needs_runner(cli, &name, api, pacer) {
             Ok(true) => return Ok((true, Some(name))),
             Ok(false) => {}
@@ -2953,16 +3398,11 @@ fn demand(cli: &Cli, api: &str, pacer: &mut ApiPacer) -> Result<(bool, Option<St
                 let repo = repo.clone();
                 return Ok((repo_needs_runner(cli, &repo, api, pacer)?, Some(repo)));
             }
-            if let Some(pref) = cli.prefer_repos.as_ref() {
-                let repos: Vec<String> = pref
-                    .split(',')
-                    .map(|x| x.trim())
-                    .filter(|x| !x.is_empty() && is_safe_repo(x))
-                    .map(|s| s.to_string())
-                    .collect();
+            let repos = prefer_repos_list(cli);
+            if !repos.is_empty() {
                 return poll_allowlist_repos(cli, api, pacer, &repos);
             }
-            Err("repo scope: missing --repo or --prefer-repos".into())
+            Err("repo scope: missing --repo, --prefer-repos, or --prefer-repos-file".into())
         }
         Scope::Org => {
             let owner = cli.owner.as_ref().expect("validated");
@@ -2995,20 +3435,19 @@ fn demand(cli: &Cli, api: &str, pacer: &mut ApiPacer) -> Result<(bool, Option<St
         }
         Scope::User => {
             let user = cli.user.as_ref().expect("validated");
-            // Allowlist mode: when prefer_repos is set, ONLY poll those repos.
-            if let Some(pref) = cli.prefer_repos.as_ref() {
+            // Allowlist mode: when prefer list is set, ONLY poll those repos.
+            let pref = prefer_repos_list(cli);
+            if !pref.is_empty() {
+                let prefix = format!("{user}/");
                 let repos: Vec<String> = pref
-                    .split(',')
-                    .map(|x| x.trim())
-                    .filter(|x| !x.is_empty() && is_safe_repo(x))
-                    .filter(|name| name.starts_with(&format!("{user}/")))
-                    .map(|s| s.to_string())
+                    .into_iter()
+                    .filter(|name| name.starts_with(&prefix))
                     .collect();
                 return poll_allowlist_repos(cli, api, pacer, &repos);
             }
-            // Full owner list — paced + budget-capped; prefer setting GHA_PREFER_REPOS.
+            // Full owner list — paced + budget-capped; prefer GHA_PREFER_REPOS / _FILE.
             eprintln!(
-                "listen: user-batch without GHA_PREFER_REPOS scans owned repos (budget {} GETs/poll, gap {}ms)",
+                "listen: user-batch without prefer list scans owned repos (budget {} GETs/poll, gap {}ms)",
                 pacer.max_per_poll,
                 pacer.min_gap.as_millis()
             );
@@ -3237,31 +3676,46 @@ fn list_demand_jobs(
     max_jobs: usize,
 ) -> Result<Vec<DemandJob>, String> {
     let mut out = Vec::new();
-    let repos: Vec<String> = if let Some(pref) = cli.prefer_repos.as_ref() {
-        pref.split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| is_safe_repo(s))
-            .collect()
-    } else if let Some(r) = cli.repo.as_ref() {
-        vec![r.clone()]
-    } else {
-        return Ok(out);
-    };
-    let tick = select_repos_for_tick(cli, &repos);
-    // When pool-scaling, scan a modest number of repos per tick (staggered).
-    // Keep this small so budget remains for job detail GETs + registration POSTs.
-    let scan = if pool_mode_on(cli) {
-        // Always stagger via round-robin; never pin to allowlist head (starves tail repos).
-        let mut cli_scan = cli.clone_for_listen();
-        if cli.repos_per_tick == 0 {
-            cli_scan.repos_per_tick = 6;
+    let mut repos = prefer_repos_list(cli);
+    if repos.is_empty() {
+        if let Some(r) = cli.repo.as_ref() {
+            repos = vec![r.clone()];
         } else {
-            cli_scan.repos_per_tick = cli.repos_per_tick.min(6);
+            return Ok(out);
         }
-        select_repos_for_tick(&cli_scan, &repos)
+    }
+    let priority = priority_repos_list(cli);
+    // Priority repos every tick (full set, capped), then RR the rest once.
+    let mut scan: Vec<String> = Vec::new();
+    for p in &priority {
+        if (repos.iter().any(|r| r == p) || is_safe_repo(p)) && !scan.contains(p) {
+            scan.push(p.clone());
+        }
+    }
+    let rest: Vec<String> = repos
+        .iter()
+        .filter(|r| !priority.iter().any(|p| p == *r))
+        .cloned()
+        .collect();
+    let tick = if rest.is_empty() {
+        Vec::new()
+    } else if pool_mode_on(cli) {
+        let mut cli_scan = cli.clone_for_listen();
+        let cap = cli.pool_scan_per_tick.max(1);
+        if cli.repos_per_tick == 0 {
+            cli_scan.repos_per_tick = cap;
+        } else {
+            cli_scan.repos_per_tick = cli.repos_per_tick.min(cap).max(1);
+        }
+        select_repos_for_tick(&cli_scan, &rest)
     } else {
-        tick
+        select_repos_for_tick(cli, &rest)
     };
+    for r in tick {
+        if !scan.contains(&r) {
+            scan.push(r);
+        }
+    }
 
     // Prefer queued runs; also sample in_progress (multi-job matrices can still have
     // queued jobs while the run is overall in_progress). Cap hard for API budget.
@@ -3382,11 +3836,13 @@ fn ensure_worker_volume(cli: &Cli, worker_volume: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn reap_pool_workers(cli: &Cli, pool: &ResourcePool) {
+/// Returns number of claims released.
+fn reap_pool_workers(cli: &Cli, pool: &ResourcePool) -> u32 {
     let Ok(claims) = pool.claims() else {
-        return;
+        return 0;
     };
     let now = now_unix();
+    let mut n = 0u32;
     for c in claims {
         // Only reap workers owned by this listen base name prefix
         if !c.container.starts_with(&cli.container) {
@@ -3410,13 +3866,129 @@ fn reap_pool_workers(cli: &Cli, pool: &ResourcePool) {
                 eprintln!("pool: release {} failed: {}", c.worker_id, redact(&e));
                 let _ = pool.release_container(&c.container);
             }
+            n += 1;
         }
     }
+    n
 }
 
-/// Merge fleet base labels with job-requested size/capability labels + tier tag.
+/// Prune exited fleet worker containers that are not in active claims.
+/// Does **not** touch running workers or cancel any GitHub Actions runs.
+fn prune_exited_fleet_workers(cli: &Cli, pool: &ResourcePool) -> u32 {
+    let claimed: std::collections::HashSet<String> = pool
+        .claims()
+        .map(|c| c.into_iter().map(|x| x.container).collect())
+        .unwrap_or_default();
+    let out = match std::process::Command::new("podman")
+        .args(["ps", "-a", "--format", "{{.Names}}\t{{.Status}}"])
+        .output()
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => return 0,
+    };
+    let prefix = cli.container.as_str();
+    let mut n = 0u32;
+    for line in out.lines() {
+        let Some((name, status)) = line.split_once('\t') else {
+            continue;
+        };
+        let name = name.trim();
+        let status = status.trim().to_ascii_lowercase();
+        if name.is_empty() {
+            continue;
+        }
+        let ours = name.starts_with(prefix)
+            || name.starts_with("gha-runner-cpu")
+            || name.starts_with("gha-runner-ctl");
+        if !ours || claimed.contains(name) {
+            continue;
+        }
+        // Only remove clearly stopped/exited/created leftovers — never "up".
+        let removable = status.starts_with("exited")
+            || status.starts_with("created")
+            || status.starts_with("dead")
+            || status.contains("exited");
+        if !removable {
+            continue;
+        }
+        eprintln!("recover: prune exited leftover {name} ({status})");
+        let _ = podman(&["rm", "-f", name]);
+        n += 1;
+    }
+    n
+}
+
+/// Safe recovery: free local capacity so listen can pick up **queued** GitHub jobs.
+/// Explicitly does **not** cancel or delete workflow runs (queue is preserved on GitHub).
+fn recover(cli: &Cli, prune_exited: bool, json: bool) -> Result<(), String> {
+    std::env::set_var("GHA_POOL_CPUS", &cli.pool_cpus);
+    std::env::set_var("GHA_POOL_MEMORY", &cli.pool_memory);
+    std::env::set_var("GHA_POOL_MAX_WORKERS", cli.pool_max_workers.to_string());
+    std::env::set_var("GHA_POOL_MODE", &cli.pool_mode);
+    let pool = ResourcePool::from_env();
+
+    let (c0, m0, n0) = pool.usage().unwrap_or((0.0, 0, 0));
+    eprintln!(
+        "recover: start usage={c0:.2}/{:.0}c {m0}/{}MiB claims={n0} (will NOT cancel GitHub runs)",
+        pool.max_cpus, pool.max_memory_mib
+    );
+
+    let reaped = reap_pool_workers(cli, &pool);
+    let mut pruned = 0u32;
+    if prune_exited {
+        pruned = prune_exited_fleet_workers(cli, &pool);
+    }
+    // Second pass: claims may point at containers we just pruned.
+    let reaped2 = reap_pool_workers(cli, &pool);
+
+    if matches!(cli.mode, Mode::Ephemeral) {
+        reap_stale_containers(cli, &pool);
+    }
+
+    let (c1, m1, n1) = pool.usage().unwrap_or((0.0, 0, 0));
+    let free_c = (pool.max_cpus - c1).max(0.0);
+    let free_m = pool.max_memory_mib.saturating_sub(m1);
+    eprintln!(
+        "recover: done reaped_claims={} pruned_containers={pruned} usage={c1:.2}/{:.0}c {m1}/{}MiB claims={n1} free≈{free_c:.2}c/{free_m}MiB",
+        reaped + reaped2,
+        pool.max_cpus,
+        pool.max_memory_mib
+    );
+    eprintln!(
+        "recover: next — leave listen running (or restart gha-runner-ctl@cpu); queued Actions jobs stay on GitHub and will be claimed when demand poll runs"
+    );
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "reaped_claims": reaped + reaped2,
+                "pruned_containers": pruned,
+                "pool_cpus_used": c1,
+                "pool_mem_mib_used": m1,
+                "pool_claims": n1,
+                "pool_cpus_free": free_c,
+                "pool_mem_mib_free": free_m,
+                "cancels_github_runs": false,
+            })
+        );
+    }
+    Ok(())
+}
+
+/// Merge fleet base labels with job-requested size/capability/image/arch labels + tier tag.
 /// GitHub requires the runner to advertise every `runs-on` label.
 pub fn runner_labels_for_job(base_labels: &str, job_labels: &[String], tier: SizeTier) -> String {
+    runner_labels_for_job_with_map(base_labels, job_labels, tier, None)
+}
+
+/// Like [`runner_labels_for_job`], plus image/arch labels resolved from the map (#28).
+pub fn runner_labels_for_job_with_map(
+    base_labels: &str,
+    job_labels: &[String],
+    tier: SizeTier,
+    resolved: Option<&JobImageArch>,
+) -> String {
     use std::collections::BTreeSet;
     let mut set: BTreeSet<String> = base_labels
         .split(',')
@@ -3431,7 +4003,7 @@ pub fn runner_labels_for_job(base_labels: &str, job_labels: &[String], tier: Siz
         if l.is_empty() || !is_safe_ident(&l) {
             continue;
         }
-        // Only capability/size extras — never drop self-hosted/linux/x64/podman from base.
+        // Size / GPU capability extras.
         if matches!(
             l.as_str(),
             "micro"
@@ -3453,17 +4025,54 @@ pub fn runner_labels_for_job(base_labels: &str, job_labels: &[String], tier: Siz
             || l.starts_with("size-")
         {
             set.insert(l);
+            continue;
+        }
+        // Arch tokens (arm64, riscv64, …) — advertised so matrix cells match.
+        if TargetArch::from_label(&l).is_some() {
+            set.insert(l);
+            continue;
+        }
+        // Distro / image-map keys present on the job (e.g. ubuntu-24.04).
+        // We re-check against resolved image_label when available; otherwise accept
+        // safe idents that look like distro tags (contain a digit or known prefix).
+        if let Some(r) = resolved {
+            if r.image_label.as_deref() == Some(l.as_str()) {
+                set.insert(l);
+            }
+        }
+    }
+    if let Some(r) = resolved {
+        for extra in extra_image_arch_labels(r) {
+            if is_safe_ident(&extra) {
+                set.insert(extra);
+            }
+        }
+        // When advertising a non-host arch, drop conflicting host arch from base
+        // so the runner is not dual-labelled x64+arm64 unless the job asked for both.
+        if let Some(arch) = r.arch {
+            if arch != TargetArch::Amd64 {
+                set.remove("x64");
+                set.remove("amd64");
+                set.remove("x86_64");
+            }
+            if arch != TargetArch::Arm64 {
+                set.remove("arm64");
+                set.remove("aarch64");
+            }
+            set.insert(arch.label().to_string());
         }
     }
     set.into_iter().collect::<Vec<_>>().join(",")
 }
 
+/// Spawn with live `fit_to_budget`. Returns `Ok(true)` if the worker was brought up,
+/// `Ok(false)` if capacity/claim refused (not an error).
 fn spawn_sized_worker(
     base: &Cli,
     pool: &ResourcePool,
     slot: u32,
     job: &DemandJob,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let tier = size_for_job(&job.job_name, &job.labels, base.gpu);
     let (want_c_s, want_m_s) = resources_for_tier(tier);
     let want_c = parse_cpus_f64(&want_c_s).unwrap_or(1.0);
@@ -3477,31 +4086,94 @@ fn spawn_sized_worker(
             job.job_name,
             tier.as_str()
         );
-        return Ok(());
+        return Ok(false);
     };
+    spawn_worker_with_resources(base, pool, slot, job, tier, c, m)
+}
+
+/// Spawn a pool worker using resources already decided by [`plan_scale`] (or
+/// re-checked via [`spawn_sized_worker`]). Claim is the hard capacity gate.
+/// `Ok(true)` = container up; `Ok(false)` = claim refused / no-op.
+fn spawn_worker_with_resources(
+    base: &Cli,
+    pool: &ResourcePool,
+    slot: u32,
+    job: &DemandJob,
+    tier: SizeTier,
+    cpus: f64,
+    memory_mib: u64,
+) -> Result<bool, String> {
+    // Per-job image + arch from runs-on labels (issue #28). No change when absent.
+    // Lives in the shared spawn path so both plan_scale spawns and live-fit spawns
+    // resolve image/arch identically.
+    let map = load_image_map(base.image_map.as_deref())?;
+    let resolved = resolve_job_image_arch(&job.labels, &map, &base.image);
+    if resolved.needs_emulation {
+        if let Some(arch) = resolved.arch {
+            ensure_binfmt_for_arch(arch, true, None)?;
+        }
+    }
     let worker_id = format!("{}-w{slot}", base.runner_name);
     let container = format!("{}-w{slot}", base.container);
     let volume = format!("{container}-data");
-    if !pool.try_claim(&worker_id, &container, c, m, tier, Some(job.repo.as_str()))? {
+    if !pool.try_claim(
+        &worker_id,
+        &container,
+        cpus,
+        memory_mib,
+        tier,
+        Some(job.repo.as_str()),
+    )? {
         eprintln!("pool: claim failed for {container}");
-        return Ok(());
+        return Ok(false);
     }
-    ensure_worker_volume(base, &volume)?;
+    if let Err(e) = ensure_worker_volume(base, &volume) {
+        let _ = pool.release(&worker_id);
+        return Err(e);
+    }
     let mut unit = base.clone_for_listen();
     unit.repo = Some(job.repo.clone());
     unit.container = container.clone();
     unit.volume = volume;
     unit.runner_name = worker_id.clone();
-    unit.cpus = format_cpus(c);
-    unit.memory = format_memory_mib(m);
-    // Register base fleet labels + job-requested size/capability labels so
-    // `runs-on: [self-hosted, linux, x64, podman, large|xlarge|gpu]` matches.
-    unit.labels = runner_labels_for_job(&base.labels, &job.labels, tier);
+    unit.cpus = format_cpus(cpus);
+    unit.memory = format_memory_mib(memory_mib);
+
+    // Apply workflow-selected image (forces external mode for non-stock OCI refs).
+    if resolved.image != base.image || resolved.image_label.is_some() {
+        unit.image = resolved.image.clone();
+        if !is_default_stock_image(&unit.image) {
+            unit.image_mode = ImageMode::External;
+        }
+        let mode = effective_image_mode(&unit.image_mode, &unit.image);
+        let pull = effective_pull_policy(unit.pull_policy.as_ref(), &mode);
+        if let Err(e) =
+            ensure_image_present_platform(&unit.image, &pull, resolved.platform.as_deref())
+        {
+            let _ = pool.release(&worker_id);
+            return Err(e);
+        }
+    }
+    // CLI --platform wins; else job-resolved platform for cross-arch.
+    if unit.platform.is_none() {
+        unit.platform = resolved.platform.clone();
+    }
+    // Align actions/runner asset arch hint when we know the mapping (SHA still operator pin).
+    if let Some(arch) = resolved.arch {
+        if let Some(ra) = arch.runner_arch() {
+            unit.runner_arch = ra.to_string();
+        }
+    }
+
+    // Register base fleet labels + job size/image/arch labels so GitHub routes the cell.
+    unit.labels = runner_labels_for_job_with_map(&base.labels, &job.labels, tier, Some(&resolved));
     eprintln!(
-        "pool: up {container} tier={} cpus={} mem={} labels={} repo={} job={}",
+        "pool: up {container} tier={} cpus={} mem={} image={} platform={:?} labels={} repo={} job={}",
         tier.as_str(),
         unit.cpus,
         unit.memory,
+        unit.image,
+        unit.platform,
         unit.labels,
         job.repo,
         job.job_name
@@ -3510,12 +4182,74 @@ fn spawn_sized_worker(
         let _ = pool.release(&worker_id);
         return Err(e);
     }
+    Ok(true)
+}
+
+/// Tear down a local pool worker by id and release its pool claim.
+fn scale_in_worker(base: &Cli, pool: &ResourcePool, worker_id: &str) -> Result<(), String> {
+    let claims = pool.claims()?;
+    let Some(c) = claims.iter().find(|x| x.worker_id == worker_id) else {
+        eprintln!("pool: scale-in skip unknown worker {worker_id}");
+        return Ok(());
+    };
+    if !c.container.starts_with(&base.container) {
+        // Never touch another manager's workers or warm/base retain runners.
+        eprintln!(
+            "pool: scale-in refuse non-local container {} (base={})",
+            c.container, base.container
+        );
+        return Ok(());
+    }
+    eprintln!(
+        "pool: scale-in {} tier={} repo={:?}",
+        c.container, c.tier, c.repo
+    );
+    let mut unit = base.clone_for_listen();
+    unit.container = c.container.clone();
+    unit.volume = format!("{}-data", c.container);
+    unit.runner_name = c.worker_id.clone();
+    let _ = down(&unit, true);
+    if let Err(e) = pool.release(worker_id) {
+        eprintln!("pool: release {worker_id} failed: {}", redact(&e));
+        let _ = pool.release_container(&c.container);
+    }
     Ok(())
 }
 
+/// Build planner worker snapshots for containers owned by this listen base name.
+///
+/// `busy` is filled from the local container process tree ([`container_worker_busy`]),
+/// never from the demand scan — so a mid-job worker on an un-scanned prefer-repo
+/// is still marked busy and protected from idle scale-in.
+fn local_worker_snapshots(cli: &Cli, pool: &ResourcePool, max_local: u32) -> Vec<WorkerSnapshot> {
+    let mut out = Vec::new();
+    let claims = pool.claims().unwrap_or_default();
+    for slot in 0..max_local {
+        let container = format!("{}-w{slot}", cli.container);
+        let worker_id = format!("{}-w{slot}", cli.runner_name);
+        let running = container_running(&container);
+        let claimed = claims
+            .iter()
+            .any(|c| c.container == container || c.worker_id == worker_id);
+        if running || claimed {
+            // Local job signal only; independent of list_demand_jobs RR sample.
+            let busy = running && container_worker_busy(&container);
+            out.push(WorkerSnapshot {
+                slot,
+                worker_id,
+                container,
+                running,
+                busy,
+            });
+        }
+    }
+    out
+}
+
 fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> Result<(), String> {
+    let floor = cli.listen_min_interval.max(15);
     let interval = if matches!(cli.scope, Scope::User) {
-        interval.max(USER_BATCH_MIN_INTERVAL_SECS)
+        interval.max(floor)
     } else {
         interval
     };
@@ -3527,8 +4261,11 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
 
     let pool = ResourcePool::from_env();
     let dynamic = pool_mode_on(cli);
+    let prefer_n = prefer_repos_list(cli).len();
+    let prio_n = priority_repos_list(cli).len();
+    let tick_path = tick_log_path(cli);
     eprintln!(
-        "listen: scope={:?} poll={interval}s idle={idle_secs}s mode={:?} api_gap={}ms max_per_poll={} pool={} ({:.0}c/{}MiB max_workers={})",
+        "listen: scope={:?} poll={interval}s (floor={floor}) idle={idle_secs}s mode={:?} api_gap={}ms max_per_poll={} pool={} ({:.0}c/{}MiB max_workers={}) prefer={prefer_n} priority={prio_n} scan/tick={} reap_stale={}s",
         cli.scope,
         cli.mode,
         cli.api_min_gap_ms,
@@ -3537,11 +4274,20 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
         pool.max_cpus,
         pool.max_memory_mib,
         pool.max_workers.min(cli.pool_max_workers),
+        cli.pool_scan_per_tick,
+        cli.reap_stale_secs,
     );
-    if matches!(cli.scope, Scope::User) && cli.prefer_repos.is_none() {
+    if matches!(cli.scope, Scope::User) && prefer_n == 0 {
         eprintln!(
-            "listen: warning: set GHA_PREFER_REPOS=owner/r1,owner/r2 (allowlist) to stay within API budgets"
+            "listen: warning: set GHA_PREFER_REPOS or GHA_PREFER_REPOS_FILE (allowlist) to stay within API budgets"
         );
+    }
+    if let Some(ref path) = tick_path {
+        eprintln!("listen: tick log → {}", path.display());
+    }
+    // Drop stale retain/warm leftovers so they cannot steal confusion or budget.
+    if matches!(cli.mode, Mode::Ephemeral) {
+        reap_stale_containers(cli, &pool);
     }
     if !volume_exists(&cli.volume) {
         eprintln!("listen: snapshot missing — prepare…");
@@ -3561,9 +4307,31 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
     }
 
     let mut idle_since: Option<Instant> = None;
+    // Consecutive ticks where the (partial) demand sample was empty.
+    // Idle timer starts only after a full prefer-list sweep of empty.
+    let mut empty_streak: u32 = 0;
     let mut cli = cli.clone_for_listen();
     let mut pacer = ApiPacer::from_cli(&cli);
     let max_local = cli.pool_max_workers.min(pool.max_workers).max(1);
+    // Effective partial-scan width for the empty-sweep gate (mirrors list_demand_jobs).
+    let scan_width: usize = if dynamic {
+        let cap = cli.pool_scan_per_tick.max(1);
+        if cli.repos_per_tick == 0 {
+            cap as usize
+        } else {
+            cli.repos_per_tick.min(cap).max(1) as usize
+        }
+    } else if cli.repos_per_tick == 0 {
+        prefer_n.max(1)
+    } else {
+        cli.repos_per_tick as usize
+    };
+    let sweep_ticks = empty_sweep_ticks(prefer_n, scan_width);
+    if dynamic {
+        eprintln!(
+            "listen: capacity-safe scale-in: empty_sweep_ticks={sweep_ticks} (prefer={prefer_n}/scan={scan_width}); busy workers never scaled in"
+        );
+    }
 
     loop {
         if let Some(wait) = pacer.cooling() {
@@ -3575,7 +4343,10 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
 
         // Always reap finished pool workers first (frees budget).
         if dynamic {
-            reap_pool_workers(&cli, &pool);
+            let n = reap_pool_workers(&cli, &pool);
+            if n > 0 {
+                eprintln!("listen: reaped {n} finished/orphan claim(s) before poll");
+            }
         }
 
         let api = match github_token() {
@@ -3590,6 +4361,8 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
         if dynamic {
             // Reset per-poll GET budget every tick (demand() does this; dynamic path must too).
             pacer.begin_poll();
+            // Free capacity again if workers finished during API cool-down.
+            let _ = reap_pool_workers(&cli, &pool);
             let jobs = match list_demand_jobs(&cli, &api, &mut pacer, max_local as usize * 2) {
                 Ok(j) => j,
                 Err(e) => {
@@ -3600,72 +4373,179 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
                         .unwrap_or(Duration::from_secs(interval));
                     drop(api);
                     thread::sleep(wait);
+                    // Do not scale-in on API failure (avoid flap when GitHub is dark).
                     continue;
                 }
             };
             drop(api);
 
-            let running_n = pool
-                .claims()
-                .map(|c| {
-                    c.iter()
-                        .filter(|x| {
-                            x.container.starts_with(&cli.container)
-                                && container_running(&x.container)
-                        })
-                        .count()
-                })
-                .unwrap_or(0);
-
-            if jobs.is_empty() {
-                if running_n == 0 {
-                    let since = idle_since.get_or_insert_with(Instant::now);
-                    if since.elapsed() >= Duration::from_secs(idle_secs) {
-                        // nothing to down at base container in pure multi-worker mode
-                        idle_since = None;
+            // Keep raw demand count for tick log (filter may drop GPU/CPU affinity mismatches).
+            let jobs_n = jobs.len();
+            // Filter by GPU affinity before planning (CPU listener skips gpu tiers).
+            let filtered: Vec<DemandJob> = jobs
+                .into_iter()
+                .filter(|job| {
+                    let tier = size_for_job(&job.job_name, &job.labels, cli.gpu);
+                    if cli.gpu {
+                        tier == SizeTier::Gpu
+                    } else {
+                        tier != SizeTier::Gpu
                     }
+                })
+                .collect();
+
+            let workers = local_worker_snapshots(&cli, &pool, max_local);
+            let running_n = workers.iter().filter(|w| w.running).count() as u32;
+            let busy_n = workers.iter().filter(|w| w.running && is_busy(w)).count() as u32;
+            let (used_c, used_m, host_claims) = pool.usage().unwrap_or((0.0, 0, 0));
+            let free_c = (pool.max_cpus - used_c).max(0.0);
+            let free_m = pool.max_memory_mib.saturating_sub(used_m);
+
+            // Demand-empty gate + idle timer:
+            // 1. A single empty *partial* RR sample must NOT start idle_secs
+            //    (busy job may live on an un-scanned prefer-repo).
+            // 2. Require consecutive empty ticks covering a full prefer-list
+            //    sweep ([`demand_empty_confirmed`] / [`empty_sweep_ticks`]).
+            // 3. Only then count idle_secs toward scale-in.
+            // Per-worker busy is a second, independent layer in plan_scale.
+            let idle_expired = if filtered.is_empty() {
+                empty_streak = empty_streak.saturating_add(1);
+                let confirmed = demand_empty_confirmed(empty_streak, prefer_n, scan_width);
+                if confirmed {
+                    let since = idle_since.get_or_insert_with(Instant::now);
+                    since.elapsed() >= Duration::from_secs(idle_secs)
                 } else {
+                    // Still covering the prefer-list — do not start idle clock.
                     idle_since = None;
+                    false
                 }
             } else {
+                empty_streak = 0;
                 idle_since = None;
-                let mut slot: u32 = 0;
-                let mut spawned = 0u32;
-                for job in &jobs {
-                    // GPU listener only takes gpu-tier jobs; CPU skips gpu.
-                    let tier = size_for_job(&job.job_name, &job.labels, cli.gpu);
-                    if cli.gpu && tier != SizeTier::Gpu {
-                        continue;
-                    }
-                    if !cli.gpu && tier == SizeTier::Gpu {
-                        continue;
-                    }
-                    // find free slot id
-                    while slot < max_local {
-                        let cname = format!("{}-w{slot}", cli.container);
-                        if !container_running(&cname) {
-                            break;
-                        }
-                        slot += 1;
-                    }
-                    if slot >= max_local {
-                        eprintln!("pool: local max workers {max_local} reached");
-                        break;
-                    }
-                    if let Err(e) = spawn_sized_worker(&cli, &pool, slot, job) {
-                        eprintln!("pool: spawn failed: {}", redact(&e));
-                    } else {
-                        spawned += 1;
-                    }
-                    slot += 1;
+                false
+            };
+
+            let max_spawn = std::env::var("GHA_POOL_MAX_SPAWN_PER_TICK")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(DEFAULT_MAX_SPAWN_PER_TICK);
+
+            let signals: Vec<DemandSignal> = filtered
+                .iter()
+                .map(|j| DemandSignal {
+                    job_name: j.job_name.clone(),
+                    labels: j.labels.clone(),
+                    repo: j.repo.clone(),
+                })
+                .collect();
+
+            let plan = plan_scale(&ScaleInput {
+                jobs: signals,
+                workers: workers.clone(),
+                free_cpus: free_c,
+                free_memory_mib: free_m,
+                max_cpus: pool.max_cpus,
+                max_memory_mib: pool.max_memory_mib,
+                max_local_workers: max_local,
+                host_claim_count: host_claims as u32,
+                max_host_workers: pool.max_workers,
+                force_gpu: cli.gpu,
+                idle_expired,
+                max_spawn_per_tick: max_spawn,
+            });
+
+            eprintln!(
+                "pool: plan {} (running={running_n} busy={busy_n} empty_streak={empty_streak}/{sweep_ticks} free={free_c:.2}c/{free_m}MiB)",
+                plan.notes
+            );
+
+            // Scale-IN first (return capacity before scale-out packing).
+            // plan_scale only lists provably-idle workers; re-check the local
+            // busy signal at execution time in case a job started mid-tick.
+            for wid in &plan.scale_in {
+                let container = workers
+                    .iter()
+                    .find(|w| w.worker_id == *wid)
+                    .map(|w| w.container.as_str())
+                    .unwrap_or("");
+                if !container.is_empty() && container_worker_busy(container) {
+                    eprintln!("pool: scale-in skip busy worker {wid} (local job signal)");
+                    continue;
                 }
-                if spawned > 0 {
+                if let Err(e) = scale_in_worker(&cli, &pool, wid) {
+                    eprintln!("pool: scale-in failed: {}", redact(&e));
+                }
+            }
+            if !plan.scale_in.is_empty() {
+                idle_since = None;
+            }
+
+            // Scale-OUT: execute planned spawns; try_claim re-checks capacity under lock.
+            let mut spawned = 0u32;
+            for req in &plan.spawns {
+                let job = DemandJob {
+                    repo: req.repo.clone(),
+                    job_name: req.job_name.clone(),
+                    labels: req.labels.clone(),
+                };
+                // Prefer planner resources; claim is still the hard gate. If the
+                // free pool moved, fall back to fit_to_budget inside spawn_sized_worker.
+                let result = spawn_worker_with_resources(
+                    &cli,
+                    &pool,
+                    req.slot,
+                    &job,
+                    req.tier,
+                    req.cpus,
+                    req.memory_mib,
+                );
+                match result {
+                    Ok(true) => spawned += 1,
+                    Ok(false) => {
+                        // Claim refused (slot raced); try live fit once.
+                        match spawn_sized_worker(&cli, &pool, req.slot, &job) {
+                            Ok(true) => spawned += 1,
+                            Ok(false) => {}
+                            Err(e) => eprintln!("pool: spawn retry failed: {}", redact(&e)),
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("pool: spawn failed: {}", redact(&e));
+                        // Retry once via live fit path (budget may have changed).
+                        match spawn_sized_worker(&cli, &pool, req.slot, &job) {
+                            Ok(true) => spawned += 1,
+                            Ok(false) => {}
+                            Err(e2) => eprintln!("pool: spawn retry failed: {}", redact(&e2)),
+                        }
+                    }
+                }
+                if let Some(ref path) = tick_path {
                     let (uc, um, n) = pool.usage().unwrap_or((0.0, 0, 0));
-                    eprintln!(
-                        "pool: spawned={spawned} usage={uc:.2}/{:.0}c {um}/{}MiB claims={n}",
-                        pool.max_cpus, pool.max_memory_mib
+                    append_tick_log(
+                        path,
+                        &serde_json::json!({
+                            "ts_unix": now_unix(),
+                            "jobs": jobs_n,
+                            "spawned": spawned,
+                            "running": running_n,
+                            "pool_cpus_used": uc,
+                            "pool_mem_mib_used": um,
+                            "pool_claims": n,
+                            "prefer": prefer_n,
+                            "priority": prio_n,
+                            "mode": "dynamic",
+                        }),
                     );
                 }
+            }
+            if spawned > 0 || !plan.scale_in.is_empty() {
+                let (uc, um, n) = pool.usage().unwrap_or((0.0, 0, 0));
+                eprintln!(
+                    "pool: spawned={spawned} scale_in={} usage={uc:.2}/{:.0}c {um}/{}MiB claims={n}",
+                    plan.scale_in.len(),
+                    pool.max_cpus,
+                    pool.max_memory_mib
+                );
             }
         } else {
             // Legacy single-container listen path
@@ -3757,6 +4637,20 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
             } else {
                 idle_since = None;
             }
+            if let Some(ref path) = tick_path {
+                append_tick_log(
+                    path,
+                    &serde_json::json!({
+                        "ts_unix": now_unix(),
+                        "need": need,
+                        "target": target_repo,
+                        "running": container_running(&cli.container),
+                        "prefer": prefer_n,
+                        "priority": prio_n,
+                        "mode": "legacy",
+                    }),
+                );
+            }
         }
 
         thread::sleep(Duration::from_secs(interval));
@@ -3794,6 +4688,12 @@ impl Cli {
             demand_require_labels: self.demand_require_labels.clone(),
             demand_exclude_labels: self.demand_exclude_labels.clone(),
             prefer_repos: self.prefer_repos.clone(),
+            prefer_repos_file: self.prefer_repos_file.clone(),
+            priority_repos: self.priority_repos.clone(),
+            listen_min_interval: self.listen_min_interval,
+            pool_scan_per_tick: self.pool_scan_per_tick,
+            reap_stale_secs: self.reap_stale_secs,
+            tick_log: self.tick_log.clone(),
             api_min_gap_ms: self.api_min_gap_ms,
             api_max_per_poll: self.api_max_per_poll,
             api_backoff_secs: self.api_backoff_secs,
@@ -3804,6 +4704,8 @@ impl Cli {
             pool_memory: self.pool_memory.clone(),
             pool_max_workers: self.pool_max_workers,
             pool_mode: self.pool_mode.clone(),
+            image_map: self.image_map.clone(),
+            platform: self.platform.clone(),
             build_dir: self.build_dir.clone(),
             mode: self.mode.clone(),
             wake_token: self.wake_token.clone(),
@@ -3843,6 +4745,12 @@ struct CliSnap {
     demand_require_labels: Option<String>,
     demand_exclude_labels: Option<String>,
     prefer_repos: Option<String>,
+    prefer_repos_file: Option<String>,
+    priority_repos: Option<String>,
+    listen_min_interval: u64,
+    pool_scan_per_tick: u32,
+    reap_stale_secs: u64,
+    tick_log: String,
     api_min_gap_ms: u64,
     api_max_per_poll: u32,
     api_backoff_secs: u64,
@@ -3853,6 +4761,8 @@ struct CliSnap {
     pool_memory: String,
     pool_max_workers: u32,
     pool_mode: String,
+    image_map: Option<PathBuf>,
+    platform: Option<String>,
     mode: Mode,
     wake_token: Option<String>,
     full_auto: bool,
@@ -3890,6 +4800,12 @@ fn cli_snapshot(cli: &Cli) -> CliSnap {
         demand_require_labels: cli.demand_require_labels.clone(),
         demand_exclude_labels: cli.demand_exclude_labels.clone(),
         prefer_repos: cli.prefer_repos.clone(),
+        prefer_repos_file: cli.prefer_repos_file.clone(),
+        priority_repos: cli.priority_repos.clone(),
+        listen_min_interval: cli.listen_min_interval,
+        pool_scan_per_tick: cli.pool_scan_per_tick,
+        reap_stale_secs: cli.reap_stale_secs,
+        tick_log: cli.tick_log.clone(),
         api_min_gap_ms: cli.api_min_gap_ms,
         api_max_per_poll: cli.api_max_per_poll,
         api_backoff_secs: cli.api_backoff_secs,
@@ -3900,6 +4816,8 @@ fn cli_snapshot(cli: &Cli) -> CliSnap {
         pool_memory: cli.pool_memory.clone(),
         pool_max_workers: cli.pool_max_workers,
         pool_mode: cli.pool_mode.clone(),
+        image_map: cli.image_map.clone(),
+        platform: cli.platform.clone(),
         mode: cli.mode.clone(),
         wake_token: cli.wake_token.clone(),
         full_auto: cli.full_auto,
@@ -3939,6 +4857,12 @@ fn snap_to_cli(s: &CliSnap) -> Cli {
         demand_require_labels: s.demand_require_labels.clone(),
         demand_exclude_labels: s.demand_exclude_labels.clone(),
         prefer_repos: s.prefer_repos.clone(),
+        prefer_repos_file: s.prefer_repos_file.clone(),
+        priority_repos: s.priority_repos.clone(),
+        listen_min_interval: s.listen_min_interval,
+        pool_scan_per_tick: s.pool_scan_per_tick,
+        reap_stale_secs: s.reap_stale_secs,
+        tick_log: s.tick_log.clone(),
         api_min_gap_ms: s.api_min_gap_ms,
         api_max_per_poll: s.api_max_per_poll,
         api_backoff_secs: s.api_backoff_secs,
@@ -3949,6 +4873,8 @@ fn snap_to_cli(s: &CliSnap) -> Cli {
         pool_memory: s.pool_memory.clone(),
         pool_max_workers: s.pool_max_workers,
         pool_mode: s.pool_mode.clone(),
+        image_map: s.image_map.clone(),
+        platform: s.platform.clone(),
         build_dir: None,
         mode: s.mode.clone(),
         wake_token: s.wake_token.clone(),
@@ -4053,5 +4979,79 @@ fn wake_server(port: u16, snap: CliSnap, token: String) {
             "HTTP/1.1 {code}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod robust_queue_tests {
+    use super::*;
+
+    #[test]
+    fn lock_is_stale_grace_protects_mid_creation_and_live_pid() {
+        use std::io::Write as _;
+        let base = std::env::temp_dir().join(format!("ghar-stale-test-{}", std::process::id()));
+
+        // A just-created empty lock (holder is between create_new and writeln!(pid))
+        // must NOT be judged stale — reclaiming it would steal a live lock (TOCTOU).
+        let empty = base.with_extension("empty");
+        let _ = fs::remove_file(&empty);
+        fs::File::create(&empty).unwrap();
+        assert!(
+            !lock_is_stale(&empty),
+            "fresh empty lock must be treated as live within the write grace"
+        );
+
+        // A lock owned by a live PID (ourselves) must NOT be stale.
+        let live = base.with_extension("live");
+        let mut f = fs::File::create(&live).unwrap();
+        writeln!(f, "{}", std::process::id()).unwrap();
+        drop(f);
+        assert!(!lock_is_stale(&live), "our own live PID must not be stale");
+
+        // A non-existent lock path is trivially reclaimable (nothing to protect).
+        let missing = base.with_extension("missing");
+        let _ = fs::remove_file(&missing);
+        assert!(
+            lock_is_stale(&missing),
+            "a non-existent lock is stale (nothing to protect)"
+        );
+
+        let _ = fs::remove_file(&empty);
+        let _ = fs::remove_file(&live);
+    }
+
+    #[test]
+    fn parse_repo_csv_dedupes_and_strips_comments() {
+        let s = "tzervas/mycelium-lang, tzervas/cabal-devmelopner\n# comment\ntzervas/mycelium-lang\nbad;repo\n";
+        let v = parse_repo_csv(s);
+        assert_eq!(
+            v,
+            vec![
+                "tzervas/mycelium-lang".to_string(),
+                "tzervas/cabal-devmelopner".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_repo_csv_newlines_and_hash_inline() {
+        let s = "owner/a # note\nowner/b\r\nowner/c";
+        let v = parse_repo_csv(s);
+        assert_eq!(v, vec!["owner/a", "owner/b", "owner/c"]);
+    }
+
+    #[test]
+    fn normalize_podman_started_at_go_format() {
+        let raw = "2026-07-21 15:52:33.909118621 -0400 EDT";
+        assert_eq!(
+            normalize_podman_started_at(raw),
+            "2026-07-21 15:52:33 -0400"
+        );
+    }
+
+    #[test]
+    fn normalize_podman_started_at_iso() {
+        let raw = "2026-07-21T19:52:33.909118621Z";
+        assert_eq!(normalize_podman_started_at(raw), "2026-07-21 19:52:33 UTC");
     }
 }
