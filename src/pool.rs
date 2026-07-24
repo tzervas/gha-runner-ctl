@@ -317,6 +317,16 @@ impl ResourcePool {
     where
         F: FnOnce(&mut PoolState) -> Result<R, String>,
     {
+        struct PoolLockGuard {
+            path: PathBuf,
+        }
+
+        impl Drop for PoolLockGuard {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(&self.path);
+            }
+        }
+
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("pool dir: {e}"))?;
         }
@@ -324,7 +334,7 @@ impl ResourcePool {
         // Exclusive create lock (no unsafe flock; matches InstanceLock style).
         let _guard = {
             let mut acquired = None;
-            for _ in 0..200 {
+            for attempt in 0..200 {
                 let mut opts = OpenOptions::new();
                 opts.write(true).create_new(true);
                 #[cfg(unix)]
@@ -335,10 +345,16 @@ impl ResourcePool {
                 match opts.open(&lock_path) {
                     Ok(mut f) => {
                         let _ = writeln!(f, "{}", std::process::id());
-                        acquired = Some(lock_path.clone());
+                        acquired = Some(PoolLockGuard {
+                            path: lock_path.clone(),
+                        });
                         break;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        if attempt == 0 && super::lock_is_stale(&lock_path) {
+                            let _ = fs::remove_file(&lock_path);
+                            continue;
+                        }
                         thread::sleep(Duration::from_millis(25));
                     }
                     Err(e) => return Err(format!("pool lock: {e}")),
@@ -357,7 +373,6 @@ impl ResourcePool {
             let json = serde_json::to_string_pretty(&state).map_err(|e| e.to_string())?;
             fs::write(&self.path, json).map_err(|e| format!("pool write: {e}"))?;
         }
-        let _ = fs::remove_file(&_guard);
         out
     }
 
