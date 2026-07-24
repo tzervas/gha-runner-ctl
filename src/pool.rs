@@ -18,10 +18,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub const DEFAULT_POOL_CPUS: f64 = 16.0;
 pub const DEFAULT_POOL_MEMORY_MIB: u64 = 16 * 1024;
 pub const DEFAULT_MAX_WORKERS: u32 = 24;
-/// Smallest worker: 250m CPU / 256 MiB.
-#[allow(dead_code)] // public pool API / future floor knobs
+/// Smallest worker: 250m CPU / 256 MiB (planner floor for fit_to_budget).
 pub const DEFAULT_MIN_CPUS: f64 = 0.25;
-#[allow(dead_code)]
 pub const DEFAULT_MIN_MEMORY_MIB: u64 = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -478,6 +476,266 @@ pub fn format_memory_mib(m: u64) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Demand-driven scale planner (pure — no I/O, no GitHub, no Podman)
+// ---------------------------------------------------------------------------
+
+/// Default cap on new worker registrations per listen tick.
+/// Bounds registration storms even when the queue is deep; next tick continues.
+pub const DEFAULT_MAX_SPAWN_PER_TICK: u32 = 4;
+
+/// One queued/in-progress job the autoscaler may size and assign a worker to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DemandSignal {
+    pub job_name: String,
+    pub labels: Vec<String>,
+    pub repo: String,
+}
+
+/// Snapshot of a local pool worker (`{base}-w{N}`) for planning.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkerSnapshot {
+    pub slot: u32,
+    pub worker_id: String,
+    pub container: String,
+    /// Whether the container process is still running.
+    pub running: bool,
+}
+
+/// Inputs for one scale decision. All numbers are **host-pool** free/max
+/// after reap; free resources must not be double-counted with planned spawns.
+#[derive(Debug, Clone)]
+pub struct ScaleInput {
+    /// Matching demand jobs (already filtered by listener labels / GPU affinity).
+    pub jobs: Vec<DemandSignal>,
+    /// Currently known local pool workers (any state).
+    pub workers: Vec<WorkerSnapshot>,
+    /// Free CPUs / MiB in the shared pool (max − claimed).
+    pub free_cpus: f64,
+    pub free_memory_mib: u64,
+    /// Hard pool ceilings (for notes / clamp; free_* already respects them).
+    pub max_cpus: f64,
+    pub max_memory_mib: u64,
+    /// Max workers this listen process may own (min of local + pool caps).
+    pub max_local_workers: u32,
+    /// Total claims already held host-wide (all managers).
+    pub host_claim_count: u32,
+    /// Host-wide max workers (pool).
+    pub max_host_workers: u32,
+    /// Force GPU tier resolution (GPU listener).
+    pub force_gpu: bool,
+    /// True when the listen idle timer has expired with no demand.
+    pub idle_expired: bool,
+    /// Anti-storm: max new spawns this tick.
+    pub max_spawn_per_tick: u32,
+}
+
+/// One planned worker spin-up.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpawnRequest {
+    pub slot: u32,
+    pub tier: SizeTier,
+    pub cpus: f64,
+    pub memory_mib: u64,
+    pub job_name: String,
+    pub labels: Vec<String>,
+    pub repo: String,
+}
+
+/// Result of [`plan_scale`]: what to create and what to tear down.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScalePlan {
+    /// Workers to start (capacity already simulated).
+    pub spawns: Vec<SpawnRequest>,
+    /// Local worker_ids to tear down (idle scale-in).
+    pub scale_in: Vec<String>,
+    /// Target running count from queue pressure (pre capacity clamp packing).
+    pub desired_count: u32,
+    /// Human-readable decision summary for logs.
+    pub notes: String,
+}
+
+impl Default for ScaleInput {
+    fn default() -> Self {
+        Self {
+            jobs: Vec::new(),
+            workers: Vec::new(),
+            free_cpus: DEFAULT_POOL_CPUS,
+            free_memory_mib: DEFAULT_POOL_MEMORY_MIB,
+            max_cpus: DEFAULT_POOL_CPUS,
+            max_memory_mib: DEFAULT_POOL_MEMORY_MIB,
+            max_local_workers: DEFAULT_MAX_WORKERS,
+            host_claim_count: 0,
+            max_host_workers: DEFAULT_MAX_WORKERS,
+            force_gpu: false,
+            idle_expired: false,
+            max_spawn_per_tick: DEFAULT_MAX_SPAWN_PER_TICK,
+        }
+    }
+}
+
+/// Pure demand-driven scale decision.
+///
+/// * **Horizontal:** queue depth → desired **total** worker count (clamped by local +
+///   host caps). Spawns only the delta (`desired − already occupied`), not one new
+///   worker per job on top of existing capacity.
+/// * **Vertical:** each job → tier via [`size_for_job`] + preferred full tier size;
+///   if nothing preferred fits, one deferred job may [`fit_to_budget`] shrink into
+///   the remainder.
+/// * **Capacity:** never plans a spawn that does not fit free CPU **and** memory
+///   (and free local/host worker slots). Claimed-or-running workers occupy slots.
+/// * **Scale-in:** when there is no demand and `idle_expired`, tear down all
+///   still-running local pool workers so capacity returns to the shared budget.
+/// * **Storm bound:** at most `max_spawn_per_tick` spawns per call.
+pub fn plan_scale(input: &ScaleInput) -> ScalePlan {
+    let running_local = input.workers.iter().filter(|w| w.running).count() as u32;
+    // Any known local worker (running **or** claimed-but-not-yet-running) holds its
+    // slot id — otherwise a mid-spawn claim is double-booked on the next tick.
+    let used_slots: std::collections::HashSet<u32> = input.workers.iter().map(|w| w.slot).collect();
+    let occupied_local = used_slots.len() as u32;
+
+    // --- Idle scale-IN: no demand, idle timer fired → tear down pool workers ---
+    if input.jobs.is_empty() {
+        if input.idle_expired && running_local > 0 {
+            let scale_in: Vec<String> = input
+                .workers
+                .iter()
+                .filter(|w| w.running)
+                .map(|w| w.worker_id.clone())
+                .collect();
+            return ScalePlan {
+                spawns: Vec::new(),
+                scale_in,
+                desired_count: 0,
+                notes: format!("scale-in: idle, tearing down {running_local} pool worker(s)"),
+            };
+        }
+        return ScalePlan {
+            spawns: Vec::new(),
+            scale_in: Vec::new(),
+            desired_count: 0,
+            notes: if running_local > 0 {
+                format!(
+                    "hold: no demand, {running_local} worker(s) still running (idle not expired)"
+                )
+            } else {
+                "idle: no demand, no workers".into()
+            },
+        };
+    }
+
+    // --- Scale-OUT from queue pressure ---
+    let host_slots_left = input
+        .max_host_workers
+        .saturating_sub(input.host_claim_count);
+    let local_slots_left = input.max_local_workers.saturating_sub(occupied_local);
+    let slot_cap = host_slots_left.min(local_slots_left);
+    // Desired total workers from queue pressure (before packing failures).
+    let desired_count = (input.jobs.len() as u32)
+        .min(input.max_local_workers)
+        .min(occupied_local.saturating_add(host_slots_left));
+
+    // Only plan the deficit toward desired — do not stack N new spawns when N
+    // workers already cover N (queued or in_progress) jobs.
+    let need = desired_count.saturating_sub(occupied_local);
+    let spawn_budget = input.max_spawn_per_tick.min(slot_cap).min(need);
+
+    let mut free_c = input.free_cpus.max(0.0);
+    let mut free_m = input.free_memory_mib;
+    let mut used = used_slots;
+    let mut spawns = Vec::new();
+    let mut skipped_capacity = 0u32;
+    // Jobs that could not take their preferred size (candidate for one shrink fill).
+    let mut deferred: Vec<&DemandSignal> = Vec::new();
+
+    for job in &input.jobs {
+        if spawns.len() as u32 >= spawn_budget {
+            break;
+        }
+        // Lowest free slot id under max_local_workers.
+        let slot = match (0..input.max_local_workers).find(|s| !used.contains(s)) {
+            Some(s) => s,
+            None => break,
+        };
+
+        let tier = size_for_job(&job.job_name, &job.labels, input.force_gpu);
+        let (want_c_s, want_m_s) = resources_for_tier(tier);
+        let want_c = parse_cpus_f64(&want_c_s).unwrap_or(1.0);
+        let want_m = parse_memory_mib(&want_m_s).unwrap_or(2048);
+
+        // Prefer full tier size so a heavy job does not shrink and starve lighter ones.
+        if free_c + 1e-9 >= want_c && free_m >= want_m {
+            free_c = (free_c - want_c).max(0.0);
+            free_m = free_m.saturating_sub(want_m);
+            used.insert(slot);
+            spawns.push(SpawnRequest {
+                slot,
+                tier,
+                cpus: want_c,
+                memory_mib: want_m,
+                job_name: job.job_name.clone(),
+                labels: job.labels.clone(),
+                repo: job.repo.clone(),
+            });
+        } else {
+            skipped_capacity += 1;
+            deferred.push(job);
+        }
+    }
+
+    // Best-effort: if nothing preferred fit but budget ≥ floor, shrink one deferred
+    // job into the remainder (keeps a single worker useful under tight headroom).
+    if spawns.is_empty() && spawn_budget > 0 {
+        if let Some(job) = deferred.first() {
+            if let Some(slot) = (0..input.max_local_workers).find(|s| !used.contains(s)) {
+                let tier = size_for_job(&job.job_name, &job.labels, input.force_gpu);
+                let (want_c_s, want_m_s) = resources_for_tier(tier);
+                let want_c = parse_cpus_f64(&want_c_s).unwrap_or(1.0);
+                let want_m = parse_memory_mib(&want_m_s).unwrap_or(2048);
+                if let Some((c, m)) = fit_to_budget(
+                    want_c,
+                    want_m,
+                    free_c,
+                    free_m,
+                    DEFAULT_MIN_CPUS,
+                    DEFAULT_MIN_MEMORY_MIB,
+                ) {
+                    free_c = (free_c - c).max(0.0);
+                    free_m = free_m.saturating_sub(m);
+                    used.insert(slot);
+                    spawns.push(SpawnRequest {
+                        slot,
+                        tier,
+                        cpus: c,
+                        memory_mib: m,
+                        job_name: job.job_name.clone(),
+                        labels: job.labels.clone(),
+                        repo: job.repo.clone(),
+                    });
+                    skipped_capacity = skipped_capacity.saturating_sub(1);
+                }
+            }
+        }
+    }
+
+    let notes = format!(
+        "scale-out: queue={} desired={} spawn={} skip_cap={} free_left={:.2}c/{}MiB",
+        input.jobs.len(),
+        desired_count,
+        spawns.len(),
+        skipped_capacity,
+        free_c,
+        free_m
+    );
+
+    ScalePlan {
+        spawns,
+        scale_in: Vec::new(),
+        desired_count,
+        notes,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -624,5 +882,280 @@ mod tests {
     #[test]
     fn fit_none_when_empty() {
         assert!(fit_to_budget(1.0, 1024, 0.1, 100, 0.25, 256).is_none());
+    }
+
+    fn job(name: &str, labels: &[&str]) -> DemandSignal {
+        DemandSignal {
+            job_name: name.into(),
+            labels: labels.iter().map(|s| s.to_string()).collect(),
+            repo: "owner/repo".into(),
+        }
+    }
+
+    fn base_input(jobs: Vec<DemandSignal>) -> ScaleInput {
+        ScaleInput {
+            jobs,
+            free_cpus: 16.0,
+            free_memory_mib: 16 * 1024,
+            max_cpus: 16.0,
+            max_memory_mib: 16 * 1024,
+            max_local_workers: 8,
+            host_claim_count: 0,
+            max_host_workers: 24,
+            max_spawn_per_tick: 8,
+            ..ScaleInput::default()
+        }
+    }
+
+    /// Queue pressure: N matching jobs → up to N planned spawns (horizontal).
+    #[test]
+    fn scale_queue_pressure_to_count() {
+        let jobs = vec![
+            job("gitleaks", &["self-hosted"]),
+            job("ruff", &["self-hosted"]),
+            job("lint", &["self-hosted"]),
+        ];
+        let plan = plan_scale(&base_input(jobs));
+        assert_eq!(plan.spawns.len(), 3, "notes={}", plan.notes);
+        assert_eq!(plan.desired_count, 3);
+        assert!(plan.scale_in.is_empty());
+        // Micro jobs get distinct slots 0,1,2
+        let mut slots: Vec<_> = plan.spawns.iter().map(|s| s.slot).collect();
+        slots.sort();
+        assert_eq!(slots, vec![0, 1, 2]);
+    }
+
+    /// Vertical: job size/labels map to tier + preferred resources in the plan.
+    #[test]
+    fn scale_job_size_vertical() {
+        // micro (0.25c/512) + large (4c/8g) + medium (2c/4g) fit under 16c/16g.
+        let jobs = vec![
+            job("gitleaks", &["self-hosted"]),
+            job("cargo test", &["self-hosted"]),
+            job("pytest", &["self-hosted"]),
+        ];
+        let plan = plan_scale(&base_input(jobs));
+        assert_eq!(plan.spawns.len(), 3, "notes={}", plan.notes);
+        assert_eq!(plan.spawns[0].tier, SizeTier::Micro);
+        assert_eq!(plan.spawns[1].tier, SizeTier::Large);
+        assert_eq!(plan.spawns[2].tier, SizeTier::Medium);
+        assert!((plan.spawns[0].cpus - 0.25).abs() < 1e-9);
+        assert_eq!(plan.spawns[0].memory_mib, 512);
+        assert!((plan.spawns[1].cpus - 4.0).abs() < 1e-9);
+        assert_eq!(plan.spawns[1].memory_mib, 8 * 1024);
+        assert!((plan.spawns[2].cpus - 2.0).abs() < 1e-9);
+        assert_eq!(plan.spawns[2].memory_mib, 4 * 1024);
+    }
+
+    /// Explicit xlarge label gets full preferred size when budget allows.
+    #[test]
+    fn scale_xlarge_preferred_when_budget_allows() {
+        let mut input = base_input(vec![job("unit", &["self-hosted", "xlarge"])]);
+        input.free_cpus = 16.0;
+        input.free_memory_mib = 16 * 1024;
+        let plan = plan_scale(&input);
+        assert_eq!(plan.spawns.len(), 1);
+        assert_eq!(plan.spawns[0].tier, SizeTier::Xlarge);
+        assert!((plan.spawns[0].cpus - 8.0).abs() < 1e-9);
+        assert_eq!(plan.spawns[0].memory_mib, 16 * 1024);
+    }
+
+    /// Capacity ceiling: never plan more workers than free CPU/memory allow.
+    #[test]
+    fn scale_capacity_bound_clamp() {
+        // 2c free / 4g free → at most one Medium (2c/4g); second Medium skipped.
+        let mut input = base_input(vec![
+            job("pytest", &["self-hosted"]),
+            job("unit test", &["self-hosted"]),
+            job("ci", &["self-hosted"]),
+        ]);
+        input.free_cpus = 2.0;
+        input.free_memory_mib = 4 * 1024;
+        input.max_cpus = 2.0;
+        input.max_memory_mib = 4 * 1024;
+        let plan = plan_scale(&input);
+        assert_eq!(plan.spawns.len(), 1, "notes={}", plan.notes);
+        assert_eq!(plan.spawns[0].tier, SizeTier::Medium);
+        // desired_count still reflects queue pressure before packing
+        assert_eq!(plan.desired_count, 3);
+    }
+
+    /// Full pool: zero free → zero spawns (hard bound).
+    #[test]
+    fn scale_no_oversubscribe_when_empty_budget() {
+        let mut input = base_input(vec![job("cargo test", &["self-hosted"])]);
+        input.free_cpus = 0.0;
+        input.free_memory_mib = 0;
+        let plan = plan_scale(&input);
+        assert!(plan.spawns.is_empty(), "notes={}", plan.notes);
+        assert!(plan.scale_in.is_empty());
+    }
+
+    /// Max workers clamp (local + host claim count).
+    #[test]
+    fn scale_max_workers_clamp() {
+        let mut input = base_input(vec![
+            job("gitleaks", &["self-hosted"]),
+            job("ruff", &["self-hosted"]),
+            job("fmt", &["self-hosted"]),
+        ]);
+        input.max_local_workers = 2;
+        input.max_spawn_per_tick = 8;
+        let plan = plan_scale(&input);
+        assert_eq!(plan.spawns.len(), 2, "notes={}", plan.notes);
+        assert_eq!(plan.desired_count, 2);
+    }
+
+    /// Host claim count reduces available slots.
+    #[test]
+    fn scale_host_claim_cap() {
+        let mut input = base_input(vec![
+            job("gitleaks", &["self-hosted"]),
+            job("ruff", &["self-hosted"]),
+        ]);
+        input.max_host_workers = 3;
+        input.host_claim_count = 3; // full
+        let plan = plan_scale(&input);
+        assert!(plan.spawns.is_empty(), "notes={}", plan.notes);
+    }
+
+    /// Anti-storm: max_spawn_per_tick bounds a deep queue.
+    #[test]
+    fn scale_spawn_per_tick_bound() {
+        let jobs: Vec<_> = (0..10)
+            .map(|i| job(&format!("gitleaks-{i}"), &["self-hosted"]))
+            .collect();
+        let mut input = base_input(jobs);
+        input.max_spawn_per_tick = 3;
+        let plan = plan_scale(&input);
+        assert_eq!(plan.spawns.len(), 3, "notes={}", plan.notes);
+        assert_eq!(plan.desired_count, 8); // clamped by max_local_workers=8
+    }
+
+    /// Idle scale-in: no jobs + idle_expired → tear down running pool workers.
+    #[test]
+    fn scale_idle_scale_in() {
+        let input = ScaleInput {
+            jobs: Vec::new(),
+            workers: vec![
+                WorkerSnapshot {
+                    slot: 0,
+                    worker_id: "runner-w0".into(),
+                    container: "ctl-w0".into(),
+                    running: true,
+                },
+                WorkerSnapshot {
+                    slot: 1,
+                    worker_id: "runner-w1".into(),
+                    container: "ctl-w1".into(),
+                    running: true,
+                },
+                WorkerSnapshot {
+                    slot: 2,
+                    worker_id: "runner-w2".into(),
+                    container: "ctl-w2".into(),
+                    running: false, // already dead — not in scale_in
+                },
+            ],
+            idle_expired: true,
+            ..ScaleInput::default()
+        };
+        let plan = plan_scale(&input);
+        assert!(plan.spawns.is_empty());
+        assert_eq!(plan.desired_count, 0);
+        assert_eq!(plan.scale_in.len(), 2);
+        assert!(plan.scale_in.contains(&"runner-w0".into()));
+        assert!(plan.scale_in.contains(&"runner-w1".into()));
+    }
+
+    /// Idle but timer not expired: hold workers (no scale-in yet).
+    #[test]
+    fn scale_idle_hold_before_timeout() {
+        let input = ScaleInput {
+            jobs: Vec::new(),
+            workers: vec![WorkerSnapshot {
+                slot: 0,
+                worker_id: "runner-w0".into(),
+                container: "ctl-w0".into(),
+                running: true,
+            }],
+            idle_expired: false,
+            ..ScaleInput::default()
+        };
+        let plan = plan_scale(&input);
+        assert!(plan.spawns.is_empty());
+        assert!(plan.scale_in.is_empty());
+        assert!(plan.notes.contains("hold"));
+    }
+
+    /// Occupied workers hold slots; deficit spawns use the next free slot id.
+    #[test]
+    fn scale_skips_occupied_slots() {
+        // 2 jobs, 1 already up → need exactly one more on slot 1.
+        let mut input = base_input(vec![
+            job("gitleaks", &["self-hosted"]),
+            job("ruff", &["self-hosted"]),
+        ]);
+        input.workers = vec![WorkerSnapshot {
+            slot: 0,
+            worker_id: "runner-w0".into(),
+            container: "ctl-w0".into(),
+            running: true,
+        }];
+        input.host_claim_count = 1;
+        let plan = plan_scale(&input);
+        assert_eq!(plan.spawns.len(), 1, "notes={}", plan.notes);
+        assert_eq!(plan.spawns[0].slot, 1);
+        assert_eq!(plan.desired_count, 2);
+    }
+
+    /// Claimed-but-not-running still occupies the slot (avoids double-book mid-spawn).
+    #[test]
+    fn scale_claimed_not_running_occupies_slot() {
+        let mut input = base_input(vec![
+            job("gitleaks", &["self-hosted"]),
+            job("ruff", &["self-hosted"]),
+        ]);
+        input.workers = vec![WorkerSnapshot {
+            slot: 0,
+            worker_id: "runner-w0".into(),
+            container: "ctl-w0".into(),
+            running: false,
+        }];
+        input.host_claim_count = 1;
+        let plan = plan_scale(&input);
+        assert_eq!(plan.spawns.len(), 1, "notes={}", plan.notes);
+        assert_eq!(plan.spawns[0].slot, 1);
+    }
+
+    /// One job + one occupied worker → no over-spawn (desired already met).
+    #[test]
+    fn scale_no_overspawn_when_covered() {
+        let mut input = base_input(vec![job("gitleaks", &["self-hosted"])]);
+        input.workers = vec![WorkerSnapshot {
+            slot: 0,
+            worker_id: "runner-w0".into(),
+            container: "ctl-w0".into(),
+            running: true,
+        }];
+        input.host_claim_count = 1;
+        let plan = plan_scale(&input);
+        assert!(plan.spawns.is_empty(), "notes={}", plan.notes);
+        assert_eq!(plan.desired_count, 1);
+    }
+
+    /// Under tight budget, a micro job can still fit after a large one is skipped.
+    #[test]
+    fn scale_skips_large_allows_micro() {
+        let mut input = base_input(vec![
+            job("unit", &["self-hosted", "xlarge"]), // 8c/16g — won't fit
+            job("gitleaks", &["self-hosted"]),       // micro — fits
+        ]);
+        input.free_cpus = 1.0;
+        input.free_memory_mib = 1024;
+        let plan = plan_scale(&input);
+        assert_eq!(plan.spawns.len(), 1, "notes={}", plan.notes);
+        assert_eq!(plan.spawns[0].tier, SizeTier::Micro);
+        assert_eq!(plan.spawns[0].job_name, "gitleaks");
     }
 }

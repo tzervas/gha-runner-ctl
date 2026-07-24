@@ -13,8 +13,9 @@
 mod pool;
 
 pub use pool::{
-    fit_to_budget, format_cpus, format_memory_mib, parse_cpus_f64, parse_memory_mib,
-    resources_for_tier, size_for_job, ResourcePool, SizeTier,
+    fit_to_budget, format_cpus, format_memory_mib, parse_cpus_f64, parse_memory_mib, plan_scale,
+    resources_for_tier, size_for_job, DemandSignal, ResourcePool, ScaleInput, ScalePlan, SizeTier,
+    SpawnRequest, WorkerSnapshot, DEFAULT_MAX_SPAWN_PER_TICK,
 };
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -3856,12 +3857,14 @@ pub fn runner_labels_for_job(base_labels: &str, job_labels: &[String], tier: Siz
     set.into_iter().collect::<Vec<_>>().join(",")
 }
 
+/// Spawn with live `fit_to_budget`. Returns `Ok(true)` if the worker was brought up,
+/// `Ok(false)` if capacity/claim refused (not an error).
 fn spawn_sized_worker(
     base: &Cli,
     pool: &ResourcePool,
     slot: u32,
     job: &DemandJob,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let tier = size_for_job(&job.job_name, &job.labels, base.gpu);
     let (want_c_s, want_m_s) = resources_for_tier(tier);
     let want_c = parse_cpus_f64(&want_c_s).unwrap_or(1.0);
@@ -3875,23 +3878,48 @@ fn spawn_sized_worker(
             job.job_name,
             tier.as_str()
         );
-        return Ok(());
+        return Ok(false);
     };
+    spawn_worker_with_resources(base, pool, slot, job, tier, c, m)
+}
+
+/// Spawn a pool worker using resources already decided by [`plan_scale`] (or
+/// re-checked via [`spawn_sized_worker`]). Claim is the hard capacity gate.
+/// `Ok(true)` = container up; `Ok(false)` = claim refused / no-op.
+fn spawn_worker_with_resources(
+    base: &Cli,
+    pool: &ResourcePool,
+    slot: u32,
+    job: &DemandJob,
+    tier: SizeTier,
+    cpus: f64,
+    memory_mib: u64,
+) -> Result<bool, String> {
     let worker_id = format!("{}-w{slot}", base.runner_name);
     let container = format!("{}-w{slot}", base.container);
     let volume = format!("{container}-data");
-    if !pool.try_claim(&worker_id, &container, c, m, tier, Some(job.repo.as_str()))? {
+    if !pool.try_claim(
+        &worker_id,
+        &container,
+        cpus,
+        memory_mib,
+        tier,
+        Some(job.repo.as_str()),
+    )? {
         eprintln!("pool: claim failed for {container}");
-        return Ok(());
+        return Ok(false);
     }
-    ensure_worker_volume(base, &volume)?;
+    if let Err(e) = ensure_worker_volume(base, &volume) {
+        let _ = pool.release(&worker_id);
+        return Err(e);
+    }
     let mut unit = base.clone_for_listen();
     unit.repo = Some(job.repo.clone());
     unit.container = container.clone();
     unit.volume = volume;
     unit.runner_name = worker_id.clone();
-    unit.cpus = format_cpus(c);
-    unit.memory = format_memory_mib(m);
+    unit.cpus = format_cpus(cpus);
+    unit.memory = format_memory_mib(memory_mib);
     // Register base fleet labels + job-requested size/capability labels so
     // `runs-on: [self-hosted, linux, x64, podman, large|xlarge|gpu]` matches.
     unit.labels = runner_labels_for_job(&base.labels, &job.labels, tier);
@@ -3908,7 +3936,61 @@ fn spawn_sized_worker(
         let _ = pool.release(&worker_id);
         return Err(e);
     }
+    Ok(true)
+}
+
+/// Tear down a local pool worker by id and release its pool claim.
+fn scale_in_worker(base: &Cli, pool: &ResourcePool, worker_id: &str) -> Result<(), String> {
+    let claims = pool.claims()?;
+    let Some(c) = claims.iter().find(|x| x.worker_id == worker_id) else {
+        eprintln!("pool: scale-in skip unknown worker {worker_id}");
+        return Ok(());
+    };
+    if !c.container.starts_with(&base.container) {
+        // Never touch another manager's workers or warm/base retain runners.
+        eprintln!(
+            "pool: scale-in refuse non-local container {} (base={})",
+            c.container, base.container
+        );
+        return Ok(());
+    }
+    eprintln!(
+        "pool: scale-in {} tier={} repo={:?}",
+        c.container, c.tier, c.repo
+    );
+    let mut unit = base.clone_for_listen();
+    unit.container = c.container.clone();
+    unit.volume = format!("{}-data", c.container);
+    unit.runner_name = c.worker_id.clone();
+    let _ = down(&unit, true);
+    if let Err(e) = pool.release(worker_id) {
+        eprintln!("pool: release {worker_id} failed: {}", redact(&e));
+        let _ = pool.release_container(&c.container);
+    }
     Ok(())
+}
+
+/// Build planner worker snapshots for containers owned by this listen base name.
+fn local_worker_snapshots(cli: &Cli, pool: &ResourcePool, max_local: u32) -> Vec<WorkerSnapshot> {
+    let mut out = Vec::new();
+    let claims = pool.claims().unwrap_or_default();
+    for slot in 0..max_local {
+        let container = format!("{}-w{slot}", cli.container);
+        let worker_id = format!("{}-w{slot}", cli.runner_name);
+        let running = container_running(&container);
+        let claimed = claims
+            .iter()
+            .any(|c| c.container == container || c.worker_id == worker_id);
+        if running || claimed {
+            out.push(WorkerSnapshot {
+                slot,
+                worker_id,
+                container,
+                running,
+            });
+        }
+    }
+    out
 }
 
 fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> Result<(), String> {
@@ -4016,82 +4098,123 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
                         .unwrap_or(Duration::from_secs(interval));
                     drop(api);
                     thread::sleep(wait);
+                    // Do not scale-in on API failure (avoid flap when GitHub is dark).
                     continue;
                 }
             };
             drop(api);
 
-            let running_n = pool
-                .claims()
-                .map(|c| {
-                    c.iter()
-                        .filter(|x| {
-                            x.container.starts_with(&cli.container)
-                                && container_running(&x.container)
-                        })
-                        .count()
-                })
-                .unwrap_or(0);
-
-            if jobs.is_empty() {
-                if running_n == 0 {
-                    let since = idle_since.get_or_insert_with(Instant::now);
-                    if since.elapsed() >= Duration::from_secs(idle_secs) {
-                        // nothing to down at base container in pure multi-worker mode
-                        idle_since = None;
+            // Filter by GPU affinity before planning (CPU listener skips gpu tiers).
+            let filtered: Vec<DemandJob> = jobs
+                .into_iter()
+                .filter(|job| {
+                    let tier = size_for_job(&job.job_name, &job.labels, cli.gpu);
+                    if cli.gpu {
+                        tier == SizeTier::Gpu
+                    } else {
+                        tier != SizeTier::Gpu
                     }
-                } else {
-                    idle_since = None;
-                }
+                })
+                .collect();
+
+            let workers = local_worker_snapshots(&cli, &pool, max_local);
+            let running_n = workers.iter().filter(|w| w.running).count() as u32;
+            let (used_c, used_m, host_claims) = pool.usage().unwrap_or((0.0, 0, 0));
+            let free_c = (pool.max_cpus - used_c).max(0.0);
+            let free_m = pool.max_memory_mib.saturating_sub(used_m);
+
+            // Idle timer: advance whenever the queue is empty (including while
+            // workers are still up — that is when scale-in must eventually fire).
+            let idle_expired = if filtered.is_empty() {
+                let since = idle_since.get_or_insert_with(Instant::now);
+                since.elapsed() >= Duration::from_secs(idle_secs)
             } else {
                 idle_since = None;
-                let mut slot: u32 = 0;
-                let mut spawned = 0u32;
-                for job in &jobs {
-                    // GPU listener only takes gpu-tier jobs; CPU skips gpu.
-                    let tier = size_for_job(&job.job_name, &job.labels, cli.gpu);
-                    if cli.gpu && tier != SizeTier::Gpu {
-                        continue;
-                    }
-                    if !cli.gpu && tier == SizeTier::Gpu {
-                        continue;
-                    }
-                    // find free slot id
-                    while slot < max_local {
-                        let cname = format!("{}-w{slot}", cli.container);
-                        if !container_running(&cname) {
-                            break;
-                        }
-                        slot += 1;
-                    }
-                    if slot >= max_local {
-                        eprintln!("pool: local max workers {max_local} reached");
-                        break;
-                    }
-                    // Free any workers that finished mid-batch before claiming budget.
-                    let _ = reap_pool_workers(&cli, &pool);
-                    if let Err(e) = spawn_sized_worker(&cli, &pool, slot, job) {
-                        eprintln!("pool: spawn failed: {}", redact(&e));
-                        // Budget may be stuck on exited claims — reap and retry once.
-                        let freed = reap_pool_workers(&cli, &pool);
-                        if freed > 0 {
-                            if let Err(e2) = spawn_sized_worker(&cli, &pool, slot, job) {
-                                eprintln!("pool: spawn retry failed: {}", redact(&e2));
-                            } else {
-                                spawned += 1;
-                            }
-                        }
-                    } else {
-                        spawned += 1;
-                    }
-                    slot += 1;
+                false
+            };
+
+            let max_spawn = std::env::var("GHA_POOL_MAX_SPAWN_PER_TICK")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(DEFAULT_MAX_SPAWN_PER_TICK);
+
+            let signals: Vec<DemandSignal> = filtered
+                .iter()
+                .map(|j| DemandSignal {
+                    job_name: j.job_name.clone(),
+                    labels: j.labels.clone(),
+                    repo: j.repo.clone(),
+                })
+                .collect();
+
+            let plan = plan_scale(&ScaleInput {
+                jobs: signals,
+                workers,
+                free_cpus: free_c,
+                free_memory_mib: free_m,
+                max_cpus: pool.max_cpus,
+                max_memory_mib: pool.max_memory_mib,
+                max_local_workers: max_local,
+                host_claim_count: host_claims as u32,
+                max_host_workers: pool.max_workers,
+                force_gpu: cli.gpu,
+                idle_expired,
+                max_spawn_per_tick: max_spawn,
+            });
+
+            eprintln!(
+                "pool: plan {} (running={running_n} free={free_c:.2}c/{free_m}MiB)",
+                plan.notes
+            );
+
+            // Scale-IN first (return capacity before scale-out packing).
+            for wid in &plan.scale_in {
+                if let Err(e) = scale_in_worker(&cli, &pool, wid) {
+                    eprintln!("pool: scale-in failed: {}", redact(&e));
                 }
-                if spawned > 0 {
-                    let (uc, um, n) = pool.usage().unwrap_or((0.0, 0, 0));
-                    eprintln!(
-                        "pool: spawned={spawned} usage={uc:.2}/{:.0}c {um}/{}MiB claims={n}",
-                        pool.max_cpus, pool.max_memory_mib
-                    );
+            }
+            if !plan.scale_in.is_empty() {
+                idle_since = None;
+            }
+
+            // Scale-OUT: execute planned spawns; try_claim re-checks capacity under lock.
+            let mut spawned = 0u32;
+            for req in &plan.spawns {
+                let job = DemandJob {
+                    repo: req.repo.clone(),
+                    job_name: req.job_name.clone(),
+                    labels: req.labels.clone(),
+                };
+                // Prefer planner resources; claim is still the hard gate. If the
+                // free pool moved, fall back to fit_to_budget inside spawn_sized_worker.
+                let result = spawn_worker_with_resources(
+                    &cli,
+                    &pool,
+                    req.slot,
+                    &job,
+                    req.tier,
+                    req.cpus,
+                    req.memory_mib,
+                );
+                match result {
+                    Ok(true) => spawned += 1,
+                    Ok(false) => {
+                        // Claim refused (slot raced); try live fit once.
+                        match spawn_sized_worker(&cli, &pool, req.slot, &job) {
+                            Ok(true) => spawned += 1,
+                            Ok(false) => {}
+                            Err(e) => eprintln!("pool: spawn retry failed: {}", redact(&e)),
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("pool: spawn failed: {}", redact(&e));
+                        // Retry once via live fit path (budget may have changed).
+                        match spawn_sized_worker(&cli, &pool, req.slot, &job) {
+                            Ok(true) => spawned += 1,
+                            Ok(false) => {}
+                            Err(e2) => eprintln!("pool: spawn retry failed: {}", redact(&e2)),
+                        }
+                    }
                 }
                 if let Some(ref path) = tick_path {
                     let (uc, um, n) = pool.usage().unwrap_or((0.0, 0, 0));
@@ -4111,6 +4234,15 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
                         }),
                     );
                 }
+            }
+            if spawned > 0 || !plan.scale_in.is_empty() {
+                let (uc, um, n) = pool.usage().unwrap_or((0.0, 0, 0));
+                eprintln!(
+                    "pool: spawned={spawned} scale_in={} usage={uc:.2}/{:.0}c {um}/{}MiB claims={n}",
+                    plan.scale_in.len(),
+                    pool.max_cpus,
+                    pool.max_memory_mib
+                );
             }
         } else {
             // Legacy single-container listen path
