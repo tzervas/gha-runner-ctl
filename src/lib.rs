@@ -4904,6 +4904,7 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 pub fn wake_request_line_authorized(line: &str, token: &str) -> bool {
     // Both header types (Authorization: Bearer and X-Wake-Token) are checked case-insensitively.
     // However, the secret token values themselves are compared exactly preserving casing.
+    // Optimized: eq_ignore_ascii_case avoids expensive to_ascii_lowercase String allocation on every wake request.
     const BEARER_PREFIX: &str = "authorization: bearer ";
     if line.len() >= BEARER_PREFIX.len() && line.is_char_boundary(BEARER_PREFIX.len()) {
         let prefix = &line[..BEARER_PREFIX.len()];
