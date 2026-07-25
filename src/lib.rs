@@ -1030,6 +1030,24 @@ const TOKEN_ANCHORS: &[(&str, usize)] = &[
     ("RUNNER_TOKEN=", CONTEXTUAL_MIN_BODY),
 ];
 
+/// First bytes that can begin a [`TOKEN_ANCHORS`] entry: `g` (all six GitHub
+/// token prefixes), `B` (`Bearer `), `R` (`RUNNER_TOKEN=`).
+///
+/// This is a pure prefilter for [`redact`]'s scan loop — a position whose first
+/// byte is not in this set cannot start an anchor, so the 8-way `starts_with`
+/// comparison can be skipped there. It never changes what is redacted, only how
+/// fast the loop reaches it.
+///
+/// Anchors are ASCII literals and the comparison is byte-exact and
+/// case-SENSITIVE, matching `starts_with`. `anchor_first_byte_filter_covers_every_anchor`
+/// derives the required set from `TOKEN_ANCHORS` at test time, so adding an anchor
+/// beginning with any other byte is a test failure rather than a silent
+/// under-redaction.
+#[inline]
+fn could_start_anchor(b: u8) -> bool {
+    matches!(b, b'g' | b'B' | b'R')
+}
+
 /// The token-body character class: ASCII alphanumerics plus `_`, `-`, `.`.
 /// This covers classic GitHub token bodies as well as `ghs_` stateless JWTs
 /// (`base64url.base64url.base64url`, base64url alphabet `[A-Za-z0-9-_]`, with
@@ -1143,27 +1161,50 @@ pub fn redact(s: &str) -> String {
     let len = s.len();
     let mut i = 0usize;
 
+    let bytes = s.as_bytes();
     while i < len {
-        // At most one anchor can match at `i` (see TOKEN_ANCHORS docs), so the
-        // first hit found is *the* hit, not merely a priority pick.
-        if let Some(&(anchor, min_body)) =
-            TOKEN_ANCHORS.iter().find(|&&(a, _)| s[i..].starts_with(a))
-        {
-            let body_start = i + anchor.len();
-            if let Some(body_end) = scan_body_end(s, body_start, min_body) {
-                // Secret body found and skipped: it is never read into `out`,
-                // never copied anywhere — just stepped over.
-                out.push_str(anchor);
-                out.push_str("***REDACTED***");
-                i = body_end;
-            } else {
-                // Empty or below-minimum body: not a secret (e.g. bare prefix
-                // in prose, or a short `ghp_ABC` example). Re-emit the anchor
-                // literal and resume scanning at the body so a short body is
-                // preserved verbatim as ordinary text.
-                out.push_str(anchor);
-                i = body_start;
+        // Single-byte prefilter before the 8-way anchor scan. Without it this
+        // loop ran up to 8 `starts_with` comparisons at EVERY byte position,
+        // which measured 5.5x slower than the implementation it replaces on an
+        // ordinary ~1 KiB secret-free log line (4.29 us vs 782 ns). `redact` is
+        // on the per-log-line path of the `listen` loop, so that is not free.
+        //
+        // Correctness: this can only skip a position whose first byte cannot
+        // begin any anchor. `anchor_first_byte_filter_covers_every_anchor`
+        // derives the expected set from TOKEN_ANCHORS itself, so adding an
+        // anchor with a new initial byte fails the test rather than silently
+        // under-redacting.
+        if could_start_anchor(bytes[i]) {
+            // At most one anchor can match at `i` (see TOKEN_ANCHORS docs), so
+            // the first hit found is *the* hit, not merely a priority pick.
+            if let Some(&(anchor, min_body)) =
+                TOKEN_ANCHORS.iter().find(|&&(a, _)| s[i..].starts_with(a))
+            {
+                let body_start = i + anchor.len();
+                if let Some(body_end) = scan_body_end(s, body_start, min_body) {
+                    // Secret body found and skipped: it is never read into `out`,
+                    // never copied anywhere — just stepped over.
+                    out.push_str(anchor);
+                    out.push_str("***REDACTED***");
+                    i = body_end;
+                } else {
+                    // Empty or below-minimum body: not a secret (e.g. bare prefix
+                    // in prose, or a short `ghp_ABC` example). Re-emit the anchor
+                    // literal and resume scanning at the body so a short body is
+                    // preserved verbatim as ordinary text.
+                    out.push_str(anchor);
+                    i = body_start;
+                }
+                continue;
             }
+        }
+
+        // ASCII fast path: one byte in, one byte out, no slice + iterator
+        // construction. `i` is a char boundary (loop invariant) and a byte
+        // < 0x80 is a complete single-byte character, so this is exact.
+        if bytes[i] < 0x80 {
+            out.push(bytes[i] as char);
+            i += 1;
             continue;
         }
 
@@ -1265,6 +1306,40 @@ mod redact_hardening_tests {
     use super::*;
 
     // ---- Spec test_cases catalog (verbatim) ----------------------------
+
+    /// The `could_start_anchor` prefilter must admit EVERY anchor's first byte.
+    /// Derived from TOKEN_ANCHORS itself: adding an anchor that starts with a byte
+    /// the filter rejects fails here instead of silently never being redacted.
+    #[test]
+    fn anchor_first_byte_filter_covers_every_anchor() {
+        for (anchor, _) in TOKEN_ANCHORS {
+            let first = *anchor.as_bytes().first().expect("anchors are non-empty");
+            assert!(
+                could_start_anchor(first),
+                "anchor {anchor:?} starts with {:?}, which the redact() prefilter \
+                 rejects — it would never be scanned and the secret would leak",
+                first as char
+            );
+        }
+    }
+
+    /// The prefilter must not admit bytes no anchor uses; if it did it would only
+    /// cost time, but a drifting filter is worth catching either way.
+    #[test]
+    fn anchor_first_byte_filter_is_tight() {
+        let admitted: Vec<u8> = (0u8..=127).filter(|b| could_start_anchor(*b)).collect();
+        let expected: std::collections::BTreeSet<u8> = TOKEN_ANCHORS
+            .iter()
+            .map(|(a, _)| *a.as_bytes().first().expect("anchors are non-empty"))
+            .collect();
+        assert_eq!(
+            admitted
+                .into_iter()
+                .collect::<std::collections::BTreeSet<u8>>(),
+            expected,
+            "prefilter set drifted from TOKEN_ANCHORS"
+        );
+    }
 
     #[test]
     fn ghs_jwt_over_520_two_dots() {
