@@ -1,0 +1,67 @@
+# Development-standards gate for gha-runner-ctl.
+#
+# Repo-specific notes, the measured merge-base damage this repo carries, and the runner-sizing
+# reasoning live in docs/STANDARDS_GATE.md. Read that before changing anything here.
+#
+# This file is deliberately thin. All policy lives in
+# tzervas/mycelium-workflows/.github/workflows/reusable-standards.yml; the only things that
+# belong here are this repo's own overrides.
+#
+# WHAT IT REPORTS: one status context, `standards / standards`.
+#
+# BEFORE YOU PUT THAT NAME IN A RULESET — a reusable workflow prefixes the job name with the
+# caller's job id and the prefix CANNOT be suppressed. A ruleset requiring the bare context
+# `standards` will require a context that NEVER REPORTS: the PR does not go red, it waits
+# forever with nothing to diagnose. Land this caller FIRST, confirm the name with
+# `gh pr checks <n>`, and only THEN add it to `protec-main` / `protec-dev`.
+# See docs/STANDARDS_GATE.md.
+#
+# WHY IT TRIGGERS ON push AS WELL AS pull_request: the trunk-divergence rule measures
+# repository state (does `main` still share a merge base with `dev`?), which is exactly what a
+# squashed promote destroys at merge time — after every PR check has already gone green.
+name: standards
+
+on:
+  pull_request:
+    branches: [main, dev, sec]
+  push:
+    branches: [main, dev, sec]
+  workflow_dispatch:
+
+concurrency:
+  group: standards-${{ github.workflow }}-${{ github.ref }}
+  # Never a bare `true`: a scheduled run that queues behind a busy self-hosted pool would be
+  # cancelled by the next tick and report `cancelled`, not `failed` — silently never running.
+  # This workflow has no schedule today; the expression keeps that true if one is added.
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  # Job id `standards` -> context `standards / standards`. Renaming this renames the context.
+  standards:
+    uses: tzervas/mycelium-workflows/.github/workflows/reusable-standards.yml@main
+    # All inputs are optional. Uncomment only what this repo genuinely differs on — an
+    # override that restates the default is a second source of truth that will drift.
+    #
+    # with:
+    #   # Start any rule at `warn` while cleaning up pre-existing state, then promote it.
+    #   exit-contract: enforce
+    #   python-floor: enforce
+    #
+    #   # Add a size token ONLY once your workers register it. An unserved label queues the
+    #   # job forever instead of failing — the same "nothing red to fix" trap as above.
+    #   runner-labels: '["self-hosted","linux","x64","podman","small"]'
+    #
+    #   # Repos with a different trunk layout.
+    #   integration-branch: dev
+    #   release-branch: main
+    #   main-allowed-heads: 'dev,sec,release/**,hotfix/**,revert-*'
+    #
+    # secrets:
+    #   # Optional. Repo-admin read lets the promote rule also assert the repo's allowed merge
+    #   # methods; the default GITHUB_TOKEN cannot see those fields and that half of the rule
+    #   # reports "not asserted" rather than guessing.
+    #   token: ${{ secrets.FLEET_ADMIN_READ_TOKEN }}
