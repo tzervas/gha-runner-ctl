@@ -985,6 +985,26 @@ pub fn is_safe_memory(s: &str) -> bool {
 }
 
 pub fn redact(s: &str) -> String {
+    let mut has_key = false;
+    for key in [
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
+        "github_pat_",
+        "Bearer ",
+        "RUNNER_TOKEN=",
+    ] {
+        if s.contains(key) {
+            has_key = true;
+            break;
+        }
+    }
+    if !has_key && s.len() <= 400 {
+        return s.to_string();
+    }
+
     let mut out = s.to_string();
     for key in [
         "ghp_",
@@ -4904,18 +4924,22 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 pub fn wake_request_line_authorized(line: &str, token: &str) -> bool {
     // Both header types (Authorization: Bearer and X-Wake-Token) are checked case-insensitively.
     // However, the secret token values themselves are compared exactly preserving casing.
-    let lower = line.to_ascii_lowercase();
     const BEARER_PREFIX: &str = "authorization: bearer ";
-    if lower.starts_with(BEARER_PREFIX) && line.len() >= BEARER_PREFIX.len() {
-        // Find the boundary in the original line using the lowercase prefix length to preserve token's case.
-        let rest = &line[BEARER_PREFIX.len()..];
-        return constant_time_eq(rest.trim(), token);
+    if line.len() >= BEARER_PREFIX.len() && line.is_char_boundary(BEARER_PREFIX.len()) {
+        let prefix = &line[..BEARER_PREFIX.len()];
+        if prefix.eq_ignore_ascii_case(BEARER_PREFIX) {
+            let rest = &line[BEARER_PREFIX.len()..];
+            return constant_time_eq(rest.trim(), token);
+        }
     }
 
     const WAKE_TOKEN_PREFIX: &str = "x-wake-token:";
-    if lower.starts_with(WAKE_TOKEN_PREFIX) && line.len() >= WAKE_TOKEN_PREFIX.len() {
-        let rest = &line[WAKE_TOKEN_PREFIX.len()..];
-        return constant_time_eq(rest.trim(), token);
+    if line.len() >= WAKE_TOKEN_PREFIX.len() && line.is_char_boundary(WAKE_TOKEN_PREFIX.len()) {
+        let prefix = &line[..WAKE_TOKEN_PREFIX.len()];
+        if prefix.eq_ignore_ascii_case(WAKE_TOKEN_PREFIX) {
+            let rest = &line[WAKE_TOKEN_PREFIX.len()..];
+            return constant_time_eq(rest.trim(), token);
+        }
     }
     false
 }
