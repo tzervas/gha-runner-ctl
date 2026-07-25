@@ -10,9 +10,11 @@
 //! multiple ephemeral workers sized from job complexity within a host budget
 //! (default 8 CPU / 8 GiB shared across all managers).
 
+pub mod appauth;
 mod image_arch;
 mod pool;
 
+pub use appauth::{AuthMode, KeySource};
 pub use image_arch::{
     binfmt_lists_arch, binfmt_missing_error, ensure_binfmt_for_arch, extra_image_arch_labels,
     load_image_map, parse_image_map, podman_platform_args, resolve_arch_from_labels,
@@ -772,7 +774,18 @@ fn resolve_cli(cli: &mut Cli) -> Result<(), String> {
     }
 
     if cli.scope == Scope::User && cli.user.is_none() {
-        let u = if let Ok(login) = gh_login() {
+        // Under GitHub App auth there is no authenticated *user*: `GET /user` with an
+        // installation token is a 403. The installation owner is the login we want,
+        // and it is already required for the mint, so use it directly.
+        let app_owner = match appauth::select_auth_mode_from_env(cli.owner.as_deref()) {
+            Ok(AuthMode::App(cfg)) => Some(cfg.owner.clone()),
+            Ok(AuthMode::Token) => None,
+            // A broken App config must surface here, not be papered over by gh_login().
+            Err(e) => return Err(e),
+        };
+        let u = if let Some(owner) = app_owner {
+            owner
+        } else if let Ok(login) = gh_login() {
             login
         } else if let Ok(tok) = github_token() {
             get_user_login_from_token(&tok)?
@@ -888,6 +901,66 @@ fn print_detect(cli: &Cli) {
     }
     println!("labels: {}", cli.labels);
     println!("container: {}", cli.container);
+    print_detect_auth(cli);
+}
+
+/// Report which authentication path resolved, so a half-configured App (right App ID,
+/// wrong key path; key present, App never installed on the owner) is visible from
+/// `detect` instead of surfacing as an opaque 401 an hour into a `listen` run.
+///
+/// Configuration-level only — no network call, and no secret material is printed.
+fn print_detect_auth(cli: &Cli) {
+    match appauth::select_auth_mode_from_env(app_owner_hint(cli).as_deref()) {
+        Ok(mode @ AuthMode::Token) => {
+            println!("auth: {}", mode.describe());
+            match github_token_source() {
+                Some(src) => println!("auth_source: {src}"),
+                None => println!(
+                    "auth_source: (none found in env — will try gh/GCM/config at command time)"
+                ),
+            }
+        }
+        Ok(AuthMode::App(cfg)) => {
+            let mode = AuthMode::App(cfg.clone());
+            println!("auth: {}", mode.describe());
+            // Local readability/shape check: catches the most common misconfiguration
+            // without a network round-trip.
+            match &cfg.key {
+                KeySource::Path(p) => match fs::read_to_string(p) {
+                    Ok(pem) if pem.contains("PRIVATE KEY-----") => {
+                        println!("auth_key: readable, PEM private key ({} bytes)", pem.len());
+                    }
+                    Ok(pem) => println!(
+                        "auth_key: PROBLEM — {} is readable ({} bytes) but is not a PEM private key",
+                        p.display(),
+                        pem.len()
+                    ),
+                    Err(e) => println!("auth_key: PROBLEM — {} unreadable: {e}", p.display()),
+                },
+                KeySource::Inline(_) => {
+                    println!("auth_key: inline PEM from GHA_APP_PRIVATE_KEY (prefer a path: inline keys must be written to a temp file to sign)");
+                }
+            }
+            if std::env::var("GH_TOKEN").is_ok() || std::env::var("GITHUB_TOKEN").is_ok() {
+                println!(
+                    "auth_note: GH_TOKEN/GITHUB_TOKEN is also set but WILL NOT be used — \
+                     GHA_APP_ID takes precedence and there is no silent fallback"
+                );
+            }
+        }
+        Err(e) => {
+            println!("auth: MISCONFIGURED — {}", redact(&e));
+            println!("auth_note: commands needing the API will refuse; they will NOT fall back to GH_TOKEN");
+        }
+    }
+}
+
+/// Which environment variable supplied the legacy token, if any. Returns the variable
+/// **name** only — never the value.
+fn github_token_source() -> Option<&'static str> {
+    ["GH_TOKEN", "GITHUB_TOKEN"]
+        .into_iter()
+        .find(|key| std::env::var(key).is_ok_and(|v| !v.trim().is_empty()))
 }
 
 // --- Validation / redaction --------------------------------------------------
@@ -2569,6 +2642,40 @@ fn prompt_token_interactively() -> Option<String> {
     }
 }
 
+/// Best-effort owner login for GitHub App installation lookup, in decreasing
+/// specificity: `--owner`/`GHA_OWNER`, then `--user`/`GHA_USER`, then the owner half
+/// of `--repo owner/name`. Returns `None` when nothing is known — [`appauth`] then
+/// refuses loudly rather than guessing an installation.
+fn app_owner_hint(cli: &Cli) -> Option<String> {
+    cli.owner
+        .as_deref()
+        .or(cli.user.as_deref())
+        .map(str::to_string)
+        .or_else(|| {
+            cli.repo
+                .as_deref()
+                .and_then(|r| r.split('/').next())
+                .filter(|o| !o.is_empty())
+                .map(str::to_string)
+        })
+}
+
+/// Resolve the API credential for this process.
+///
+/// GitHub App auth (`GHA_APP_ID` + private key) takes precedence when configured and
+/// yields an installation token with a <=1 h TTL, cached and re-minted before expiry.
+/// Otherwise this is the pre-existing long-lived-token discovery.
+///
+/// There is deliberately **no fallback edge** from App auth to `GH_TOKEN`: a broken
+/// App configuration is an error, because silently reverting to the long-lived token
+/// would undo the whole point of the feature without anyone noticing.
+fn auth_token(cli: &Cli) -> Result<String, String> {
+    match appauth::select_auth_mode_from_env(app_owner_hint(cli).as_deref())? {
+        AuthMode::App(cfg) => appauth::cached_installation_token(&cfg),
+        AuthMode::Token => github_token(),
+    }
+}
+
 fn github_token() -> Result<String, String> {
     // 1. Try env variables
     for key in ["GH_TOKEN", "GITHUB_TOKEN"] {
@@ -3370,7 +3477,7 @@ fn warm(cli: &Cli, gap_secs: u64, start: bool) -> Result<(), String> {
             }
         } else {
             // Mint token only to prove registration rights (still paced); do not start.
-            let api = github_token()?;
+            let api = auth_token(&unit)?;
             match registration_token(&unit, &api) {
                 Ok(_) => eprintln!("warm: token mint OK for {repo} (not starting)"),
                 Err(e) => eprintln!("warm: token mint failed for {repo}: {}", redact(&e)),
@@ -3838,7 +3945,7 @@ fn up(cli: &Cli) -> Result<(), String> {
         );
         write_env_file(&env_path, "REUSE", cli)?;
     } else {
-        let api = github_token()?;
+        let api = auth_token(cli)?;
         let reg = registration_token(cli, &api)?;
         write_env_file(&env_path, &reg, cli)?;
         drop(reg);
@@ -5610,7 +5717,9 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
             }
         }
 
-        let api = match github_token() {
+        // App mode returns a cached installation token and re-mints it before the
+        // <=1h TTL lapses, so this per-tick call is cheap after the first mint.
+        let api = match auth_token(&cli) {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("listen: auth: {}", redact(&e));
@@ -5857,7 +5966,7 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
 
             // Vertical size for single worker from first matching job name if any
             if need {
-                if let Ok(api2) = github_token() {
+                if let Ok(api2) = auth_token(&cli) {
                     if let Ok(jobs) = list_demand_jobs(&cli, &api2, &mut pacer, 1) {
                         if let Some(j) = jobs.first() {
                             let tier = size_for_job(&j.job_name, &j.labels, cli.gpu);

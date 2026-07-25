@@ -1,3 +1,48 @@
+## Unreleased
+
+### Added — GitHub App authentication (issue #41, opt-in)
+
+The host can now hold an App **private key** instead of a long-lived `GH_TOKEN`, and
+mint installation tokens with a **<= 1 h TTL** on demand. Rotation stops requiring an
+interactive `gh auth login` device flow, because "rotation" becomes just the next mint.
+
+- **New config:** `GHA_APP_ID`, `GHA_APP_PRIVATE_KEY_PATH` (preferred) or
+  `GHA_APP_PRIVATE_KEY`, reusing the existing `GHA_OWNER`. `--owner` / `--user` /
+  the owner half of `--repo` are used as owner fallbacks.
+- **Opt-in and precedence:** `GH_TOKEN` / `GITHUB_TOKEN` / `gh` / GCM / config
+  discovery is unchanged when `GHA_APP_ID` is unset. When it *is* set, App auth wins.
+- **Mint flow** (`src/appauth.rs`): RS256 JWT with `iat` backdated 60 s and
+  `exp = iat + 600` (GitHub's 10-minute cap) → `GET /app/installations` matched on
+  `account.login` → `POST /app/installations/{id}/access_tokens`. Ported from the
+  cryptographically-verified `openssl`+`curl` reference in `mycelium-workflows`
+  `.github/actions/app-token/action.yml`.
+- **Cached and re-minted** 5 minutes before expiry (`REMINT_MARGIN`), so long
+  `listen` runs survive the TTL unattended. `expires_at` is parsed rather than
+  assumed; an unparseable value falls back to a *shorter* 30 min TTL, so the failure
+  mode is a redundant mint, not a mid-run 401.
+- **Refuses loudly, never degrades silently.** A bad key, unreadable key path, a
+  Client ID (`Iv1.…`/`Iv23…`) in `GHA_APP_ID`, or an App with no installation on the
+  owner is a hard error. There is no fallback edge from App auth to `GH_TOKEN` and
+  none to an unauthenticated state.
+- **`detect` reports the resolved auth mode** (`auth:` / `auth_source:` / `auth_key:`
+  / `auth_note:`), including a local key readability + PEM-shape check, so
+  misconfiguration is visible before it becomes a 401. No network call.
+- **Secret handling:** neither key nor token is ever passed via argv
+  (`/proc/<pid>/cmdline` is world-readable) — `openssl dgst -sign` gets only a path,
+  signing input goes over stdin, signature over stdout. `Pem` and `InstallationToken`
+  have `Debug` impls that print placeholders. Inline PEM is written to a `0600` file
+  in an atomically-created `0700` directory, removed by a `Drop` guard on every path
+  including errors.
+- **Tests (23 new, no live GitHub credentials required):** JWT header/payload decode
+  to the exact expected JSON with `exp - iat == 600`; RS256 signature verified with
+  `openssl dgst -sha256 -verify` => `Verified OK` against a locally generated
+  keypair; auth-mode selection matrix; `parse_iso8601_utc` against GNU-`date`-derived
+  vectors including leap days and 2100; temp-key-dir cleanup on success and error.
+- **New host dependency:** `openssl(1)` is required for RS256 signing, and only when
+  App auth is used. Chosen over adding a Rust crypto crate to keep the dependency
+  tree at five crates, consistent with the tool already shelling out to
+  `podman`/`gh`/`git`.
+
 ## v0.3.0 (2026-07-25)
 
 ### Fixed — release automation: a crates.io failure no longer blocks the release
@@ -32,7 +77,6 @@ but disjoint histories (merge base three days stale). `docs/RELEASE.md` already
 required all feature/fix PRs to base `dev` and required a merge-back after each
 promote; neither was happening. `dev` has been back-merged from `main` and open
 PRs retargeted. Release promotes must use a **merge commit, not a squash**.
-
 
 ### Fixed — capacity-safe idle scale-in (demand-driven autoscaler)
 

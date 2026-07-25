@@ -120,15 +120,16 @@ Full matrix, systemd, containers/VMs for testing: **[docs/HOST_PLATFORMS.md](doc
 1. `--full-auto`: Detects cwd git checkout → repo scope, else defaults to personal user batch. Prepares the Podman snapshot if missing, then starts the listener (interval 180s, idle 500s).
 2. `--auto` / `detect`: Infer `owner/repo` from the current checkout (`gh repo view` / `git remote`).
 3. Secret handling: Prefer GCM (`git credential fill`), `gh auth token`, config file, or a masked interactive prompt. Raw `ghp_` / `github_pat_` patterns on the CLI argv are blocked (history/process leaks). Tokens may also be supplied via `GH_TOKEN` / `GITHUB_TOKEN` env (accepted by design; avoid if your environment logs env vars).
-4. Git Credential Manager (GCM): Optional install assist on Debian/Ubuntu; store/retrieve PAT without pasting into shell history.
-5. Visibility filters: `--public-only` (default when unset), `--private-only`, or `--all-repos`.
-6. Scopes: `repo` | `user` (batch personal) | `org` (org-level registration).
-7. Hardened container: Configurable `--runner-user` (default `1001:1001`), `no-new-privileges`, pull policy (`never`/`missing`/`always`).
-8. **Any work image (0.2.9+):** set `GHA_IMAGE` to any OCI ref; `image-mode=external` injects actions/runner into the volume (see [WORK_IMAGES](docs/WORK_IMAGES.md)).
-9. **Workflow-selectable image + arch (issue #28 draft):** `runs-on` labels such as `ubuntu-24.04` or `arm64` select the work OCI image and/or `podman --platform` at spawn (label→image map via `GHA_IMAGE_MAP`; binfmt guard for emulation). Avoids nested podman/docker inside runners — see [WORK_IMAGES](docs/WORK_IMAGES.md#workflow-selectable-image--arch-issue-28) (mycelium-lang draw-in use case).
-10. Demand filters (0.2.4+): `--demand-require-labels` / `--demand-exclude-labels` so CPU listeners ignore GPU jobs and GPU listeners only wake on `gpu`.
-11. Sticky user-batch: do not recycle registration while the active repo still has matching work.
-12. Multi-instance locks: `up`/`listen` locks namespaced by `--container`.
+4. **GitHub App auth (0.3.1+, opt-in — issue #41):** the host holds an App *private key* instead of a usable token, and mints installation tokens with a **<=1 h TTL** on demand. See [GitHub App authentication](#github-app-authentication).
+5. Git Credential Manager (GCM): Optional install assist on Debian/Ubuntu; store/retrieve PAT without pasting into shell history.
+6. Visibility filters: `--public-only` (default when unset), `--private-only`, or `--all-repos`.
+7. Scopes: `repo` | `user` (batch personal) | `org` (org-level registration).
+8. Hardened container: Configurable `--runner-user` (default `1001:1001`), `no-new-privileges`, pull policy (`never`/`missing`/`always`).
+9. **Any work image (0.2.9+):** set `GHA_IMAGE` to any OCI ref; `image-mode=external` injects actions/runner into the volume (see [WORK_IMAGES](docs/WORK_IMAGES.md)).
+10. **Workflow-selectable image + arch (issue #28 draft):** `runs-on` labels such as `ubuntu-24.04` or `arm64` select the work OCI image and/or `podman --platform` at spawn (label→image map via `GHA_IMAGE_MAP`; binfmt guard for emulation). Avoids nested podman/docker inside runners — see [WORK_IMAGES](docs/WORK_IMAGES.md#workflow-selectable-image--arch-issue-28) (mycelium-lang draw-in use case).
+11. Demand filters (0.2.4+): `--demand-require-labels` / `--demand-exclude-labels` so CPU listeners ignore GPU jobs and GPU listeners only wake on `gpu`.
+12. Sticky user-batch: do not recycle registration while the active repo still has matching work.
+13. Multi-instance locks: `up`/`listen` locks namespaced by `--container`.
 
 ## Requirements
 
@@ -300,9 +301,73 @@ Install and listen are safe unattended on a prepared machine; host package upgra
 
 More detail: [docs/HOST_OPS.md](docs/HOST_OPS.md).
 
+## GitHub App authentication
+
+*Opt-in, added for [#41](https://github.com/tzervas/gha-runner-ctl/issues/41).* Default behaviour is unchanged: with no `GHA_APP_ID` set, `GH_TOKEN` / `GITHUB_TOKEN` / `gh` / GCM / config discovery works exactly as before.
+
+### Why
+
+Runner *registration* tokens are already ephemeral. The weak link is the **bootstrap** credential used to mint them: a long-lived `GH_TOKEN` that sits on the host indefinitely, *is* the access if leaked, and can only be rolled through an interactive `gh auth login` device flow — which cannot be scripted.
+
+With App auth the host holds a **private key** and *derives* an installation token per use:
+
+| | `GH_TOKEN` | GitHub App |
+|---|---|---|
+| At rest | a usable credential | a key that must still be exchanged |
+| Exposure window | until someone notices | **<= 1 hour** (token self-expires) |
+| Rotation | interactive device flow | just the next mint — automatable |
+| Scope | coarse `repo` OAuth scope | per-resource App permissions |
+| Rate limit | shared with interactive `gh` | the installation's own 5,000/hr pool |
+
+This is **not** full zero-trust: an App private key is still long-lived material on the host. It is "zero-trust lite" — one long-lived key that can only ever produce short-lived, narrowly-scoped tokens.
+
+### Configure
+
+```bash
+export GHA_APP_ID=123456                              # numeric App ID, NOT the Client ID
+export GHA_APP_PRIVATE_KEY_PATH=/etc/gha/app.pem      # preferred
+# or, if a path is impossible:
+# export GHA_APP_PRIVATE_KEY="$(cat /etc/gha/app.pem)"
+export GHA_OWNER=tzervas                              # account the App is installed on
+```
+
+`GHA_OWNER` is the existing flag — `--owner` / `--user` / the owner half of `--repo owner/name` are used as fallbacks. Prefer `GHA_APP_PRIVATE_KEY_PATH`: inline PEM has to be written to a temporary `0600` file for signing, which is a brief on-disk exposure a path avoids entirely.
+
+Check what resolved — this is configuration-level only, so it makes no network call:
+
+```console
+$ gha-runner-ctl detect --repo tzervas/gha-runner-ctl
+...
+auth: github-app (app_id=123456, owner=tzervas, key=path:/etc/gha/app.pem) — installation token, TTL <= 1h
+auth_key: readable, PEM private key (1704 bytes)
+auth_note: GH_TOKEN/GITHUB_TOKEN is also set but WILL NOT be used — GHA_APP_ID takes precedence and there is no silent fallback
+```
+
+A misconfiguration is reported as such rather than quietly degrading:
+
+```console
+$ GHA_APP_ID=Iv23liABC gha-runner-ctl detect --repo tzervas/gha-runner-ctl
+auth: MISCONFIGURED — GHA_APP_ID must be the numeric App ID … Note this is NOT the Client ID (`Iv1.…`/`Iv23…`).
+auth_note: commands needing the API will refuse; they will NOT fall back to GH_TOKEN
+```
+
+### How the mint works
+
+RS256 JWT (`iat` backdated 60 s for clock skew, `exp = iat + 600` — GitHub hard-caps App JWTs at 10 minutes) → `GET /app/installations` to resolve the installation for `GHA_OWNER` → `POST /app/installations/{id}/access_tokens`. The resulting token is cached and re-minted 5 minutes before expiry, so a multi-day `listen` run never needs a human.
+
+This is a direct port of the `openssl`+`curl` reference in `tzervas/mycelium-workflows` `.github/actions/app-token/action.yml`, which was verified end-to-end (`openssl dgst -sha256 -verify` => `Verified OK`). The Rust port re-verifies that property in `appauth::tests::rs256_signature_verifies_against_the_public_key` against a locally generated keypair — no live GitHub credentials are needed to run the test suite.
+
+### Guarantees
+
+- **Refuses loudly.** A bad key, an unreadable key path, a Client ID in `GHA_APP_ID`, or an App with no installation on `GHA_OWNER` is a hard error. There is deliberately **no fallback edge** from App auth to `GH_TOKEN` and none to an unauthenticated state — silently reverting would undo the whole point without anyone noticing.
+- **Never in argv.** `/proc/<pid>/cmdline` is world-readable. `openssl dgst -sign` receives only a *path*; the signing input goes over stdin and the signature returns over stdout. Verified by inspecting the child's recorded `/proc/<pid>/cmdline`.
+- **Never logged.** `Pem` and `InstallationToken` have `Debug` impls that print a placeholder, and the existing `ghs_` redaction covers minted tokens in error paths.
+- **Requires `openssl(1)`** on the host for RS256 signing — a deliberate choice to keep the dependency tree at five crates and avoid pulling a new cryptographic implementation into a supply chain that already shells out to `podman`/`gh`/`git`.
+
 ## Security model (summary)
 
 - Allowlist validation on repo/owner/labels/cpus/memory/image (no shell metacharacters into Podman/API)
+- Optional [GitHub App auth](#github-app-authentication): host holds a private key, not a usable token; installation tokens expire in <= 1 h
 - Short-lived registration tokens; log redaction (`ghp_`, `github_pat_`, `Bearer`, …)
 - Single-instance PID lock file on `up` / `listen` (exclusive create; not `flock(2)`)
 - Wake endpoint: loopback only; requires `GHA_WAKE_TOKEN` (≥16 chars); constant-time compare (token bytes not lowercased)
