@@ -1,0 +1,236 @@
+# Right-sized weekly maintenance for gha-runner-ctl on the self-hosted podman fleet.
+# Exit contract (every job): broken -> fail | done/empty -> pass | unknown -> fail loudly.
+# No cancel-in-progress: this workflow has schedule: (see scheduled-cancellation trap).
+name: maintenance
+
+on:
+  schedule:
+    # Mondays 08:17 UTC — offset from fleet-security to reduce queue contention
+    - cron: "17 8 * * 1"
+  workflow_dispatch:
+
+# Group only; never cancel-in-progress on schedule: workflows (silent cancel trap).
+concurrency:
+  group: maintenance-${{ github.workflow }}
+
+permissions:
+  contents: read
+  # stale-branch report needs metadata read; pull-requests is unused but harmless
+  pull-requests: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Compiling job: explicit `large` (4c/8g). Job names with lint/fmt/clippy force
+  # MICRO (512 MiB) under the name heuristic; cargo clippy --all-targets was
+  # measured at 1225 MiB peak -> SIGKILL 137 under micro. Do not rely on name.
+  # ---------------------------------------------------------------------------
+  rust-fmt-clippy:
+    name: rust fmt and clippy
+    runs-on: [self-hosted, linux, x64, podman, large]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Toolchain preflight
+        run: |
+          set -euo pipefail
+          if ! command -v cargo >/dev/null 2>&1 || ! command -v rustc >/dev/null 2>&1; then
+            echo "::error title=FAIL_ENV::cargo/rustc missing on runner (expected fleet image)"
+            exit 1
+          fi
+          rustc --version
+          cargo --version
+          # Ensure rustfmt + clippy components when rustup is present
+          if command -v rustup >/dev/null 2>&1; then
+            rustup component add rustfmt clippy 2>/dev/null || true
+          fi
+          if ! cargo fmt --version >/dev/null 2>&1; then
+            echo "::error title=FAIL_ENV::rustfmt not available after preflight"
+            exit 1
+          fi
+          if ! cargo clippy --version >/dev/null 2>&1; then
+            echo "::error title=FAIL_ENV::clippy not available after preflight"
+            exit 1
+          fi
+
+      - name: cargo fmt --check
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+
+      - name: cargo clippy --all-targets -D warnings
+        run: |
+          set -euo pipefail
+          # Basis: measured peak 1225 MiB; large provides 8 GiB headroom.
+          cargo clippy --all-targets -- -D warnings
+
+  # ---------------------------------------------------------------------------
+  # Dependency staleness REPORT only. cargo update --dry-run parses the graph;
+  # does not compile the crate. small (0.5c/1g) is enough; not a name-heuristic
+  # micro trap. Outdated deps are informational (exit 0); tool/API failure fails.
+  # ---------------------------------------------------------------------------
+  dep-staleness:
+    name: dependency staleness report
+    runs-on: [self-hosted, linux, x64, podman, small]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: cargo update --dry-run report
+        run: |
+          set -euo pipefail
+          if ! command -v cargo >/dev/null 2>&1; then
+            echo "::error title=FAIL_ENV::cargo missing — cannot assess dependency staleness (UNKNOWN)"
+            exit 1
+          fi
+          echo "## Dependency staleness report" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          set +e
+          out="$(cargo update --dry-run --verbose 2>&1)"
+          rc=$?
+          set -e
+          printf '%s\n' "$out" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error title=FAIL_INFRA::cargo update --dry-run failed (rc=$rc) — UNKNOWN, not empty"
+            exit 1
+          fi
+          # "nothing to update" / no "Updating" lines => empty work => PASS
+          if printf '%s\n' "$out" | grep -Eiq 'Updating|Adding|Removing'; then
+            echo "Staleness: packages would change under cargo update (report only; exit 0)."
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "**Status:** packages would change (informational; job passes)." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Staleness: nothing to update (empty) — PASS."
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "**Status:** nothing to update (empty) — PASS." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit 0
+
+  # ---------------------------------------------------------------------------
+  # Pure gh/git API — no compile. micro (0.25c/512 MiB) is proven for API jobs.
+  # REPORT ONLY: never delete branches. Empty set => PASS. API errors => FAIL.
+  # ---------------------------------------------------------------------------
+  stale-branch-report:
+    name: stale and merged branch report
+    runs-on: [self-hosted, linux, x64, podman, micro]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Report stale / merged remote branches
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! command -v git >/dev/null 2>&1; then
+            echo "::error title=FAIL_ENV::git missing — cannot list branches (UNKNOWN)"
+            exit 1
+          fi
+          if ! command -v gh >/dev/null 2>&1; then
+            echo "::error title=FAIL_ENV::gh CLI missing — cannot list merged PRs (UNKNOWN)"
+            exit 1
+          fi
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "::error title=FAIL_ENV::jq missing — cannot parse PR API (UNKNOWN)"
+            exit 1
+          fi
+
+          echo "## Stale / merged branch report (read-only)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Protected from deletion by this job: **report only, DELETE NOTHING**." >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          # Default + long-lived integration branches are never "stale" for this report
+          keep='^(main|master|dev|sec)$'
+          stale_days=90
+          cutoff_epoch=$(date -u -d "${stale_days} days ago" +%s)
+
+          set +e
+          git fetch --prune origin 2>&1
+          frc=$?
+          set -e
+          if [ "$frc" -ne 0 ]; then
+            echo "::error title=FAIL_INFRA::git fetch --prune origin failed (rc=$frc) — UNKNOWN"
+            exit 1
+          fi
+
+          # Pure git: no per-branch REST calls (rate-limit safe).
+          report_lines=""
+          count=0
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            epoch=$(printf '%s' "$line" | awk '{print $1}')
+            date_str=$(printf '%s' "$line" | awk '{print $2}')
+            full=$(printf '%s' "$line" | awk '{print $3}')
+            name=${full#origin/}
+            [ "$name" = "HEAD" ] && continue
+            if printf '%s' "$name" | grep -Eq "$keep"; then
+              continue
+            fi
+            if [ "$epoch" -lt "$cutoff_epoch" ]; then
+              report_lines="${report_lines}- \`${name}\` — last commit ${date_str} (>${stale_days}d)\n"
+              count=$((count + 1))
+            fi
+          done < <(git for-each-ref --format='%(committerdate:unix) %(committerdate:iso-strict) %(refname:short)' refs/remotes/origin)
+
+          # Recently merged PRs whose head branch may still exist (API sample)
+          set +e
+          merged_raw="$(gh api "repos/${GITHUB_REPOSITORY}/pulls?state=closed&per_page=50" 2>&1)"
+          mrc=$?
+          set -e
+          if [ "$mrc" -ne 0 ]; then
+            echo "::error title=FAIL_INFRA::gh api pulls failed (rc=$mrc) — UNKNOWN"
+            printf '%s\n' "$merged_raw" >&2
+            exit 1
+          fi
+
+          merged_lines=""
+          mcount=0
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            bname=$(printf '%s' "$line" | cut -f1)
+            merged_at=$(printf '%s' "$line" | cut -f2)
+            if printf '%s' "$bname" | grep -Eq "$keep"; then
+              continue
+            fi
+            if git show-ref --verify --quiet "refs/remotes/origin/${bname}"; then
+              merged_lines="${merged_lines}- \`${bname}\` — PR merged at ${merged_at} (branch still present)\n"
+              mcount=$((mcount + 1))
+            fi
+          done < <(printf '%s' "$merged_raw" | jq -r '
+            if type=="array" then
+              .[] | select(.merged_at != null) | "\(.head.ref)\t\(.merged_at)"
+            else empty end
+          ')
+
+          {
+            echo "### Branches with tip older than ${stale_days} days"
+            echo ""
+            if [ "$count" -eq 0 ]; then
+              echo "_None (empty) — PASS._"
+            else
+              printf '%b' "$report_lines"
+            fi
+            echo ""
+            echo "### Merged PR head branches still present (sample of 50 recent closed PRs)"
+            echo ""
+            if [ "$mcount" -eq 0 ]; then
+              echo "_None in the recent closed-PR window (empty) — PASS._"
+            else
+              printf '%b' "$merged_lines"
+            fi
+            echo ""
+            echo "**Action:** report only. Operators may delete by hand; this job never deletes."
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+          echo "stale_count=${count} merged_still_present=${mcount} — PASS (report complete)"
+          exit 0

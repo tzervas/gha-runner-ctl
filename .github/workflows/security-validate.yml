@@ -1,0 +1,613 @@
+# Self-hosted FOSS security scanning with VALIDATED findings.
+# No SaaS (no Snyk, Codecov, CodeQL cloud). Report lands on the `sec` branch.
+# Exit contract: broken/reachable finding/unknown -> fail | clean/empty -> pass.
+# No cancel-in-progress: this workflow has schedule: (scheduled-cancellation trap).
+name: security-validate
+
+on:
+  schedule:
+    # Tuesdays 07:17 UTC — offset from fleet-security Monday scan
+    - cron: "17 7 * * 2"
+  workflow_dispatch:
+
+# Group only; never cancel-in-progress on schedule: workflows.
+concurrency:
+  group: security-validate-${{ github.workflow }}
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # gitleaks: proven at micro on this fleet (fleet-security.yml unlabelled).
+  # Explicit micro so the "security" name heuristic cannot surprise us later.
+  # Pin 8.30.1 + SHA256 — apt ships incompatible 8.16.0. Pattern matches
+  # fleet-security.yml exactly.
+  # ---------------------------------------------------------------------------
+  gitleaks-scan:
+    name: gitleaks validated
+    runs-on: [self-hosted, linux, x64, podman, micro]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Ensure gitleaks (pinned + checksum)
+        run: |
+          set -euo pipefail
+          # Pin must match packaging/Containerfile / fleet-security.yml
+          GITLEAKS_VERSION="8.30.1"
+          GITLEAKS_SHA256="551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+          if command -v gitleaks >/dev/null 2>&1; then
+            ver="$(gitleaks version 2>/dev/null || true)"
+            echo "using preinstalled $(command -v gitleaks) (${ver})"
+            # Still require the pin when we can detect the version string
+            if printf '%s' "$ver" | grep -q '8.30.1'; then
+              exit 0
+            fi
+            echo "preinstalled gitleaks is not 8.30.1 — installing pinned release"
+          fi
+          install_dir="${RUNNER_TEMP:-/tmp}/gitleaks-bin"
+          mkdir -p "$install_dir"
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${archive}"
+          tmp="${RUNNER_TEMP:-/tmp}/${archive}"
+          curl -fsSL "$url" -o "$tmp"
+          echo "${GITLEAKS_SHA256}  ${tmp}" | sha256sum -c -
+          tar -xzf "$tmp" -C "$install_dir" gitleaks
+          chmod 0755 "$install_dir/gitleaks"
+          echo "$install_dir" >> "$GITHUB_PATH"
+          "$install_dir/gitleaks" version
+
+      - name: Run gitleaks (JSON + gate)
+        run: |
+          set -euo pipefail
+          if ! command -v gitleaks >/dev/null 2>&1; then
+            echo "::error title=FAIL_ENV::gitleaks not available after install — UNKNOWN"
+            exit 1
+          fi
+          mkdir -p reports
+          set +e
+          gitleaks detect --source . --verbose --redact \
+            --report-format json --report-path reports/gitleaks.json \
+            --exit-code 1
+          rc=$?
+          set -e
+          if [ ! -f reports/gitleaks.json ]; then
+            echo '[]' > reports/gitleaks.json
+          fi
+          # Count findings
+          if command -v jq >/dev/null 2>&1; then
+            n=$(jq 'if type=="array" then length else 0 end' reports/gitleaks.json)
+          else
+            n="unknown"
+          fi
+          {
+            echo "## gitleaks (8.30.1)"
+            echo ""
+            echo "- findings: ${n}"
+            echo "- classification: every secret finding is **APPLICABLE** (reachable by definition)"
+            if [ "$rc" -eq 0 ]; then
+              echo "- result: empty (no leaks) — PASS"
+            else
+              echo "- result: leaks present — FAIL"
+              echo "- remediation: rotate the exposed credential; purge from git history if committed;"
+              echo "  add a gitleaks allowlist entry only for known test fixtures with documented reason"
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          # Soft-store rc for the validate job; this job fails on findings
+          echo "$rc" > reports/gitleaks.rc
+          if [ "$rc" -ne 0 ]; then
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gitleaks-report
+          path: reports/
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # trivy filesystem: proven at micro on this fleet (fleet-security.yml).
+  # Pin 0.72.0 + SHA256. Explicit micro label.
+  # ---------------------------------------------------------------------------
+  trivy-scan:
+    name: trivy filesystem validated
+    runs-on: [self-hosted, linux, x64, podman, micro]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Ensure trivy (pinned + checksum)
+        run: |
+          set -euo pipefail
+          TRIVY_VERSION="0.72.0"
+          TRIVY_SHA256="bbb64b9695866ce4a7a8f5c9592002c5961cab378577fa3f8a040df362b9b2ea"
+          if command -v trivy >/dev/null 2>&1; then
+            echo "using preinstalled $(command -v trivy) ($(trivy --version 2>/dev/null | head -1 || true))"
+            exit 0
+          fi
+          install_dir="${RUNNER_TEMP:-/tmp}/trivy-bin"
+          mkdir -p "$install_dir"
+          archive="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          url="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${archive}"
+          tmp="${RUNNER_TEMP:-/tmp}/${archive}"
+          curl -fsSL "$url" -o "$tmp"
+          echo "${TRIVY_SHA256}  ${tmp}" | sha256sum -c -
+          tar -xzf "$tmp" -C "$install_dir" trivy
+          chmod 0755 "$install_dir/trivy"
+          echo "$install_dir" >> "$GITHUB_PATH"
+          "$install_dir/trivy" --version
+
+      - name: Trivy fs (vuln+secret+license) JSON
+        run: |
+          set -euo pipefail
+          if ! command -v trivy >/dev/null 2>&1; then
+            echo "::error title=FAIL_ENV::trivy not available after install — UNKNOWN"
+            exit 1
+          fi
+          mkdir -p reports
+          set +e
+          trivy fs --scanners vuln,secret,license \
+            --severity HIGH,CRITICAL \
+            --skip-dirs .git --skip-dirs target --skip-dirs node_modules --skip-dirs .venv \
+            --format json --output reports/trivy.json \
+            --exit-code 1 \
+            .
+          rc=$?
+          set -e
+          if [ ! -f reports/trivy.json ]; then
+            echo "::error title=FAIL_ENV::trivy produced no JSON — UNKNOWN"
+            exit 1
+          fi
+          {
+            echo "## trivy 0.72.0 filesystem (vuln+secret+license)"
+            echo ""
+            if [ "$rc" -eq 0 ]; then
+              echo "- result: no HIGH/CRITICAL findings (empty) — PASS"
+            else
+              echo "- result: HIGH/CRITICAL findings present — see JSON artifact"
+              echo "- classification: filesystem findings in this repo tree are **APPLICABLE** unless path is a vendored test fixture"
+              echo "- remediation: bump the affected package/image pin, or remove the secret;"
+              echo "  for license findings update deny.toml / replace the dependency"
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "$rc" > reports/trivy.rc
+          if [ "$rc" -ne 0 ]; then
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-report
+          path: reports/
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # cargo-audit + cargo-deny + reachability validation.
+  # PREBUILT binaries (no cargo install compile). Explicit medium: advisory DB
+  # download + cargo metadata/tree dep graph, not a full crate compile. Name
+  # contains "security"-like words would force micro without an explicit tier.
+  # Basis: no rustc compile of this crate; prebuilt scanners; medium 2c/4g.
+  # ---------------------------------------------------------------------------
+  rust-advisory-validate:
+    name: rust advisory validate
+    runs-on: [self-hosted, linux, x64, podman, medium]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Preflight cargo
+        run: |
+          set -euo pipefail
+          if ! command -v cargo >/dev/null 2>&1; then
+            echo "::error title=FAIL_ENV::cargo missing — cannot validate Rust advisories (UNKNOWN)"
+            exit 1
+          fi
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "::error title=FAIL_ENV::jq missing — cannot parse advisory JSON (UNKNOWN)"
+            exit 1
+          fi
+          cargo --version
+          rustc --version || true
+
+      - name: Ensure cargo-audit (pinned prebuilt + checksum)
+        run: |
+          set -euo pipefail
+          CA_VERSION="0.22.2"
+          CA_SHA256="7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428"
+          install_dir="${RUNNER_TEMP:-/tmp}/cargo-audit-bin"
+          mkdir -p "$install_dir"
+          archive="cargo-audit-x86_64-unknown-linux-musl-v${CA_VERSION}.tgz"
+          url="https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv${CA_VERSION}/${archive}"
+          tmp="${RUNNER_TEMP:-/tmp}/${archive}"
+          if command -v cargo-audit >/dev/null 2>&1 || cargo audit --version >/dev/null 2>&1; then
+            echo "cargo-audit already on PATH: $(cargo audit --version 2>/dev/null || true)"
+          fi
+          curl -fsSL "$url" -o "$tmp"
+          echo "${CA_SHA256}  ${tmp}" | sha256sum -c -
+          tar -xzf "$tmp" -C "$install_dir"
+          # tarball layout may nest the binary
+          bin="$(find "$install_dir" -type f -name cargo-audit | head -1)"
+          if [ -z "$bin" ]; then
+            echo "::error title=FAIL_ENV::cargo-audit binary missing from archive — UNKNOWN"
+            exit 1
+          fi
+          chmod 0755 "$bin"
+          mkdir -p "${HOME}/.local/bin"
+          cp "$bin" "${HOME}/.local/bin/cargo-audit"
+          echo "${HOME}/.local/bin" >> "$GITHUB_PATH"
+          "${HOME}/.local/bin/cargo-audit" --version
+
+      - name: Ensure cargo-deny (pinned prebuilt + checksum)
+        run: |
+          set -euo pipefail
+          CD_VERSION="0.20.2"
+          CD_SHA256="9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f"
+          install_dir="${RUNNER_TEMP:-/tmp}/cargo-deny-bin"
+          mkdir -p "$install_dir"
+          archive="cargo-deny-${CD_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          url="https://github.com/EmbarkStudios/cargo-deny/releases/download/${CD_VERSION}/${archive}"
+          tmp="${RUNNER_TEMP:-/tmp}/${archive}"
+          curl -fsSL "$url" -o "$tmp"
+          echo "${CD_SHA256}  ${tmp}" | sha256sum -c -
+          tar -xzf "$tmp" -C "$install_dir"
+          bin="$(find "$install_dir" -type f -name cargo-deny | head -1)"
+          if [ -z "$bin" ]; then
+            echo "::error title=FAIL_ENV::cargo-deny binary missing from archive — UNKNOWN"
+            exit 1
+          fi
+          chmod 0755 "$bin"
+          mkdir -p "${HOME}/.local/bin"
+          cp "$bin" "${HOME}/.local/bin/cargo-deny"
+          echo "${HOME}/.local/bin" >> "$GITHUB_PATH"
+          "${HOME}/.local/bin/cargo-deny" --version
+
+      - name: Run cargo-audit + cargo-deny + reachability validation
+        run: |
+          set -euo pipefail
+          export PATH="${HOME}/.local/bin:${PATH}"
+          mkdir -p reports
+
+          # --- cargo audit (JSON) ---
+          set +e
+          cargo audit --format json > reports/cargo-audit.json 2>reports/cargo-audit.stderr
+          audit_rc=$?
+          set -e
+          if [ ! -s reports/cargo-audit.json ]; then
+            # Some versions write human output on failure paths; treat missing JSON as UNKNOWN
+            if [ "$audit_rc" -ne 0 ]; then
+              echo "::error title=FAIL_ENV::cargo audit produced no JSON and exited ${audit_rc} — UNKNOWN"
+              cat reports/cargo-audit.stderr >&2 || true
+              exit 1
+            fi
+            echo '{"vulnerabilities":{"list":[]}}' > reports/cargo-audit.json
+          fi
+
+          # --- cargo deny (advisories, bans, licenses, sources) ---
+          set +e
+          # --format is a global cargo-deny option (before the subcommand)
+          cargo deny --format json check advisories bans licenses sources \
+            > reports/cargo-deny.json 2>reports/cargo-deny.stderr
+          deny_rc=$?
+          set -e
+          if [ ! -s reports/cargo-deny.json ]; then
+            # deny may print non-json diagnostics; keep stderr for the report
+            echo '{"notes":"no-json-output","stderr_bytes":0}' > reports/cargo-deny.json
+            if [ "$deny_rc" -ne 0 ]; then
+              # Still capture human output for validation
+              cp reports/cargo-deny.stderr reports/cargo-deny.txt || true
+            fi
+          fi
+          cp reports/cargo-deny.stderr reports/cargo-deny.txt 2>/dev/null || true
+
+          # --- Validate each cargo-audit vulnerability ---
+          # Classification:
+          #   RUNTIME   — appears on a normal/build dependency path (APPLICABLE)
+          #   DEV_ONLY  — only reachable via dev-dependencies
+          #   NOT_IN_GRAPH — cargo tree -i finds no path (stale/unrelated)
+          #   UNKNOWN   — tree/audit parse failed (FAIL)
+          : > reports/validation.md
+          {
+            echo "# Security validation report — gha-runner-ctl"
+            echo ""
+            echo "- generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "- commit: ${GITHUB_SHA}"
+            echo "- ref: ${GITHUB_REF}"
+            echo ""
+            echo "## Methodology"
+            echo ""
+            echo "For each RustSec advisory from \`cargo audit\`:"
+            echo "1. Run \`cargo tree --invert <crate> --depth 10\` to see reverse dependency paths."
+            echo "2. Run \`cargo tree --invert <crate> --edges normal,build\` — if empty while full tree is non-empty, classify **DEV_ONLY**."
+            echo "3. If no path exists, classify **NOT_IN_GRAPH**."
+            echo "4. If the crate is on a runtime path, classify **RUNTIME** (APPLICABLE)."
+            echo "5. If tools fail to answer, classify **UNKNOWN** (failure condition)."
+            echo ""
+            echo "Never silently drop a finding. Every finding gets a remediation line."
+            echo ""
+            echo "## cargo-audit findings"
+            echo ""
+          } >> reports/validation.md
+
+          applicable=0
+          unknown=0
+          dev_only=0
+          not_in_graph=0
+          total=0
+
+          # Extract package names + advisory ids + versions from audit JSON
+          # Support both cargo-audit JSON shapes (list under vulnerabilities.list or .vulnerabilities)
+          mapfile -t findings < <(jq -r '
+            def items:
+              if .vulnerabilities.list then .vulnerabilities.list
+              elif .vulnerabilities then .vulnerabilities
+              else [] end;
+            items
+            | if type != "array" then [] else . end
+            | .[]
+            | [
+                (.advisory.id // .advisory.Id // "UNKNOWN-ID"),
+                (.package.name // .package.Name // "unknown-crate"),
+                (.package.version // .package.Version // "?"),
+                ((.versions.patched // []) | join(", ")),
+                (.advisory.title // .advisory.Title // "")
+              ]
+            | @tsv
+          ' reports/cargo-audit.json 2>/dev/null || true)
+
+          if [ "${#findings[@]}" -eq 0 ] || [ -z "${findings[0]:-}" ]; then
+            echo "_No cargo-audit vulnerabilities in JSON (empty) — PASS for audit list._" >> reports/validation.md
+            echo "cargo-audit: empty vulnerability list"
+          else
+            for row in "${findings[@]}"; do
+              total=$((total + 1))
+              id=$(printf '%s' "$row" | cut -f1)
+              crate=$(printf '%s' "$row" | cut -f2)
+              ver=$(printf '%s' "$row" | cut -f3)
+              patched=$(printf '%s' "$row" | cut -f4)
+              title=$(printf '%s' "$row" | cut -f5)
+
+              echo "### ${id} — \`${crate} ${ver}\`" >> reports/validation.md
+              echo "" >> reports/validation.md
+              echo "- title: ${title}" >> reports/validation.md
+
+              set +e
+              tree_all="$(cargo tree --invert "${crate}" --depth 10 2>&1)"
+              tree_all_rc=$?
+              tree_rt="$(cargo tree --invert "${crate}" --edges normal,build --depth 10 2>&1)"
+              tree_rt_rc=$?
+              set -e
+
+              if [ "$tree_all_rc" -ne 0 ] && [ "$tree_rt_rc" -ne 0 ]; then
+                class="UNKNOWN"
+                unknown=$((unknown + 1))
+                why="cargo tree failed for ${crate} (rc_all=${tree_all_rc} rc_rt=${tree_rt_rc})"
+              elif printf '%s' "$tree_all" | grep -Eq "error:|package ID specification|did not match"; then
+                # No match in graph
+                class="NOT_IN_GRAPH"
+                not_in_graph=$((not_in_graph + 1))
+                why="cargo tree --invert found no package matching ${crate}"
+              elif [ -z "$(printf '%s' "$tree_rt" | grep -v '^[[:space:]]*$' | head -1)" ] \
+                || printf '%s' "$tree_rt" | grep -Eq "did not match|error:"; then
+                # Full tree has it but normal+build edges do not → dev-only
+                if printf '%s' "$tree_all" | grep -q .; then
+                  class="DEV_ONLY"
+                  dev_only=$((dev_only + 1))
+                  why="present only on dev-dependency edges (not normal/build)"
+                else
+                  class="NOT_IN_GRAPH"
+                  not_in_graph=$((not_in_graph + 1))
+                  why="empty reverse tree"
+                fi
+              else
+                class="RUNTIME"
+                applicable=$((applicable + 1))
+                why="appears on a normal/build dependency path (see cargo tree below)"
+              fi
+
+              {
+                echo "- classification: **${class}**"
+                echo "- why: ${why}"
+                echo "- reverse tree (all edges):"
+                echo '```'
+                printf '%s\n' "$tree_all" | head -80
+                echo '```'
+                echo "- reverse tree (normal+build only):"
+                echo '```'
+                printf '%s\n' "$tree_rt" | head -40
+                echo '```'
+              } >> reports/validation.md
+
+              # Remediation — always emit a concrete fix line
+              if [ -n "$patched" ] && [ "$patched" != "" ]; then
+                # first patched version if comma-separated
+                first_pat=$(printf '%s' "$patched" | cut -d, -f1 | tr -d ' ')
+                echo "- remediation: \`cargo update -p ${crate} --precise ${first_pat}\` (patched: ${patched})" >> reports/validation.md
+              else
+                echo "- remediation: no patched version listed — check https://rustsec.org/advisories/${id}.html ; consider \`cargo update -p ${crate}\` or replacing the crate; if yanked/unmaintained update deny.toml / dependency graph" >> reports/validation.md
+              fi
+              echo "" >> reports/validation.md
+            done
+          fi
+
+          {
+            echo "## cargo-deny"
+            echo ""
+            echo "- exit code: ${deny_rc}"
+            if [ "$deny_rc" -eq 0 ]; then
+              echo "- result: clean (empty issues) — PASS"
+            else
+              echo "- result: findings or policy violations present"
+              echo "- remediation: address each advisory/ban/license/source hit in deny.toml and Cargo.toml;"
+              echo "  for license: add an allowed license only with documented justification, or replace the crate;"
+              echo "  for advisories: same \`cargo update -p <crate> --precise <ver>\` as above"
+              echo ""
+              echo '```'
+              head -120 reports/cargo-deny.txt 2>/dev/null || head -120 reports/cargo-deny.stderr 2>/dev/null || true
+              echo '```'
+            fi
+            echo ""
+            echo "## Summary"
+            echo ""
+            echo "| class | count |"
+            echo "|-------|------:|"
+            echo "| total audit vulns | ${total} |"
+            echo "| RUNTIME (applicable) | ${applicable} |"
+            echo "| DEV_ONLY | ${dev_only} |"
+            echo "| NOT_IN_GRAPH | ${not_in_graph} |"
+            echo "| UNKNOWN | ${unknown} |"
+            echo "| cargo-deny rc | ${deny_rc} |"
+            echo ""
+          } >> reports/validation.md
+
+          cat reports/validation.md | tee -a "$GITHUB_STEP_SUMMARY"
+
+          # Machine-readable summary for the publish job
+          jq -n \
+            --argjson total "$total" \
+            --argjson runtime "$applicable" \
+            --argjson dev_only "$dev_only" \
+            --argjson not_in_graph "$not_in_graph" \
+            --argjson unknown "$unknown" \
+            --argjson deny_rc "$deny_rc" \
+            --argjson audit_rc "$audit_rc" \
+            '{total:$total,runtime:$runtime,dev_only:$dev_only,not_in_graph:$not_in_graph,unknown:$unknown,deny_rc:$deny_rc,audit_rc:$audit_rc}' \
+            > reports/validation-summary.json
+
+          # Exit contract:
+          # - RUNTIME findings -> FAIL
+          # - UNKNOWN -> FAIL
+          # - DEV_ONLY alone -> PASS (documented; not in released runtime graph)
+          # - NOT_IN_GRAPH alone -> PASS (documented)
+          # - deny policy fail -> FAIL
+          # - empty everything -> PASS
+          fail=0
+          if [ "$applicable" -gt 0 ]; then
+            echo "::error title=FAIL_PRODUCT::${applicable} RUNTIME-applicable advisory(ies)"
+            fail=1
+          fi
+          if [ "$unknown" -gt 0 ]; then
+            echo "::error title=FAIL_PRODUCT::${unknown} UNKNOWN advisory classification(s) — not clean"
+            fail=1
+          fi
+          if [ "$deny_rc" -ne 0 ]; then
+            echo "::error title=FAIL_PRODUCT::cargo deny check failed (rc=${deny_rc})"
+            fail=1
+          fi
+          # cargo audit non-zero with only DEV_ONLY/NOT_IN_GRAPH is still a signal:
+          # we already classified; only fail when runtime/unknown.
+          if [ "$fail" -ne 0 ]; then
+            exit 1
+          fi
+          echo "rust-advisory-validate: PASS (no RUNTIME/UNKNOWN; deny clean)"
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rust-advisory-report
+          path: reports/
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # Publish consolidated report to the `sec` branch (not main/dev).
+  # micro: pure git + artifact download, no compile.
+  # Argument for direct commit to sec: reports are machine-generated audit
+  # artifacts, not product code; sec is the dedicated security home and is
+  # kept in sync with main by merge (see docs/branch-sync.md). Direct commit
+  # avoids PR noise while keeping feature flow unblocked.
+  # ---------------------------------------------------------------------------
+  publish-sec-report:
+    name: publish report to sec
+    needs: [gitleaks-scan, trivy-scan, rust-advisory-validate]
+    if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: [self-hosted, linux, x64, podman, micro]
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: sec
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Download scan artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: _scan_artifacts
+        continue-on-error: true
+
+      - name: Assemble and push report to sec
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          stamp=$(date -u +%Y%m%dT%H%M%SZ)
+          out_dir="security-reports/${stamp}"
+          mkdir -p "$out_dir"
+
+          # Copy whatever artifacts arrived
+          if [ -d _scan_artifacts ]; then
+            find _scan_artifacts -type f \( -name '*.json' -o -name '*.md' -o -name '*.txt' -o -name '*.rc' -o -name '*.stderr' \) \
+              -exec cp -a {} "$out_dir"/ \;
+          fi
+
+          {
+            echo "# Security scan bundle — ${stamp}"
+            echo ""
+            echo "- workflow run: ${GITHUB_RUN_ID}"
+            echo "- source sha: ${GITHUB_SHA}"
+            echo "- event: ${GITHUB_EVENT_NAME}"
+            echo ""
+            echo "Job results (GitHub conclusion):"
+            echo "- gitleaks-scan: ${{ needs.gitleaks-scan.result }}"
+            echo "- trivy-scan: ${{ needs.trivy-scan.result }}"
+            echo "- rust-advisory-validate: ${{ needs.rust-advisory-validate.result }}"
+            echo ""
+            echo "Raw tool JSON and the validation markdown (when present) are in this directory."
+            echo "Sync policy for \`sec\`: merge from \`main\` only — never force-push. See [docs/branch-sync.md](../../docs/branch-sync.md)."
+            if [ -f "$out_dir/validation.md" ]; then
+              echo ""
+              echo "---"
+              echo ""
+              cat "$out_dir/validation.md"
+            fi
+          } > "$out_dir/README.md"
+
+          # Also refresh a floating "latest" pointer for humans
+          mkdir -p security-reports
+          cp "$out_dir/README.md" security-reports/LATEST.md
+          if [ -f "$out_dir/validation.md" ]; then
+            cp "$out_dir/validation.md" security-reports/LATEST-validation.md
+          fi
+
+          git config user.name "tzervas"
+          git config user.email "albedo.black.1@gmail.com"
+
+          git add security-reports/
+          if git diff --staged --quiet; then
+            echo "Publish: nothing new to commit (empty) — PASS"
+            echo "nothing new to commit" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git commit -m "chore(sec): security validation report ${stamp}"
+          set +e
+          git push origin HEAD:sec
+          prc=$?
+          set -e
+          if [ "$prc" -ne 0 ]; then
+            echo "::error title=FAIL_INFRA::git push to sec failed (rc=${prc}) — UNKNOWN"
+            exit 1
+          fi
+          echo "Published security report to sec at ${stamp}" | tee -a "$GITHUB_STEP_SUMMARY"
+          exit 0
