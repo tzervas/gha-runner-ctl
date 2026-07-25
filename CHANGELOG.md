@@ -1,4 +1,38 @@
-## v0.3.0 (2026-07-24)
+## v0.3.0 (2026-07-25)
+
+### Fixed — release automation: a crates.io failure no longer blocks the release
+
+`v0.3.0` was merged to `main` on 2026-07-24 and **never shipped**. Both
+`release-on-merge` runs failed at `cargo publish` (exit 101), and because the
+publish ran *before* tagging and was fatal, the `v0.3.0` tag and GitHub release
+were never created. `main` carried an untagged, unreleased 0.3.0 while the
+latest release stayed `v0.2.11`.
+
+- **Reordered:** tag + GitHub release now run **before** the crates.io publish.
+  A GitHub Release records what shipped from this repository; a registry
+  publication is a separate artifact in a separate system with its own failure
+  domain. One must not be able to take out the other.
+- **Publish is no longer gated on the tag.** It relies on `cargo publish` being
+  idempotent ("already exists" -> success), so a publish that failed for a
+  registry-side reason is retried by simply re-running the workflow. Under the
+  old gating, once the tag existed the publish would have been skipped forever.
+- **Failure is still loud:** a failed publish still fails the job and now writes
+  an actionable job summary naming the likely cause (this crate has never been
+  published; a scoped crates.io token needs `publish-new`, not just
+  `publish-update`).
+
+Known outstanding: the crates.io publish for this version is still expected to
+fail until the token carries `publish-new`. That is a credential-scope issue
+outside this repository and no longer blocks the GitHub release.
+
+### Changed — `dev` restored as the single integration branch
+
+Release PR #37 was squash-merged, leaving `dev` and `main` with identical trees
+but disjoint histories (merge base three days stale). `docs/RELEASE.md` already
+required all feature/fix PRs to base `dev` and required a merge-back after each
+promote; neither was happening. `dev` has been back-merged from `main` and open
+PRs retargeted. Release promotes must use a **merge commit, not a squash**.
+
 
 ### Fixed — capacity-safe idle scale-in (demand-driven autoscaler)
 

@@ -144,8 +144,51 @@ Workers (L2) edit files only; **L1 / human owns** `git commit`, `push`, and PR.
 
 1. Ensure `dev` is green on local gates.
 2. Open promote PR: **`dev` → `main`** (human review gate).
-3. Merge via PR (no force-push).
-4. On `main` tip: tag `vX.Y.Z`, build release artifacts, publish release notes.
+3. Merge via PR (no force-push). **Use a MERGE COMMIT, not a squash.**
+4. On `main` tip: `release-on-merge.yml` tags `vX.Y.Z`, builds artifacts, cuts
+   the GitHub release, then publishes to crates.io.
+5. Open the merge-back PR **`main` → `dev`** immediately (step 4 of the
+   checklist below is not optional).
+
+#### Never squash the promote PR
+
+Squashing `dev` → `main` gives `main` a single new commit instead of `dev`'s
+history. The two branches then have **identical trees but disjoint histories**,
+and their merge base stops advancing. Consequences, all of which happened:
+
+- Every PR cut from `main` diffs against a stale merge base, so retargeting it
+  to `dev` renders thousands of lines of already-merged work.
+- `main` → `dev` merge-back conflicts on files both sides "added".
+- "Which branch is upstream?" becomes unanswerable from the UI.
+
+If it happens anyway, recover with a `main` → `dev` back-merge PR that resolves
+conflicts in favour of `main`, and verify the result with
+`git diff origin/main <branch> --stat` returning empty.
+
+### Release artifacts vs registry publication
+
+These are **separate artifacts with separate failure domains**, and
+`release-on-merge.yml` deliberately orders them so one cannot block the other:
+
+| Artifact | System | Blocking? |
+|----------|--------|-----------|
+| `vX.Y.Z` tag + GitHub release + assets | this repository | runs **first** |
+| crates.io publish | crates.io | runs **after**, cannot prevent the above |
+
+A failed publish still fails the job (loudly, with a job summary), but the tag
+and release already exist by then, so the repository's own record of what
+shipped is never held hostage by a registry problem.
+
+The publish step is **not** gated on the tag. It relies on `cargo publish` being
+idempotent — an already-published version reports "already exists" and is
+treated as success — so a publish that failed for a registry-side reason is
+retried by re-running the workflow, with no repo change. Gating it on the tag
+would mean that once the tag existed the publish could never run again.
+
+**Known blocker:** this crate has never been published. A scoped crates.io token
+needs the `publish-new` permission (not just `publish-update`) to create a crate
+for the first time. Until the token carries it, expect the publish step to fail
+while the GitHub release still succeeds.
 
 Task/epic issue closure policy matches org practice: prefer closing task issues
 when their commits land on **`main`**, not on intermediate `dev` merges.
@@ -186,10 +229,15 @@ merge theater.
 - [ ] `cz bump` or manual bump: `VERSION`, `Cargo.toml`, `UA`, `CHANGELOG.md`
 - [ ] Local gates green
 - [ ] PR to `dev` merged (feature wave) or `dev` ready for promote
-- [ ] Promote PR `dev` → `main` merged
-- [ ] Annotated tag `vX.Y.Z` on `main`
-- [ ] `bash scripts/dist.sh` (and upload if publishing)
-- [ ] Merge-back `main` → `dev` if tips diverged
+- [ ] Promote PR `dev` → `main` merged **with a merge commit, never a squash**
+- [ ] Annotated tag `vX.Y.Z` on `main` (automated by `release-on-merge.yml`)
+- [ ] GitHub release created with `dist/` assets attached
+- [ ] crates.io publish succeeded **or** its failure is understood and recorded
+      (it does not block the release — see "Release artifacts vs registry
+      publication")
+- [ ] Merge-back PR `main` → `dev` opened — **always**, not only "if tips
+      diverged". A squash-merged promote leaves the trees identical while the
+      histories diverge, so "tips look the same" is not evidence they are.
 
 ---
 

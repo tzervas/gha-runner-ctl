@@ -3,9 +3,21 @@ name: release-on-merge
 #
 # On push to main: read the VERSION file; if v<version> is not already tagged, then
 #   1. build the dist tarball (scripts/dist.sh),
-#   2. publish the crate to crates.io (idempotent — skips if the version already exists),
-#   3. cut the GitHub release and upload assets,
-#   4. push the v<version> tag (record of what shipped).
+#   2. push the v<version> tag and cut the GitHub release with assets,
+#   3. publish the crate to crates.io (idempotent, and NOT gated on the tag).
+#
+# WHY 2 COMES BEFORE 3 — this order was learned the hard way. Previously the
+# crates.io publish ran first and was fatal, so when `cargo publish` failed the
+# tag and GitHub release were never created. That is exactly what happened to
+# v0.3.0: it was merged to main on 2026-07-24, both release runs failed at
+# `cargo publish` (exit 101), and main sat at an UNTAGGED, UNRELEASED 0.3.0 —
+# latest release still v0.2.11 — with no tag recording what shipped.
+#
+# A GitHub Release and a registry publication are different artifacts in
+# different systems with different failure domains. A crates.io token-scope
+# problem must not be able to prevent this repository from recording its own
+# release. The publish step still fails the job loudly when it fails; it just
+# no longer takes the release record down with it.
 #
 # Fully self-contained: it does NOT delegate to release.yml, so it does not depend on
 # the GITHUB_TOKEN "won't trigger downstream workflows" limitation. Idempotent — a
@@ -73,27 +85,13 @@ jobs:
         if: steps.gate.outputs.go == 'true'
         run: bash scripts/dist.sh
 
-      - name: Publish to crates.io
-        if: steps.gate.outputs.go == 'true'
-        env:
-          # cargo reads the crates.io token from the CARGO_REGISTRY_TOKEN env var;
-          # source it from the identically-named repo secret (the idiomatic setup).
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          set -uo pipefail
-          # Idempotent publish: if a prior run already published this version but failed
-          # before tagging, cargo errors with "already exists" — treat that as success
-          # rather than failing the release. Any other failure is fatal. Name-agnostic
-          # (works whether crates.io canonicalizes to gha_runner_ctl or gha-runner-ctl).
-          out="$(cargo publish --locked 2>&1)"; rc=$?
-          printf '%s\n' "$out"
-          if [ "$rc" -eq 0 ]; then
-            echo "published to crates.io"
-          elif printf '%s' "$out" | grep -qiE 'already (exists|uploaded)|crate version .* is already'; then
-            echo "this version is already on crates.io — treating as success (idempotent)."
-          else
-            echo "cargo publish failed (rc=$rc)"; exit "$rc"
-          fi
+      # ---------------------------------------------------------------------
+      # ORDER IS LOAD-BEARING: tag + GitHub release FIRST, crates.io publish
+      # after. A GitHub Release is a record of what shipped from this repo; a
+      # crates.io publish is a separate artifact in a separate system with its
+      # own failure domain (token scope, registry availability, name squatting).
+      # Coupling them cost this repo a release: see the "Why" note below.
+      # ---------------------------------------------------------------------
 
       - name: Tag + GitHub release with assets
         if: steps.gate.outputs.go == 'true'
@@ -115,3 +113,60 @@ jobs:
             gh release create "$TAG" --title "gha-runner-ctl ${TAG}" --generate-notes
           fi
           gh release upload "$TAG" "$ARCHIVE" "$SUMS" --clobber
+
+      - name: Publish to crates.io
+        # WHY THIS IS NOT GATED ON steps.gate.outputs.go
+        #
+        # The gate answers "is this version tagged?". Tagging now happens in the
+        # step ABOVE, so gating the publish on it would mean: first run tags and
+        # then fails to publish; every later re-run sees the tag, sets go=false,
+        # and skips the publish forever. The version could never be published
+        # without hand-editing the workflow.
+        #
+        # Instead this runs whenever the job runs and relies on `cargo publish`
+        # being idempotent — an already-published version reports "already
+        # exists" and is treated as success. So a publish that failed for a
+        # registry-side reason is fixed by re-running the workflow once the
+        # cause is cleared, with no repo change at all.
+        #
+        # `!cancelled()` rather than `always()`: a cancelled release should not
+        # push to a public registry.
+        if: ${{ !cancelled() }}
+        env:
+          # cargo reads the crates.io token from the CARGO_REGISTRY_TOKEN env var;
+          # source it from the identically-named repo secret (the idiomatic setup).
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -uo pipefail
+          # Idempotent publish: if a prior run already published this version but failed
+          # before tagging, cargo errors with "already exists" — treat that as success
+          # rather than failing the release. Any other failure is fatal. Name-agnostic
+          # (works whether crates.io canonicalizes to gha_runner_ctl or gha-runner-ctl).
+          out="$(cargo publish --locked 2>&1)"; rc=$?
+          printf '%s\n' "$out"
+          if [ "$rc" -eq 0 ]; then
+            echo "published to crates.io"
+            exit 0
+          fi
+          if printf '%s' "$out" | grep -qiE 'already (exists|uploaded)|crate version .* is already'; then
+            echo "this version is already on crates.io — treating as success (idempotent)."
+            exit 0
+          fi
+
+          # Still a hard failure — the job goes red and the operator is told.
+          # But the tag and the GitHub Release already exist, so the repo's own
+          # record of the release is intact and is not held hostage by crates.io.
+          {
+            echo "### crates.io publish FAILED (rc=${rc})"
+            echo
+            echo "The **GitHub release and tag \`${{ steps.gate.outputs.tag }}\` were still created**"
+            echo "— this step runs after them deliberately."
+            echo
+            echo "Common cause for this crate: it has never been published, and a"
+            echo "scoped crates.io token needs \`publish-new\` (not just \`publish-update\`)"
+            echo "to create a crate for the first time."
+            echo
+            echo "Fix the cause, then re-run this workflow — the publish step is"
+            echo "idempotent and is not gated on the tag, so it will retry cleanly."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "cargo publish failed (rc=$rc)"; exit "$rc"
