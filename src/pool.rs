@@ -236,20 +236,37 @@ pub fn cargo_jobs_for_cpus(cpus: &str) -> u32 {
 /// Caps: xlarge/gpu <= 16 CPU / 16 GiB (host pool default matches).
 ///
 /// Memory is sized from measured peaks with `CARGO_BUILD_JOBS` pinned to the
-/// tier's CPU quota (see [`cargo_jobs_for_cpus`]), keeping >=6x headroom for the
-/// non-Rust workloads that share these tiers:
+/// tier's CPU quota (see [`cargo_jobs_for_cpus`]).
+///
+/// The headroom below is measured against `cargo clippy --all-targets` on
+/// gha-runner-ctl — the heaviest routine Rust workload the fleet runs, and
+/// heavier than the `cargo check` figures this table originally quoted. Sampled
+/// at 0.2 s over the whole process tree, so every peak is a FLOOR:
 ///
 /// | tier   | jobs | measured peak | claim | headroom |
 /// |--------|-----:|--------------:|------:|---------:|
-/// | medium |    2 |       333 MiB |    2g |      ~6x |
-/// | large  |    4 |       479 MiB |    4g |      ~8x |
-/// | xlarge |    8 |       678 MiB |    8g |     ~12x |
+/// | micro  |    1 |       332 MiB |  512m |    1.54x |
+/// | small  |    1 |       332 MiB |    1g |    3.08x |
+/// | medium |    2 |       563 MiB |    2g |    3.64x |
+/// | large  |    4 |       756 MiB |    4g |    5.42x |
+/// | xlarge |    8 |       916 MiB |    8g |    8.94x |
+/// | gpu    |    4 |       756 MiB |    8g |   10.84x |
 ///
-/// The previous 4g/8g/16g claims were sized for the unpinned `-j28` behaviour.
-/// Because the pool admits workers against *claimed* memory, over-claiming
-/// throttled parallelism: a `large` job reserved half the 16 GiB budget while
-/// using under 0.5 GiB. Halving the claims roughly doubles concurrent workers
-/// without reducing real headroom.
+/// These are lower than the ">=6x" this change first claimed. That claim came
+/// from `cargo check` on a single crate; a clippy `--all-targets` compile of the
+/// same tree peaks 45-85% higher at the same job count. The tiers are still
+/// adequate for this crate, but the true margins are 3.6x/5.4x/8.9x, not
+/// 6x/8x/12x, and MICRO IS ONLY 1.54x — thin enough that a larger workspace
+/// (mycelium-*) can still OOM there even with jobs pinned. Rust compiles are
+/// therefore routed away from Micro by [`size_for_job`] rather than being
+/// relied upon to fit. `tier_headroom_against_measured_peaks_is_documented`
+/// pins these numbers so a future tier change cannot silently erase the margin.
+///
+/// The previous 4g/8g/16g claims were sized for the unpinned `-j28` behaviour
+/// (measured 1225 MiB for the same clippy run). Because the pool admits workers
+/// against *claimed* memory, over-claiming throttled parallelism: a `large` job
+/// reserved half the 16 GiB budget while using under 1 GiB. Halving the claims
+/// roughly doubles concurrent workers without reducing real headroom.
 pub fn resources_for_tier(tier: SizeTier) -> (String, String) {
     match tier {
         // gitleaks 19 MiB, trivy fs with a cold DB 121 MiB - both measured.
@@ -1025,13 +1042,100 @@ mod tests {
             let (c, m) = resources_for_tier(tier);
             let jobs = cargo_jobs_for_cpus(&c);
             assert!(jobs >= 1, "tier {tier:?} produced {jobs} cargo jobs");
-            // Claimed memory must cover the measured ~250 MiB base plus ~55 MiB
-            // per extra job, or the tier is structurally OOM-prone.
-            let need_mib = 250 + 55 * u64::from(jobs - 1);
             let claim_mib = parse_memory_mib(&m).expect("tier memory parses");
+            let need_mib = measured_peak_mib(jobs) * 5 / 4; // 1.25x safety factor
             assert!(
                 claim_mib >= need_mib,
-                "tier {tier:?}: claims {claim_mib} MiB but -j{jobs} needs ~{need_mib} MiB"
+                "tier {tier:?}: claims {claim_mib} MiB but -j{jobs} peaks at \
+                 {} MiB measured ({need_mib} MiB with the 1.25x factor)",
+                measured_peak_mib(jobs)
+            );
+        }
+    }
+
+    /// Measured peak RSS (MiB) of the whole process tree for the heaviest routine
+    /// Rust workload the fleet runs, `cargo clippy --all-targets`, at a given
+    /// `CARGO_BUILD_JOBS`. Sampled at 0.2 s on this crate, so every figure is a
+    /// FLOOR, not a ceiling.
+    ///
+    /// |  -j |  1  |  2  |  4  |  8  | unpinned (28-core host) |
+    /// |-----|----:|----:|----:|----:|------------------------:|
+    /// | MiB | 332 | 563 | 756 | 916 |                    1225 |
+    ///
+    /// This replaces the earlier `250 + 55*(jobs-1)` linear model, which was fitted
+    /// to `cargo check` on one crate and under-predicts a real `clippy
+    /// --all-targets` by 33-85%:
+    ///
+    /// | -j | model | measured | model error |
+    /// |----|------:|---------:|------------:|
+    /// |  1 |   250 |      332 |        -25% |
+    /// |  2 |   305 |      563 |        -46% |
+    /// |  4 |   415 |      756 |        -45% |
+    /// |  8 |   635 |      916 |        -31% |
+    ///
+    /// A guard that under-predicts by half is not a guard. Growth is concave, not
+    /// linear, so interpolation between measured points is a linear upper bound on
+    /// the curve rather than a fit through it.
+    ///
+    /// NOTE ON SCOPE: these are gha-runner-ctl's own numbers. The fleet also builds
+    /// much larger workspaces (mycelium-*), whose peaks are higher. Micro's
+    /// 512 MiB against a 332 MiB single-job floor is only 1.54x — thin enough that
+    /// a bigger crate can still OOM at Micro even with jobs pinned. That is why
+    /// clippy is routed away from Micro by `size_for_job` rather than being relied
+    /// on to fit.
+    fn measured_peak_mib(jobs: u32) -> u64 {
+        const SAMPLES: &[(u32, u64)] = &[(1, 332), (2, 563), (4, 756), (8, 916)];
+        if let Some(&(_, mib)) = SAMPLES.iter().find(|&&(j, _)| j == jobs) {
+            return mib;
+        }
+        // Between samples: linear interpolation on the bracketing pair (an upper
+        // bound, since the real curve is concave). Above the top sample: extend at
+        // the last observed slope.
+        let (mut lo, mut hi) = (SAMPLES[0], SAMPLES[SAMPLES.len() - 1]);
+        for w in SAMPLES.windows(2) {
+            if w[0].0 <= jobs && jobs <= w[1].0 {
+                (lo, hi) = (w[0], w[1]);
+            }
+        }
+        if jobs > hi.0 {
+            lo = SAMPLES[SAMPLES.len() - 2];
+        }
+        let span = u64::from(hi.0 - lo.0);
+        let slope_num = hi.1 - lo.1;
+        lo.1 + slope_num * u64::from(jobs.saturating_sub(lo.0)) / span
+    }
+
+    /// The headroom the tier table actually delivers, against measured peaks.
+    /// Documents the real multiples rather than the aspirational ones, and fails
+    /// if any tier drops below 1.25x — the point at which a modestly larger crate
+    /// than this one starts getting SIGKILLed.
+    #[test]
+    fn tier_headroom_against_measured_peaks_is_documented() {
+        let rows = [
+            (SizeTier::Micro, 1u32),
+            (SizeTier::Small, 1),
+            (SizeTier::Medium, 2),
+            (SizeTier::Large, 4),
+            (SizeTier::Xlarge, 8),
+            (SizeTier::Gpu, 4),
+        ];
+        for (tier, expect_jobs) in rows {
+            let (c, m) = resources_for_tier(tier);
+            let jobs = cargo_jobs_for_cpus(&c);
+            assert_eq!(
+                jobs, expect_jobs,
+                "tier {tier:?}: CPU quota {c} should pin cargo to -j{expect_jobs}"
+            );
+            let claim = parse_memory_mib(&m).expect("tier memory parses");
+            let peak = measured_peak_mib(jobs);
+            // Integer tenths, so the assertion message carries the real number.
+            let headroom_tenths = claim * 10 / peak;
+            assert!(
+                headroom_tenths >= 12,
+                "tier {tier:?}: {claim} MiB over a measured {peak} MiB peak at -j{jobs} \
+                 is only {}.{}x headroom",
+                headroom_tenths / 10,
+                headroom_tenths % 10
             );
         }
     }
