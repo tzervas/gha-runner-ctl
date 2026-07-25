@@ -21,7 +21,7 @@ See **[docs/HOST_PLATFORMS.md](docs/HOST_PLATFORMS.md)**.
 
 CI badge reflects self-hosted workflow status on `main` (`runs-on: [self-hosted, linux, x64, podman]`). It is only green when a host listener registers a runner and completes the job—no GitHub-hosted fallback.
 
-Docs: [QUICKSTART](docs/QUICKSTART.md) · [HOST_PLATFORMS](docs/HOST_PLATFORMS.md) · [WORK_IMAGES](docs/WORK_IMAGES.md) · [HOST_OPS](docs/HOST_OPS.md) · [SECURITY](docs/SECURITY.md) · [CONSUMERS](docs/CONSUMERS.md) · [DESIGN](docs/DESIGN.md)
+Docs: [QUICKSTART](docs/QUICKSTART.md) · [HOST_PLATFORMS](docs/HOST_PLATFORMS.md) · [WORK_IMAGES](docs/WORK_IMAGES.md) · [HOST_OPS](docs/HOST_OPS.md) · [SECURITY](docs/SECURITY.md) · [AUTO_FIX](docs/AUTO_FIX.md) · [CONSUMERS](docs/CONSUMERS.md) · [DESIGN](docs/DESIGN.md)
 
 [MIT](LICENSE) · [NOTICE](NOTICE) (cites [actions/runner](https://github.com/actions/runner), also MIT)
 
@@ -309,6 +309,32 @@ More detail: [docs/HOST_OPS.md](docs/HOST_OPS.md).
 - Prefer private repos on self-hosted compute
 
 Details: [docs/SECURITY.md](docs/SECURITY.md).
+
+## Automated CI fixing (opt-in, off by default)
+
+Two workflows close the loop on **mechanically fixable** CI failures:
+
+- `.github/workflows/auto-fix.yml` — applies a **closed list** (`cargo fmt`,
+  `ruff format`, `ruff check --fix` with safe rules only, and a lockfile refresh
+  matching a manifest change in the same PR) and pushes to the **PR's own head
+  branch**. It refuses to push to `main`/`master`/`dev`/`sec`/`release/**`, refuses
+  fork PRs, never force-pushes, and never makes an empty commit.
+- `.github/workflows/ci-triage.yml` — everything else is **not** auto-applied. It
+  posts one sticky comment carrying the real error from the job log, whether the
+  failure also reproduces on the base branch, and a bounded attempt count, then
+  labels the PR for [`scripts/grok-triage-poll.sh`](scripts/grok-triage-poll.sh)
+  (host-side; the agent credential never enters a runner container). Nothing merges
+  automatically.
+
+The push uses `AUTOFIX_TOKEN` — a fine-grained PAT scoped to **this repository
+only**, **Contents: write** and nothing else — because a push made with
+`GITHUB_TOKEN` does not trigger workflows, so the checks would never re-run.
+
+Both ship **inert**. Enable: `gh variable set AUTOFIX_ENABLED --body true`.
+Disable: `gh variable set AUTOFIX_ENABLED --body false`.
+
+Full design, threat model, loop bounds and what is *not* verified:
+**[docs/AUTO_FIX.md](docs/AUTO_FIX.md)**.
 
 ## Citation / license
 

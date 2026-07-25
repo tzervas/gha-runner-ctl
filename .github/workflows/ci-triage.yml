@@ -1,0 +1,379 @@
+# Tier 2 of the two-tier auto-fix loop.
+#
+# Tier 1 (auto-fix.yml) applies the closed list of mechanical fixes. Everything it
+# will not touch lands here: this workflow does NOT change code. It produces the
+# HANDOFF -- one sticky comment carrying the real failure, whether the failure also
+# reproduces on the base branch, the attempt count, and what a human should look at
+# -- and it labels the PR so the host-side grok worker can pick it up.
+#
+# WHY workflow_run IS SAFE HERE, SPECIFICALLY
+#   workflow_run runs with the default branch's workflow file, full repository
+#   secrets and a writable token, on an event caused by a pull request. That is the
+#   same shape as pull_request_target and it is dangerous for the same reason. It is
+#   safe in this file for one reason and one reason only:
+#
+#       THIS WORKFLOW NEVER CHECKS OUT AND NEVER EXECUTES PULL REQUEST CODE.
+#
+#   There is no actions/checkout step below. Every step is an API call. If you ever
+#   add a checkout here, you have re-opened the hole -- do not.
+#
+# WHAT IT NEVER DOES
+#   * apply a patch                * merge, or arm auto-merge
+#   * push to any branch           * conclude "fixed" from a queued check
+#
+# Full design: docs/AUTO_FIX.md
+name: ci-triage
+
+on:
+  workflow_run:
+    # Keep in step with the repo's real gate workflows.
+    workflows: [ci, fleet-ci, fleet-security]
+    types: [completed]
+
+# One triage per PR, newest wins -- so two failing gate workflows finishing at once
+# cannot both rewrite the sticky comment and race. Safe here because this is
+# workflow_run (event-driven), never a schedule: a scheduled self-hosted job queues
+# with no runner, the next schedule cancels it, and it reports `cancelled` rather
+# than `failed` -- silently never running.
+concurrency:
+  group: ci-triage-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read          # read the failing run's jobs and job logs
+  pull-requests: write   # upsert the sticky comment
+  issues: write          # labels live on the issues API
+
+env:
+  # ESCALATION BOUND. After this many triage rounds on one PR the loop STOPS and
+  # hands to a human with what was tried. An unbounded patch/fail/patch retry is the
+  # single most likely way this system burns a subscription and an API budget.
+  MAX_ATTEMPTS: "3"
+
+jobs:
+  triage:
+    name: ci-triage (diagnose, never patch)
+    # Explicit tier label: labels beat the job-name heuristic in size_for_job(), and
+    # without one the word "security"/"lint" appearing in a name would pin this to
+    # micro. This job is API calls only -- small (0.5 cpu / 1 GiB) is ample, and it
+    # is the tier with an online worker in this fleet.
+    runs-on: [self-hosted, linux, x64, podman, small]
+
+    # Guards, in order of what they stop:
+    #  * AUTOFIX_ENABLED       -- ships absent; the loop is inert until opted in.
+    #  * conclusion == failure -- success/cancelled/skipped are not a handoff.
+    #  * event == pull_request -- push builds on trunk are not this loop's business.
+    #  * head_repository       -- FORK GUARD. Never spend credentials, and never
+    #                             queue an agent, on a head that is attacker
+    #                             controlled.
+    if: >-
+      vars.AUTOFIX_ENABLED == 'true' &&
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+
+    steps:
+      - name: Resolve the PR and re-read LIVE state
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+          # The workflow_run payload is a snapshot of the past. Everything below is
+          # re-read from the API now. This fleet has already produced a case where an
+          # agent asserted a tag "does not exist" while it did, because it never
+          # re-checked after its own attempt was blocked.
+          num="$(gh api "repos/${REPO}/commits/${RUN_SHA}/pulls" \
+                   --jq '[.[] | select(.state == "open")][0].number // empty' 2>/dev/null || true)"
+          if [ -z "$num" ]; then
+            echo "::notice::no open PR for ${RUN_SHA} -- nothing to triage"
+            echo "skip=no-pr" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          head_sha="$(gh api "repos/${REPO}/pulls/${num}" --jq .head.sha)"
+          head_ref="$(gh api "repos/${REPO}/pulls/${num}" --jq .head.ref)"
+          base_ref="$(gh api "repos/${REPO}/pulls/${num}" --jq .base.ref)"
+          head_repo="$(gh api "repos/${REPO}/pulls/${num}" --jq .head.repo.full_name)"
+          draft="$(gh api "repos/${REPO}/pulls/${num}" --jq .draft)"
+
+          # STALE-DIAGNOSIS GUARD. If the branch has moved past the SHA that failed,
+          # this diagnosis describes code nobody is looking at any more, and a newer
+          # run is already in flight for the new head.
+          if [ "$head_sha" != "$RUN_SHA" ]; then
+            echo "::notice::PR #${num} head moved ${RUN_SHA} -> ${head_sha}; diagnosis superseded"
+            echo "skip=superseded" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # FORK GUARD, re-asserted against live state rather than the payload.
+          if [ "$head_repo" != "$REPO" ]; then
+            echo "::error::PR #${num} head repo is ${head_repo}, not ${REPO} -- refusing" >&2
+            exit 1
+          fi
+          # TRUNK GUARD. Nothing downstream of this workflow may write to a trunk.
+          case "$head_ref" in
+            main|master|dev|sec|release/*)
+              echo "::error::PR #${num} head is trunk branch '${head_ref}' -- refusing to queue automation" >&2
+              exit 1 ;;
+          esac
+          if [ "$draft" = "true" ]; then
+            echo "::notice::PR #${num} is a draft -- not triaging"
+            echo "skip=draft" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          {
+            echo "skip="
+            echo "number=$num"
+            echo "head_sha=$head_sha"
+            echo "head_ref=$head_ref"
+            echo "base_ref=$base_ref"
+          } >> "$GITHUB_OUTPUT"
+          printf 'PR #%s  head=%s (%s)  base=%s\n' "$num" "$head_ref" "$head_sha" "$base_ref"
+
+      - name: Collect the REAL failure from the job logs
+        id: diag
+        if: steps.pr.outputs.skip == ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          WF_NAME: ${{ github.event.workflow_run.name }}
+          WF_PATH: ${{ github.event.workflow_run.path }}
+          BASE_REF: ${{ steps.pr.outputs.base_ref }}
+        run: |
+          set -euo pipefail
+          # "CI failed" is not a handoff. The comment has to carry the actual error,
+          # so pull the failing job's log rather than restating the check name.
+          gh api "repos/${REPO}/actions/runs/${RUN_ID}/jobs" --paginate \
+            --jq '.jobs[] | select(.conclusion == "failure") | [.id, .name] | @tsv' \
+            > /tmp/failed-jobs.tsv || true
+          if [ ! -s /tmp/failed-jobs.tsv ]; then
+            # The run concluded failure but exposes no failed job. Startup failure is
+            # the usual cause -- e.g. invalid workflow YAML, which on this fleet has
+            # been produced by a python heredoc at column 0 terminating a `run: |`
+            # block scalar. That is UNKNOWN, not empty, and must be said out loud.
+            printf 'The run reports failure but exposes no failed job.\n\n' > /tmp/excerpt.txt
+            printf 'Most often a startup_failure: the workflow YAML is invalid and the\n' >> /tmp/excerpt.txt
+            printf 'workflow never ran at all. Validate it before assuming the job logic\n' >> /tmp/excerpt.txt
+            printf 'is wrong:\n  python3 -c "import yaml,sys;yaml.safe_load(open(sys.argv[1]))" %s\n' "$WF_PATH" >> /tmp/excerpt.txt
+            echo "job_names=(startup failure -- no job ran)" >> "$GITHUB_OUTPUT"
+            echo "classification=unknown" >> "$GITHUB_OUTPUT"
+          else
+            names="$(cut -f2 /tmp/failed-jobs.tsv | paste -sd', ' -)"
+            echo "job_names=$names" >> "$GITHUB_OUTPUT"
+            : > /tmp/excerpt.txt
+            : > /tmp/failsteps.txt
+            while IFS="$(printf '\t')" read -r jid jname; do
+              [ -n "$jid" ] || continue
+              gh api "repos/${REPO}/actions/jobs/${jid}" \
+                --jq '.steps[]? | select(.conclusion == "failure") | .name' >> /tmp/failsteps.txt || true
+              printf '=== job: %s ===\n' "$jname" >> /tmp/excerpt.txt
+              if gh api "repos/${REPO}/actions/jobs/${jid}/logs" > /tmp/job.log 2>/dev/null; then
+                # Last 60 lines from the first error marker, capped. Enough to
+                # diagnose, small enough to stay readable in a comment.
+                awk '/[Ee]rror|FAILED|failed with exit code|panicked|Traceback/ {found=NR} \
+                     {buf[NR]=$0} END { if (!found) found=NR; s=found-10; if (s<1) s=1; \
+                     e=found+50; if (e>NR) e=NR; for (i=s;i<=e;i++) print buf[i] }' \
+                  /tmp/job.log >> /tmp/excerpt.txt || true
+              else
+                printf '(job log unavailable -- log retention, or the job never started)\n' >> /tmp/excerpt.txt
+              fi
+              printf '\n' >> /tmp/excerpt.txt
+            done < /tmp/failed-jobs.tsv
+
+            # CLASSIFY. If the failure is on tier 1's closed list, grok is the wrong
+            # tool -- the answer is that auto-fix did not run or could not push.
+            if grep -qiE 'cargo fmt|rustfmt|ruff format|ruff check|fmt --check' /tmp/failsteps.txt; then
+              echo "classification=safe-fixable" >> "$GITHUB_OUTPUT"
+            else
+              echo "classification=needs-review" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+          # Sanitise: strip anything that could close the fenced block or forge the
+          # sticky-comment marker, and hard-cap the size.
+          sed -e 's/`/'"'"'/g' -e 's/-->/--\&gt;/g' -e 's/<!--/\&lt;!--/g' /tmp/excerpt.txt \
+            | head -c 12000 > /tmp/excerpt.clean
+          mv /tmp/excerpt.clean /tmp/excerpt.txt
+
+          # BASE-BRANCH REPRODUCTION. "Is this the PR's defect, or drift the PR
+          # merely exposed?" has cost real time on this fleet twice. Answer it from
+          # the base branch's own most recent completed run of the same workflow --
+          # no re-runs, no extra queue pressure.
+          wf_file="$(basename "$WF_PATH")"
+          base_concl="$(gh api "repos/${REPO}/actions/workflows/${wf_file}/runs?branch=${BASE_REF}&status=completed&per_page=1" \
+                          --jq '.workflow_runs[0].conclusion // empty' 2>/dev/null || true)"
+          case "$base_concl" in
+            failure) echo "base_state=ALSO FAILING on \`${BASE_REF}\` -- likely pre-existing drift this PR merely exposed, not this PR's defect" ;;
+            success) echo "base_state=passing on \`${BASE_REF}\` -- the defect is most likely in this PR" ;;
+            "")      echo "base_state=UNKNOWN -- \`${WF_NAME}\` has no completed run on \`${BASE_REF}\` to compare against" ;;
+            *)       echo "base_state=inconclusive on \`${BASE_REF}\` (last run: ${base_concl})" ;;
+          esac >> "$GITHUB_OUTPUT"
+
+      - name: Read the attempt count from the sticky comment
+        id: attempts
+        if: steps.pr.outputs.skip == ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.pr.outputs.number }}
+        run: |
+          set -euo pipefail
+          # ONE comment per PR, updated in place. Appending a comment per run floods
+          # the PR and buries the signal, and the newest state is the only state
+          # anyone wants.
+          gh api "repos/${REPO}/issues/${PR}/comments" --paginate \
+            --jq '.[] | select(.body | contains("<!-- autofix-report -->")) | [.id, (.body | capture("autofix-state attempts=(?<n>[0-9]+)").n // "0")] | @tsv' \
+            > /tmp/sticky.tsv || true
+          cid="$(awk -F'\t' 'NR==1{print $1}' /tmp/sticky.tsv)"
+          # awk with NF>=2 so a single-field line cannot be misread as the counter:
+          # `cut -f2` would echo field 1 for a line with no tab, which would look
+          # like a huge attempt count and trip the bound on the first run.
+          prev="$(awk -F'\t' 'NR==1 && NF>=2{print $2}' /tmp/sticky.tsv)"
+          case "${prev:-}" in ""|*[!0-9]*) prev=0 ;; esac
+          next=$(( prev + 1 ))
+          echo "comment_id=${cid:-}" >> "$GITHUB_OUTPUT"
+          echo "attempt=${next}"     >> "$GITHUB_OUTPUT"
+          echo "max=${MAX_ATTEMPTS}" >> "$GITHUB_OUTPUT"
+          if [ "$next" -gt "$MAX_ATTEMPTS" ]; then
+            echo "exhausted=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "exhausted=false" >> "$GITHUB_OUTPUT"
+          fi
+          printf 'attempt %s of %s (previous: %s)\n' "$next" "$MAX_ATTEMPTS" "$prev"
+
+      - name: Compose and upsert the sticky comment
+        if: steps.pr.outputs.skip == ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+          BASE_REF: ${{ steps.pr.outputs.base_ref }}
+          WF_NAME: ${{ github.event.workflow_run.name }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          JOB_NAMES: ${{ steps.diag.outputs.job_names }}
+          CLASSIFICATION: ${{ steps.diag.outputs.classification }}
+          BASE_STATE: ${{ steps.diag.outputs.base_state }}
+          ATTEMPT: ${{ steps.attempts.outputs.attempt }}
+          MAX: ${{ steps.attempts.outputs.max }}
+          EXHAUSTED: ${{ steps.attempts.outputs.exhausted }}
+          CID: ${{ steps.attempts.outputs.comment_id }}
+        run: |
+          set -euo pipefail
+          B=/tmp/body.md
+          {
+            printf '<!-- autofix-report -->\n'
+            printf '<!-- autofix-state attempts=%s max=%s -->\n\n' "$ATTEMPT" "$MAX"
+            printf '## CI triage -- attempt %s of %s\n\n' "$ATTEMPT" "$MAX"
+            printf '| | |\n|---|---|\n'
+            printf '| failing workflow | `%s` ([run](%s)) |\n' "$WF_NAME" "$RUN_URL"
+            printf '| failing job(s) | `%s` |\n' "$JOB_NAMES"
+            printf '| head | `%s` @ `%s` |\n' "$HEAD_REF" "$HEAD_SHA"
+            printf '| on the base branch | %s |\n' "$BASE_STATE"
+            printf '| classification | **%s** |\n\n' "$CLASSIFICATION"
+            case "$CLASSIFICATION" in
+              safe-fixable)
+                printf '### This should not have reached tier 2\n\n'
+                printf 'The failing step is on the tier-1 closed safe-fix list, so `auto-fix.yml`\n'
+                printf 'should have already fixed and pushed it. Check, in order:\n\n'
+                printf '1. is repository variable `AUTOFIX_ENABLED` set to `true`?\n'
+                printf '2. is repository secret `AUTOFIX_TOKEN` present and unexpired?\n'
+                printf '3. did the `auto-fix` run fail? Its log says which.\n\n' ;;
+              unknown)
+                printf '### Could not tell what failed\n\n'
+                printf 'The run failed without exposing a failed job. Treat this as UNKNOWN,\n'
+                printf 'not as empty -- see the excerpt below.\n\n' ;;
+              *)
+                printf '### Not auto-fixable -- needs review\n\n'
+                printf 'This failure is **outside** the closed safe-fix list, so nothing was\n'
+                printf 'applied automatically. A red PR is the correct outcome for a real defect.\n\n'
+                printf 'Auto-fixable (tier 1, applied without asking): `cargo fmt`, `ruff format`,\n'
+                printf '`ruff check --fix` with safe rules only, and a lockfile refresh matching a\n'
+                printf 'manifest change in this PR.\n\n'
+                printf 'Never auto-applied: semantic code changes, test edits, version bumps,\n'
+                printf 'dependency major bumps, and any workflow or permission change.\n\n' ;;
+            esac
+            printf '<details><summary>error excerpt from the job log</summary>\n\n```text\n'
+            cat /tmp/excerpt.txt
+            printf '\n```\n\n</details>\n\n'
+            if [ "$EXHAUSTED" = "true" ]; then
+              printf '### Attempt budget exhausted -- handing to a human\n\n'
+              printf 'Automated attempts are capped at %s per PR so a patch/fail/patch loop\n' "$MAX"
+              printf 'cannot burn the API budget indefinitely. No further automation will run\n'
+              printf 'on this PR.\n\n'
+              printf '**What to look at:** the excerpt above; whether the same workflow is\n'
+              printf 'failing on `%s` (see the table -- if it is, fix the base first); and the\n' "$BASE_REF"
+              printf 'earlier attempts in this branch history.\n\n'
+              printf 'To re-arm after addressing it: remove the `autofix:needs-human` label and\n'
+              printf 'delete this comment (the attempt counter lives in its HTML marker).\n\n'
+            else
+              printf 'Labelled `autofix:needs-grok`. The host-side worker\n'
+              printf '(`scripts/grok-triage-poll.sh` in `tzervas/gha-runner-ctl`) picks this up,\n'
+              printf 'reviews, tests and patches **on this branch**. It never merges and it never\n'
+              printf 'arms auto-merge; a human still decides.\n\n'
+            fi
+            printf -- '---\n'
+            printf '<sub>Posted by `.github/workflows/ci-triage.yml`. This comment is updated in\n'
+            printf 'place, never appended. Design: `docs/AUTO_FIX.md`.</sub>\n'
+          } > "$B"
+
+          if [ -n "${CID:-}" ]; then
+            gh api --method PATCH "repos/${REPO}/issues/comments/${CID}" -F body=@"$B" --silent
+            echo "updated sticky comment ${CID}"
+          else
+            gh api --method POST "repos/${REPO}/issues/${PR}/comments" -F body=@"$B" --silent
+            echo "created sticky comment"
+          fi
+
+      - name: Label for the host-side grok worker (or for a human)
+        if: steps.pr.outputs.skip == ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.pr.outputs.number }}
+          CLASSIFICATION: ${{ steps.diag.outputs.classification }}
+          EXHAUSTED: ${{ steps.attempts.outputs.exhausted }}
+        run: |
+          set -euo pipefail
+          ensure_label() {
+            gh api "repos/${REPO}/labels/$1" --silent 2>/dev/null && return 0
+            gh api --method POST "repos/${REPO}/labels" \
+              -f "name=$1" -f "color=$2" -f "description=$3" --silent 2>/dev/null || true
+          }
+          ensure_label 'autofix:needs-grok'  'fbca04' 'CI failure outside the safe-fix list; queued for the host-side grok worker'
+          ensure_label 'autofix:needs-human' 'b60205' 'Automated attempt budget exhausted; a human must take this'
+
+          drop() { gh api --method DELETE "repos/${REPO}/issues/${PR}/labels/$1" --silent 2>/dev/null || true; }
+          add()  { gh api --method POST "repos/${REPO}/issues/${PR}/labels" -f "labels[]=$1" --silent; }
+
+          if [ "$EXHAUSTED" = "true" ]; then
+            # HARD STOP. Removing needs-grok is what actually bounds the escalation:
+            # the host worker only ever acts on that label.
+            drop 'autofix:needs-grok'
+            add  'autofix:needs-human'
+            echo "::warning::PR #${PR}: automated attempt budget exhausted -- handed to a human"
+          elif [ "$CLASSIFICATION" = "safe-fixable" ]; then
+            # Tier 1 owns this. Queueing an agent for a formatting diff would be
+            # spending a model on `cargo fmt`.
+            drop 'autofix:needs-grok'
+            echo "failure is on the tier-1 closed list -- not queueing grok"
+          else
+            add 'autofix:needs-grok'
+            echo "PR #${PR} labelled autofix:needs-grok"
+          fi
+
+      - name: Report
+        if: always()
+        env:
+          SKIP: ${{ steps.pr.outputs.skip }}
+        run: |
+          set -euo pipefail
+          case "${SKIP:-}" in
+            no-pr)      printf '### ci-triage\n\nNo open PR for that commit. Nothing to do -- an empty result is a real answer.\n' >> "$GITHUB_STEP_SUMMARY" ;;
+            superseded) printf '### ci-triage\n\nThe branch moved past the failing commit; a newer run owns the diagnosis.\n' >> "$GITHUB_STEP_SUMMARY" ;;
+            draft)      printf '### ci-triage\n\nDraft PR -- not triaged.\n' >> "$GITHUB_STEP_SUMMARY" ;;
+            *)          printf '### ci-triage\n\nDiagnosis posted to the PR sticky comment.\n' >> "$GITHUB_STEP_SUMMARY" ;;
+          esac
