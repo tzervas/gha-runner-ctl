@@ -208,17 +208,58 @@ fn name_contains_any(name: &str, needles: &[&str]) -> bool {
     needles.iter().any(|n| name.contains(n))
 }
 
-/// Map tier → (cpus string, memory string) for podman.
-/// Caps: xlarge/gpu ≤ 16 CPU / 16 GiB (host pool default matches).
+/// Cargo job count to advertise for a container holding `cpus` of CPU quota.
+///
+/// `--cpus` is a *quota*, not a cpuset: `nproc` inside the container still
+/// reports the host's core count. Cargo therefore defaults to `-j$(nproc)` and
+/// spawns as many rustc processes as the host has cores, no matter how small
+/// the container is. Peak memory is roughly `per_rustc * jobs`, so the
+/// container blows its `--memory` cap and the kernel SIGKILLs a rustc — the
+/// "heavy crate OOM" that is really a parallelism-vs-quota mismatch.
+///
+/// Measured on `mycelium-codegen` (`cargo check --workspace --all-targets`),
+/// peak RSS of the whole process tree:
+///
+/// | `-j`  |   1 |   2 |   4 |   8 | 28 (host default) |
+/// |-------|----:|----:|----:|----:|------------------:|
+/// | MiB   | 289 | 333 | 479 | 678 |          **1848** |
+///
+/// Growth is linear (~250 MiB base + ~55 MiB per extra job), so pinning jobs to
+/// the CPU quota makes a tier's memory need predictable instead of host-shaped.
+pub fn cargo_jobs_for_cpus(cpus: &str) -> u32 {
+    parse_cpus_f64(cpus)
+        .map(|c| c.floor().max(1.0) as u32)
+        .unwrap_or(1)
+}
+
+/// Map tier -> (cpus string, memory string) for podman.
+/// Caps: xlarge/gpu <= 16 CPU / 16 GiB (host pool default matches).
+///
+/// Memory is sized from measured peaks with `CARGO_BUILD_JOBS` pinned to the
+/// tier's CPU quota (see [`cargo_jobs_for_cpus`]), keeping >=6x headroom for the
+/// non-Rust workloads that share these tiers:
+///
+/// | tier   | jobs | measured peak | claim | headroom |
+/// |--------|-----:|--------------:|------:|---------:|
+/// | medium |    2 |       333 MiB |    2g |      ~6x |
+/// | large  |    4 |       479 MiB |    4g |      ~8x |
+/// | xlarge |    8 |       678 MiB |    8g |     ~12x |
+///
+/// The previous 4g/8g/16g claims were sized for the unpinned `-j28` behaviour.
+/// Because the pool admits workers against *claimed* memory, over-claiming
+/// throttled parallelism: a `large` job reserved half the 16 GiB budget while
+/// using under 0.5 GiB. Halving the claims roughly doubles concurrent workers
+/// without reducing real headroom.
 pub fn resources_for_tier(tier: SizeTier) -> (String, String) {
     match tier {
+        // gitleaks 19 MiB, trivy fs with a cold DB 121 MiB - both measured.
+        // Trivy's real cost is ~1.2 GiB of DISK cache, not RAM, so 512m is ample.
         SizeTier::Micro => ("0.25".into(), "512m".into()),
         SizeTier::Small => ("0.5".into(), "1g".into()),
-        // Medium crates / cargo check — 2c/4g avoids OOM on self-hosted workers
-        SizeTier::Medium => ("2".into(), "4g".into()),
-        SizeTier::Large => ("4".into(), "8g".into()),
-        SizeTier::Xlarge => ("8".into(), "16g".into()),
-        // GPU jobs: solid host CPU/RAM for data loaders + full device on GPU slice
+        SizeTier::Medium => ("2".into(), "2g".into()),
+        SizeTier::Large => ("4".into(), "4g".into()),
+        SizeTier::Xlarge => ("8".into(), "8g".into()),
+        // GPU jobs: data loaders are less predictable than rustc - keep 8g.
         SizeTier::Gpu => ("4".into(), "8g".into()),
     }
 }
@@ -939,14 +980,60 @@ mod tests {
     fn resources_medium_has_headroom() {
         let (c, m) = resources_for_tier(SizeTier::Medium);
         assert_eq!(c, "2");
-        assert_eq!(m, "4g");
+        // 2g against a measured 333 MiB peak at -j2 (~6x headroom).
+        assert_eq!(m, "2g");
     }
 
     #[test]
     fn resources_xlarge_cap() {
         let (c, m) = resources_for_tier(SizeTier::Xlarge);
         assert_eq!(c, "8");
-        assert_eq!(m, "16g");
+        // 8g against a measured 678 MiB peak at -j8 (~12x headroom).
+        assert_eq!(m, "8g");
+    }
+
+    #[test]
+    fn cargo_jobs_track_the_cpu_quota() {
+        // Whole quotas map straight through.
+        assert_eq!(cargo_jobs_for_cpus("2"), 2);
+        assert_eq!(cargo_jobs_for_cpus("4"), 4);
+        assert_eq!(cargo_jobs_for_cpus("8"), 8);
+        // Fractional quotas floor, but never below one job — a 0.25-CPU micro
+        // container must still be able to run cargo at all.
+        assert_eq!(cargo_jobs_for_cpus("0.25"), 1);
+        assert_eq!(cargo_jobs_for_cpus("0.5"), 1);
+        assert_eq!(cargo_jobs_for_cpus("1.9"), 1);
+        // Unparseable input fails closed to the least-memory choice rather than
+        // silently inheriting cargo's host-shaped default.
+        assert_eq!(cargo_jobs_for_cpus(""), 1);
+        assert_eq!(cargo_jobs_for_cpus("all"), 1);
+        assert_eq!(cargo_jobs_for_cpus("-3"), 1);
+    }
+
+    #[test]
+    fn every_tier_yields_a_usable_cargo_job_count() {
+        // No tier may produce 0 jobs: `cargo -j0` is an error, so a bad mapping
+        // would break every Rust job on that tier.
+        for tier in [
+            SizeTier::Micro,
+            SizeTier::Small,
+            SizeTier::Medium,
+            SizeTier::Large,
+            SizeTier::Xlarge,
+            SizeTier::Gpu,
+        ] {
+            let (c, m) = resources_for_tier(tier);
+            let jobs = cargo_jobs_for_cpus(&c);
+            assert!(jobs >= 1, "tier {tier:?} produced {jobs} cargo jobs");
+            // Claimed memory must cover the measured ~250 MiB base plus ~55 MiB
+            // per extra job, or the tier is structurally OOM-prone.
+            let need_mib = 250 + 55 * u64::from(jobs - 1);
+            let claim_mib = parse_memory_mib(&m).expect("tier memory parses");
+            assert!(
+                claim_mib >= need_mib,
+                "tier {tier:?}: claims {claim_mib} MiB but -j{jobs} needs ~{need_mib} MiB"
+            );
+        }
     }
 
     #[test]
@@ -1026,9 +1113,9 @@ mod tests {
         assert!((plan.spawns[0].cpus - 0.25).abs() < 1e-9);
         assert_eq!(plan.spawns[0].memory_mib, 512);
         assert!((plan.spawns[1].cpus - 4.0).abs() < 1e-9);
-        assert_eq!(plan.spawns[1].memory_mib, 8 * 1024);
+        assert_eq!(plan.spawns[1].memory_mib, 4 * 1024);
         assert!((plan.spawns[2].cpus - 2.0).abs() < 1e-9);
-        assert_eq!(plan.spawns[2].memory_mib, 4 * 1024);
+        assert_eq!(plan.spawns[2].memory_mib, 2 * 1024);
     }
 
     /// Explicit xlarge label gets full preferred size when budget allows.
@@ -1041,7 +1128,7 @@ mod tests {
         assert_eq!(plan.spawns.len(), 1);
         assert_eq!(plan.spawns[0].tier, SizeTier::Xlarge);
         assert!((plan.spawns[0].cpus - 8.0).abs() < 1e-9);
-        assert_eq!(plan.spawns[0].memory_mib, 16 * 1024);
+        assert_eq!(plan.spawns[0].memory_mib, 8 * 1024);
     }
 
     /// Capacity ceiling: never plan more workers than free CPU/memory allow.
