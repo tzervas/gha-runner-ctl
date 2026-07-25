@@ -1,25 +1,128 @@
+# Centralized CI — calls tzervas/ap-workflows (renamed from mycelium-workflows).
+#
+# Policy for this gate now lives in one place. Changing it fleet-wide is a commit
+# there, not a PR here.
+#
+# PIN: ap-workflows currently publishes no tags at all (checked via the GitHub
+# API: /tags and /releases both empty). A tag pin is the preferred form — see
+# the fleet standard on moving refs — but with no tag to pin to, the safest
+# alternative to `@main` is an explicit commit SHA: immutable, auditable, and
+# just as capable of being bumped by a reviewed PR here as a tag would be.
+# ap-workflows also has no branch protection and no CI on its own PRs today, so
+# anything it publishes — including this exact commit — is currently ungated
+# upstream; re-review this pin's target if that changes.
+# TODO: move to a tag pin once ap-workflows cuts one (e.g. v1).
+#
+# TIERING: the tier comes from the branch under test — a PR's BASE branch — so a
+# PR into main is gated at main strength BEFORE it merges.
+#
+#   dev   check+test, GitHub-hosted
+#   main  full (adds cargo doc -D warnings), self-hosted fleet `large` tier
+#
+# `large` is kept on the main tier deliberately: it is a fleet size label (4c/8g)
+# and dropping it is how rustup+cargo get OOM-killed with exit 137 here.
+#
+# NOTHING IS WEAKENED BY THIS CHANGE. The previous gate was
+#   cargo fmt --check; cargo clippy --all-targets -- -D warnings;
+#   cargo test; cargo build --release
+# The centralized gate runs `cargo fmt --all --check` (broader), the same clippy,
+# `cargo check --workspace --all-targets` (new), `cargo test --workspace`
+# (broader), and at the main tier `cargo doc` with RUSTDOCFLAGS=-D warnings (new).
+#
+# release-build/bench: the pinned ap-workflows commit's reusable-rust-ci.yml
+# does not declare `release-build` or `bench` workflow_call inputs (only
+# rust-version, depth, runner-labels, cargo-jobs, all-features, deny-warnings,
+# timeout-minutes exist there today) — passing undeclared inputs is a hard
+# workflow-validation failure, not a no-op. A `release-build` input exists on
+# an ap-workflows feature branch (tracked upstream in ap-workflows PR #3,
+# unmerged), but depending on unreviewed, unmerged upstream work is worse than
+# doing the release build here. So the `release-build` job below does
+# `cargo build --release` locally, gated to the same depth=='full' condition
+# the reusable call resolves to. Revisit and drop this job in favor of
+# `release-build: true` once ap-workflows' main supports the input. There are
+# no [[bench]] targets in this crate, so nothing is lost by dropping `bench`.
 name: ci
+
 on:
+  workflow_dispatch:
+    inputs:
+      depth:
+        description: 'Gate depth (overrides the tier default)'
+        type: choice
+        options: [lint, check, check+test, full]
+        default: check+test
+      runner:
+        description: 'Where to run'
+        type: choice
+        options: [github-hosted, self-hosted-fleet]
+        default: github-hosted
   push:
     branches: [main, dev]
   pull_request:
-  workflow_dispatch:
+    branches: [main, dev]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build:
-    # Prefer the shared self-hosted runner when available.
-    # `large` is a fleet size label (4c/8g) so rustup+cargo are not OOM-killed (exit 137).
-    runs-on: [self-hosted, linux, x64, podman, large]
+  ci:
+    uses: tzervas/ap-workflows/.github/workflows/reusable-rust-ci.yml@80c61fe4a6dd35bc3dbf8db3abfee0ce20a4284a
+    with:
+      depth: >-
+        ${{ inputs.depth
+            || ((github.base_ref || github.ref_name) == 'main' && 'full' || 'check+test') }}
+      runner-labels: >-
+        ${{ (inputs.runner == 'self-hosted-fleet'
+             || (inputs.runner == '' && (github.base_ref || github.ref_name) == 'main'))
+            && '["self-hosted","linux","x64","podman","large"]'
+            || '["ubuntu-latest"]' }}
+
+  release-build:
+    # Stands in for the `release-build` reusable-workflow input until
+    # ap-workflows' main supports it — see the header comment above.
+    # Condition and runner mirror the `ci` job's `depth`/`runner-labels`
+    # resolution exactly: keep them in sync if either changes.
+    name: release-build
+    needs: [ci]
+    if: >-
+      ${{ (inputs.depth
+           || ((github.base_ref || github.ref_name) == 'main' && 'full' || 'check+test')) == 'full' }}
+    runs-on: >-
+      ${{ (inputs.runner == 'self-hosted-fleet'
+           || (inputs.runner == '' && (github.base_ref || github.ref_name) == 'main'))
+          && fromJSON('["self-hosted","linux","x64","podman","large"]')
+          || fromJSON('["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97
-        with:
-          components: clippy, rustfmt
-      - name: fmt
-        run: cargo fmt --check
-      - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
-      - name: test
-        run: cargo test
-      - name: build
+      - name: cargo build --release
         run: cargo build --release
+
+  build:
+    # `build` is a REQUIRED status-check context in this repo's protec-main
+    # ruleset. A job that `uses:` a reusable workflow does not report under its
+    # own name alone, so this thin aggregate keeps the context reporting under
+    # exactly the name the ruleset requires. Removing it would leave protec-main
+    # waiting forever on a check that never arrives — and auto-merge is armed
+    # fleet-wide. Same pattern as fleet-ci.yml's `gate` job.
+    name: build
+    needs: [ci, release-build]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Aggregate the centralized gate
+        run: |
+          set -eu
+          ci_res='${{ needs.ci.result }}'
+          rel_res='${{ needs.release-build.result }}'
+          echo "reusable-rust-ci result: $ci_res"
+          echo "release-build result: $rel_res"
+          [ "$ci_res" = "success" ] || { echo "::error::centralized CI did not pass (result=$ci_res)"; exit 1; }
+          case "$rel_res" in
+            success|skipped) : ;;
+            *) echo "::error::release build did not pass (result=$rel_res)"; exit 1 ;;
+          esac
