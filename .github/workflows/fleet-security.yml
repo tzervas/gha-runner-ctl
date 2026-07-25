@@ -12,9 +12,11 @@ on:
     - cron: "17 7 * * 1"
   workflow_dispatch:
 
+# No cancel-in-progress: scheduled self-hosted jobs queue without a runner; the
+# next schedule would cancel them and report "cancelled" (not failed), so the
+# scan silently never runs and nothing alerts. Group alone is enough for PR reuse.
 concurrency:
   group: fleet-security-${{ github.ref }}
-  cancel-in-progress: true
 
 # Minimal token surface for checkout + scan (no write, no id-token).
 permissions:
