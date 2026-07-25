@@ -985,26 +985,6 @@ pub fn is_safe_memory(s: &str) -> bool {
 }
 
 pub fn redact(s: &str) -> String {
-    let mut has_key = false;
-    for key in [
-        "ghp_",
-        "gho_",
-        "ghu_",
-        "ghs_",
-        "ghr_",
-        "github_pat_",
-        "Bearer ",
-        "RUNNER_TOKEN=",
-    ] {
-        if s.contains(key) {
-            has_key = true;
-            break;
-        }
-    }
-    if !has_key && s.len() <= 400 {
-        return s.to_string();
-    }
-
     let mut out = s.to_string();
     for key in [
         "ghp_",
