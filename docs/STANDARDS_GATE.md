@@ -1,10 +1,10 @@
 # The development-standards gate
 
 `.github/workflows/standards.yml` is a thin caller for
-[`tzervas/mycelium-workflows/.github/workflows/reusable-standards.yml`](https://github.com/tzervas/mycelium-workflows/blob/main/docs/STANDARDS.md).
+[`tzervas/ap-workflows/.github/workflows/reusable-policy-contract.yml@v0.1.0`](https://github.com/tzervas/ap-workflows/blob/v0.1.0/.github/workflows/reusable-policy-contract.yml).
 All policy lives centrally; this repo carries only its overrides. Full rule reference, the
 operator commands, and the known limits are in
-[`mycelium-workflows/docs/STANDARDS.md`](https://github.com/tzervas/mycelium-workflows/blob/main/docs/STANDARDS.md).
+[`ap-workflows/docs/STANDARDS.md`](https://github.com/tzervas/ap-workflows/blob/main/docs/STANDARDS.md).
 
 This page covers what is specific to **gha-runner-ctl**.
 
