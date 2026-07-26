@@ -1128,8 +1128,9 @@ fn scan_body_end(s: &str, body_start: usize, min_body: usize) -> Option<usize> {
 /// deterministically wipes that buffer on return.
 ///
 /// # Matching
-/// At each byte index `i`, at most one entry of [`TOKEN_ANCHORS`] can match
-/// (`s[i..].starts_with(anchor)`); if one does, [`scan_body_end`] finds the
+/// At each byte index `i`, at most one entry of `TOKEN_ANCHORS` (crate-private —
+/// not linkable from public docs) can match (`s[i..].starts_with(anchor)`); if
+/// one does, `scan_body_end` (also crate-private) finds the
 /// end of the secret body that follows it, subject to that anchor's minimum
 /// body length. A qualifying body is replaced with `anchor` +
 /// `"***REDACTED***"` (the type-identifying prefix is kept for debuggability;
@@ -1952,6 +1953,40 @@ mod redact_hardening_tests {
         );
         let out = redact_zeroizing(zeroize::Zeroizing::new(format!("tok {jwt} end")));
         assert_eq!(out, "tok ghs_***REDACTED*** end");
+    }
+
+    /// MAJOR finding fix: `registration_token`'s `Err(ureq::Error::Status(code, r))`
+    /// arm now folds any response-body diagnostic text through
+    /// `registration_http_error`, which redacts before formatting. This proves a
+    /// token-shaped string embedded in that body never reaches the returned error
+    /// (and therefore never reaches a log line built from it) unredacted.
+    #[test]
+    fn registration_http_error_redacts_token_shaped_body() {
+        let secret = "A".repeat(40);
+        let body = format!(r#"{{"message":"leaked ghs_{}"}}"#, secret);
+        let msg =
+            registration_http_error("registration-token request failed", 403, Some(&body));
+        assert!(
+            !msg.contains(&secret),
+            "raw token-shaped body must not appear in error message: {msg}"
+        );
+        assert!(
+            msg.contains("***REDACTED***"),
+            "redaction marker missing from error message: {msg}"
+        );
+        assert!(
+            msg.contains("HTTP 403"),
+            "status code context missing from error message: {msg}"
+        );
+    }
+
+    /// A body-less error (transport error, or a body that failed to read) must
+    /// still produce a plain, useful message — redaction must not be required to
+    /// avoid a panic or an empty string.
+    #[test]
+    fn registration_http_error_without_body_is_plain() {
+        let msg = registration_http_error("registration-token request failed", 500, None);
+        assert_eq!(msg, "registration-token request failed: HTTP 500");
     }
 }
 
@@ -2970,6 +3005,24 @@ fn note_registration_failure_backoff(secs: u64) {
     thread::sleep(Duration::from_secs(secs));
 }
 
+/// Builds a registration-token-mint error message, folding in a short,
+/// **already-redacted** snippet of the HTTP response body when one is present.
+///
+/// This is the one centralized point every error path in [`registration_token`]
+/// that has access to a live HTTP response must route dynamic content through:
+/// GitHub's error bodies are not expected to carry secret material, but a
+/// message-building path that skips `redact()` "because there's nothing
+/// sensitive here today" is exactly how a future edit (e.g. surfacing the
+/// server's own error text for the "admin rights on target?" case) silently
+/// reintroduces a raw-token leak. Routing through here closes that gap once,
+/// rather than depending on every call site remembering to do it.
+fn registration_http_error(prefix: &str, status: u16, body: Option<&str>) -> String {
+    match body.map(str::trim).filter(|b| !b.is_empty()) {
+        Some(b) => format!("{prefix}: HTTP {status} — {}", redact(b)),
+        None => format!("{prefix}: HTTP {status}"),
+    }
+}
+
 fn registration_token(cli: &Cli, api_token: &str) -> Result<String, String> {
     pace_registration(cli)?;
     let url = registration_api(cli);
@@ -2989,7 +3042,15 @@ fn registration_token(cli: &Cli, api_token: &str) -> Result<String, String> {
                     .unwrap_or(cli.api_backoff_secs.max(60));
                 note_registration_failure_backoff(retry.min(MAX_API_BACKOFF_SECS));
             }
-            return Err(format!("registration-token request failed: HTTP {code}"));
+            // Read the body (if any) for diagnostics — MUST go through
+            // registration_http_error()'s redact() call before it can ever
+            // reach an error message; see that function's doc comment.
+            let body = r.into_string().ok();
+            return Err(registration_http_error(
+                "registration-token request failed",
+                code,
+                body.as_deref(),
+            ));
         }
         Err(e) => {
             return Err(format!(
