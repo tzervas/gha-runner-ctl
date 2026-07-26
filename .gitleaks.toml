@@ -1,5 +1,15 @@
 # gha-runner-ctl redacts GitHub token shapes; tests exercise those fixtures.
 # PR/push fleet-security uses --no-git tip scan; schedule uses full history.
+#
+# gitleaks 8.18.4 note: conditions inside one [allowlist] table are OR'd, not AND'd
+# (there is no condition = "AND" in this version). That means a `paths` entry naming
+# a whole directory (e.g. `(^|/)tests/`) suppresses ANY content ever committed under
+# it, forever, not just the fixture that motivated the entry. This file previously
+# allowlisted `(^|/)tests/` and `(^|/)target/` by path; both were removed because
+# they are OR-branches with no content check. Allowlist entries below match on
+# fixture CONTENT (fixed literal fake-token/test-value shapes) or are anchored to
+# `.git/`, never on a bare directory prefix. If you need to exempt a new fixture,
+# add its exact literal shape here — do not add a directory path.
 title = "gha-runner-ctl gitleaks"
 
 [extend]
@@ -8,8 +18,6 @@ useDefault = true
 [allowlist]
 description = "Test fixtures and build artifacts (not live credentials)"
 paths = [
-  '''(^|/)tests/''',
-  '''(^|/)target/''',
   '''(^|/)\.git/''',
 ]
 regexes = [
@@ -17,4 +25,10 @@ regexes = [
   '''ghp_ABC[A-Z0-9]{0,30}''',
   '''ghp_XYZ[A-Z0-9]{0,30}''',
   '''RUNNER_TOKEN=test[_-]?token[_-]?value''',
+  # Sequential-digit placeholder token literal, tests/tests.rs (redact fixture,
+  # commit 17e678b9); not a real OAuth token, no random entropy. Matched on the
+  # bare secret value (not the RUNNER_TOKEN= prefix) because gitleaks' allowlist
+  # regex is checked against the ruleset's extracted match text, which for the
+  # generic-api-key rule here is "TOKEN=gho_1234567890abcdef", not the full line.
+  '''gho_1234567890abcdef''',
 ]
