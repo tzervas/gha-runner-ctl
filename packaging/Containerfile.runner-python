@@ -1,0 +1,91 @@
+# fleet-runner-python — Python CI class: adds uv, ruff, pytest to fleet-runner-base.
+# Class table (frozen): see packaging/Containerfile.runner-base header and
+# docs/WORK_IMAGES.md.
+#
+# Tag as fleet-runner-python:<semver>, starting 0.1.0. NEVER :latest.
+#
+# Base choice: FROM fleet-runner-base (debian-slim), NOT alpine. Alpine is NOT
+# automatically smallest for Python: musl-libc means no manylinux wheel
+# compatibility, so every wheel (including transitive deps of pytest/ruff's own
+# ecosystem) would compile from source — bigger AND far slower to build than
+# debian-slim with prebuilt glibc wheels. See fleet-runner-base's header for the
+# full base rationale shared by every class. fleet-runner-base is produced in this
+# same repo/pipeline, not a third-party upstream, so pin
+# `fleet-runner-base:0.1.0@sha256:<digest>` once it is pushed to a registry;
+# do not invent a digest before then.
+#
+# Python interpreter: intentionally NOT apt python3. uv manages its own pinned
+# CPython build (astral-sh/python-build-standalone, via `uv python install`), so
+# the interpreter used by CI jobs is reproducible independent of the base image's
+# distro python package version, and is verified by uv's own trusted download
+# pipeline rather than us re-checksumming it by hand here.
+#
+# uv and ruff below are vendor-published, self-contained Linux binary releases,
+# downloaded and verified against a pinned upstream sha256 (recomputed by hand on
+# 2026-07-26 from a fresh download of each asset — both matched the official
+# `*.sha256` sidecar file astral-sh publishes alongside each release asset),
+# matching the gitleaks pattern already established in packaging/Containerfile.
+#
+# pytest has NO standalone vendor binary — it is a pure-Python package, so it
+# cannot be pinned the same way. It is installed from PyPI via `uv pip install`,
+# which verifies the downloaded artifact's hash against the hash PyPI itself
+# publishes in its JSON/simple index (uv's default behavior, same mechanism pip
+# uses) rather than a manually pinned sha256 ARG in this file. This is a
+# deliberate, documented deviation from the "checksum every downloaded binary"
+# rule, not an oversight — flagged explicitly per the instruction to say plainly
+# what could not be pinned the same way as gitleaks/shellcheck/uv/ruff.
+#
+# Why this image exists: Python CI fails fleet-wide on missing `ruff` — no runner
+# image in any repo currently carries it. This class is what the `python`
+# job-label token (`runs-on: [..., podman, <size>, python]`) should resolve to.
+#
+# Runs as non-root UID 1001 (inherited from fleet-runner-base).
+# Style: one logical step per RUN (no && chains) — matches packaging/Containerfile.
+# After edit: `podman build -f packaging/Containerfile.runner-python -t fleet-runner-python:0.1.0 .`
+
+FROM localhost/fleet-runner-base:0.1.0
+
+# uv pin: https://github.com/astral-sh/uv/releases/tag/0.11.32
+ARG UV_VERSION=0.11.32
+ARG UV_SHA256=aab924fd522efd06f1c5f3b93a243864fc453132c94b2dc49f1371b528a4b967
+# ruff pin: https://github.com/astral-sh/ruff/releases/tag/0.16.0
+ARG RUFF_VERSION=0.16.0
+ARG RUFF_SHA256=98001c995a134d95f9bc83106a7f94b552971b583f1c0ab75fb656a881e13865
+# uv-managed CPython pin (python-build-standalone); pytest pin (PyPI, see header note).
+ARG PYTHON_VERSION=3.13.14
+ARG PYTEST_VERSION=9.1.1
+
+ENV PATH=/home/runner/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+USER root
+WORKDIR /
+
+# uv pinned binary → /usr/local/bin
+RUN curl -fsSL -o /tmp/uv.tar.gz \
+      "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-gnu.tar.gz"
+RUN echo "${UV_SHA256}  /tmp/uv.tar.gz" | sha256sum -c -
+RUN tar -xzf /tmp/uv.tar.gz -C /tmp
+RUN install -m 755 /tmp/uv-x86_64-unknown-linux-gnu/uv /usr/local/bin/uv
+RUN install -m 755 /tmp/uv-x86_64-unknown-linux-gnu/uvx /usr/local/bin/uvx
+RUN rm -rf /tmp/uv.tar.gz /tmp/uv-x86_64-unknown-linux-gnu
+RUN uv --version
+
+# ruff pinned binary → /usr/local/bin
+RUN curl -fsSL -o /tmp/ruff.tar.gz \
+      "https://github.com/astral-sh/ruff/releases/download/${RUFF_VERSION}/ruff-x86_64-unknown-linux-gnu.tar.gz"
+RUN echo "${RUFF_SHA256}  /tmp/ruff.tar.gz" | sha256sum -c -
+RUN tar -xzf /tmp/ruff.tar.gz -C /tmp
+RUN install -m 755 /tmp/ruff-x86_64-unknown-linux-gnu/ruff /usr/local/bin/ruff
+RUN rm -rf /tmp/ruff.tar.gz /tmp/ruff-x86_64-unknown-linux-gnu
+RUN ruff --version
+
+# Managed CPython + pytest venv for runner (UID 1001): see header for why this is
+# not apt python3 and why pytest has no manually-pinned sha256.
+USER runner
+WORKDIR /home/runner
+RUN uv python install "${PYTHON_VERSION}"
+RUN uv venv /home/runner/.venv --python "${PYTHON_VERSION}"
+RUN uv pip install --python /home/runner/.venv/bin/python "pytest==${PYTEST_VERSION}"
+RUN /home/runner/.venv/bin/pytest --version
+
+WORKDIR /opt/actions-runner

@@ -1,0 +1,125 @@
+# fleet-runner-base — thin runner rootfs shared by every fleet-runner-<class> image.
+# Class table (frozen, authoritative — see docs/WORK_IMAGES.md and the packaging PR
+# that introduced this file): base | shell | python | rust | docs | gpu. Two image
+# planes exist and never merge: fleet-runner-<class> (this file's family — the rootfs
+# a CI job executes inside) vs fleet-<service> (a deployed app, owned by
+# homelab-infra-private — not this repo's concern).
+#
+# Tag as fleet-runner-base:<semver>, starting 0.1.0. NEVER :latest — a moving tag
+# makes a rollback impossible to describe.
+#
+# Base choice: docker.io/library/debian:bookworm-slim, NOT alpine, NOT a fresh
+# ubuntu:24.04 like packaging/Containerfile (the pre-existing fat default image).
+#   - alpine is NOT automatically smallest here: alpine is musl-libc, so every
+#     Python wheel in the `python` class (which FROMs this base) would compile from
+#     source instead of using prebuilt manylinux/glibc wheels — bigger AND far
+#     slower to build. debian-slim avoids that trap fleet-wide, once, at the base.
+#   - debian-slim keeps full glibc compatibility with the official actions/runner
+#     tarball (glibc-oriented, see docs/WORK_IMAGES.md) and with every pinned
+#     upstream binary release installed in the derived class Containerfiles
+#     (shellcheck/shfmt/bats/uv/ruff are all glibc Linux builds).
+#   - `ubuntu` is reserved for the `gpu` class only, where the vendor CUDA stack
+#     assumes an Ubuntu userspace — not used here.
+#
+# Upstream digest pin resolved 2026-07-26 against the Docker Hub Registry v2 API
+# (anonymous pull; `Docker-Content-Digest` response header on the manifest-list
+# request for the tag, cross-checked by recomputing sha256 over the raw manifest
+# body — both matched exactly):
+#   docker.io/library/debian:bookworm-slim -> sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
+#
+# Carries (per the frozen class table): runner agent, git, curl, jq, tar, gzip, gitleaks.
+# Runner tarball + gitleaks pins below were copied from packaging/Containerfile and
+# re-verified (sha256sum) against a fresh download on 2026-07-26 — both matched.
+#
+# Runs as non-root UID 1001 (trivy DS-0002), same convention as packaging/Containerfile.
+# Style: one logical step per RUN (no && chains) — matches packaging/Containerfile.
+# After edit: `podman build -f packaging/Containerfile.runner-base -t fleet-runner-base:0.1.0 .`
+
+FROM docker.io/library/debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
+
+ARG RUNNER_VERSION=2.335.1
+# NOT named TARGETARCH: that name is a reserved ARG the builder (podman/buildah,
+# BuildKit) auto-populates with the Go-style arch (e.g. "amd64"), silently
+# overriding any default given here — discovered via a live `podman build` of this
+# file, which then 404'd fetching ".../actions-runner-linux-amd64-....tar.gz" (the
+# release asset is named "-x64-", not "-amd64-"). RUNNER_ARCH avoids the collision.
+ARG RUNNER_ARCH=x64
+ARG RUNNER_SHA256=4ef2f25285f0ae4477f1fe1e346db76d2f3ebf03824e2ddd1973a2819bf6c8cf
+ARG RUNNER_UID=1001
+# gitleaks pin: https://github.com/gitleaks/gitleaks/releases/tag/v8.30.1
+ARG GITLEAKS_VERSION=8.30.1
+ARG GITLEAKS_SHA256=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    RUNNER_HOME=/opt/actions-runner \
+    RUNNER_USER=runner \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true
+
+# Node runtime for JavaScript actions: the runner tarball bundles node20 and node24.
+# Actions declaring `using: node20` are upgraded to the bundled node24 when this env is
+# set (GitHub's documented transition knob). Node 24 is the platform default as of
+# 2026-06-16; this env keeps the fleet on node24 even if the server flag rolls back.
+
+# Install HTTPS transport and CA certificates first to support secure updates.
+RUN apt-get update \
+      && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      ca-certificates \
+      apt-transport-https
+RUN rm -rf /var/lib/apt/lists/*
+
+# Enforce HTTPS-only trusted mirrors for Debian repositories (both the legacy
+# one-line format and the newer DEB822 .sources format may be present).
+RUN sed -i 's|http://|https://|g' /etc/apt/sources.list 2>/dev/null \
+      || true
+RUN sed -i 's|http://|https://|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null \
+      || true
+
+# Always refresh indexes and apply upgrades before installing packages so the
+# snapshot is not baked from a stale base layer.
+RUN apt-get update \
+      && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
+      -o Dpkg::Options::="--force-confdef" \
+      -o Dpkg::Options::="--force-confold" \
+      && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      curl \
+      git \
+      jq \
+      tar \
+      gzip \
+      coreutils \
+      bash \
+      sudo
+RUN rm -rf /var/lib/apt/lists/*
+RUN useradd -m -u "${RUNNER_UID}" -s /bin/bash "${RUNNER_USER}"
+
+# gitleaks pinned binary → /usr/local/bin (fleet-security / secret scan jobs)
+RUN curl -fsSL -o /tmp/gitleaks.tar.gz \
+      "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+RUN echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tar.gz" | sha256sum -c -
+RUN tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+RUN install -m 755 /tmp/gitleaks /usr/local/bin/gitleaks
+RUN rm -f /tmp/gitleaks /tmp/gitleaks.tar.gz
+RUN gitleaks version
+
+# Seed dir holds extracted runner; snapshot volume mounts over RUNNER_HOME at runtime.
+RUN mkdir -p /opt/actions-runner-seed "${RUNNER_HOME}"
+WORKDIR /opt/actions-runner-seed
+RUN curl -fsSL -o actions-runner.tar.gz \
+      "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-${RUNNER_ARCH}-${RUNNER_VERSION}.tar.gz"
+RUN echo "${RUNNER_SHA256}  actions-runner.tar.gz" \
+      | sha256sum -c -
+RUN tar xzf actions-runner.tar.gz
+RUN rm actions-runner.tar.gz
+RUN ./bin/installdependencies.sh
+RUN rm -rf /var/lib/apt/lists/*
+RUN chown -R "${RUNNER_USER}:${RUNNER_USER}" /opt/actions-runner-seed "${RUNNER_HOME}"
+
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod 755 /entrypoint.sh
+RUN chown "${RUNNER_USER}:${RUNNER_USER}" /entrypoint.sh
+
+USER runner
+WORKDIR /opt/actions-runner
+
+ENTRYPOINT ["/entrypoint.sh"]
