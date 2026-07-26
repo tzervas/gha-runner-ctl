@@ -11,8 +11,8 @@ jobs:
     # `large` is a fleet size label (4c/8g) so rustup+cargo are not OOM-killed (exit 137).
     runs-on: [self-hosted, linux, x64, podman, large]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.96
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.97
         with:
           components: clippy, rustfmt
       - name: fmt

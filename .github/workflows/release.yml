@@ -16,11 +16,11 @@ jobs:
   dist-linux-x64:
     runs-on: [self-hosted, linux, x64, podman]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
-      - uses: dtolnay/rust-toolchain@1.96
+      - uses: dtolnay/rust-toolchain@1.97
 
       - name: Ensure GitHub CLI
         run: |

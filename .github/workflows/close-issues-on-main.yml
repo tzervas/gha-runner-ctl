@@ -40,7 +40,7 @@ jobs:
        (github.event.pull_request.base.ref == 'main' ||
         github.event.pull_request.base.ref == 'master'))
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Close linked issues (main only)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
