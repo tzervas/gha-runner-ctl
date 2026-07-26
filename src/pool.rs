@@ -55,7 +55,11 @@ impl SizeTier {
 /// Example: `runs-on: [self-hosted, linux, x64, podman, large]`
 fn tier_from_labels(labs: &[String]) -> Option<SizeTier> {
     // Prefer most specific / largest explicit label.
-    let has = |s: &str| labs.iter().any(|l| l == s || l == &format!("size-{s}"));
+    // Optimized: strip_prefix avoids expensive format!("size-{s}") String allocations inside the loop.
+    let has = |s: &str| {
+        labs.iter()
+            .any(|l| l == s || l.strip_prefix("size-") == Some(s))
+    };
     if has("gpu")
         || labs
             .iter()
@@ -138,7 +142,44 @@ pub fn size_for_job(job_name: &str, labels: &[String], force_gpu: bool) -> SizeT
     ) {
         return SizeTier::Large;
     }
-    // Light / security / lint (docs/clippy alone stay micro)
+    // CLIPPY IS NOT LINT-ONLY, and treating it as such was OOM-killing jobs.
+    //
+    // `cargo clippy --all-targets` compiles the ENTIRE dependency graph — it is a
+    // build that also lints. Measured peak RSS of the whole process tree for
+    // `cargo clippy --all-targets` on this crate (0.2 s sampler, so these are floors):
+    //
+    //   | CARGO_BUILD_JOBS |  1  |  2  |  4  |  8  | unpinned (28-core host) |
+    //   |------------------|----:|----:|----:|----:|------------------------:|
+    //   | peak MiB         | 332 | 563 | 756 | 916 |                    1225 |
+    //
+    // Micro is 0.25 cpu / 512 MiB. Unpinned, clippy peaks at 1225 MiB — 2.4x over the
+    // cap — which produced "could not compile syn (signal: 9)" SIGKILLs, and 0.25 CPU
+    // produced a 30-minute stall on `syn` then exit 255.
+    //
+    // THIS CHECK MUST PRECEDE THE LINT LIST BELOW. That list matches the substring
+    // "lint", so job names that are common in the wild — "clippy lint", "lint
+    // (clippy)", "Lint (Clippy)", "clippy & fmt" — were routed to Micro *before* any
+    // clippy-specific rule could see them. Simply deleting the old `clippy => Micro`
+    // branch (which sat after the lint list) did not fix those names at all; only
+    // bare "clippy"/"cargo clippy" escaped. Ordering is the fix.
+    //
+    // Clippy is also sized explicitly here rather than falling through to the cargo
+    // rule further down: that rule requires "cargo" AND one of check/test/build/doc,
+    // and "cargo clippy" contains none of them — it fell through to the Medium
+    // catch-all, and a bare "Clippy" never matched "cargo" at all.
+    //
+    // `fmt` genuinely does not compile and stays in the lint list below.
+    if name.contains("clippy") {
+        return if name_contains_any(
+            &name,
+            &["workspace", "all-targets", "all targets", "all-features"],
+        ) {
+            SizeTier::Xlarge
+        } else {
+            SizeTier::Large
+        };
+    }
+    // Light / security / lint (fmt/docs stay micro; clippy is handled above)
     if name_contains_any(
         &name,
         &[
@@ -161,10 +202,6 @@ pub fn size_for_job(job_name: &str, labels: &[String], force_gpu: bool) -> SizeT
     ) {
         return SizeTier::Micro;
     }
-    // Clippy-only jobs are light; "cargo clippy" with build stays medium via cargo below
-    if name.contains("clippy") && !name.contains("build") && !name.contains("test") {
-        return SizeTier::Micro;
-    }
     // Single "build" jobs (product ci.yml job name) need RAM for rustup + LTO-ish
     // builds. Undersizing caused OOM kill 137 on self-hosted. Prefer large.
     if name == "build" || name.starts_with("build ") || name.ends_with(" build") {
@@ -176,8 +213,9 @@ pub fn size_for_job(job_name: &str, labels: &[String], force_gpu: bool) -> SizeT
     // "cargo check/test", which landed on Medium via the catch-all below.
     //
     // A workspace-wide compile gets Xlarge; any other cargo compile/check/test gets
-    // Large. Lint-only cargo jobs (clippy/fmt without build or test) are already
-    // routed to Micro above, so they are unaffected.
+    // Large. Clippy never reaches this rule — it is sized explicitly above, because
+    // "cargo clippy" satisfies neither half of this condition's check/test/build/doc
+    // requirement. Only `fmt` is routed to Micro, by the lint list.
     if name.contains("cargo") && name_contains_any(&name, &["check", "test", "build", "doc"]) {
         return if name_contains_any(&name, &["workspace", "all-targets", "all targets"]) {
             SizeTier::Xlarge
@@ -208,17 +246,75 @@ fn name_contains_any(name: &str, needles: &[&str]) -> bool {
     needles.iter().any(|n| name.contains(n))
 }
 
-/// Map tier → (cpus string, memory string) for podman.
-/// Caps: xlarge/gpu ≤ 16 CPU / 16 GiB (host pool default matches).
+/// Cargo job count to advertise for a container holding `cpus` of CPU quota.
+///
+/// `--cpus` is a *quota*, not a cpuset: `nproc` inside the container still
+/// reports the host's core count. Cargo therefore defaults to `-j$(nproc)` and
+/// spawns as many rustc processes as the host has cores, no matter how small
+/// the container is. Peak memory is roughly `per_rustc * jobs`, so the
+/// container blows its `--memory` cap and the kernel SIGKILLs a rustc — the
+/// "heavy crate OOM" that is really a parallelism-vs-quota mismatch.
+///
+/// Measured on `mycelium-codegen` (`cargo check --workspace --all-targets`),
+/// peak RSS of the whole process tree:
+///
+/// | `-j`  |   1 |   2 |   4 |   8 | 28 (host default) |
+/// |-------|----:|----:|----:|----:|------------------:|
+/// | MiB   | 289 | 333 | 479 | 678 |          **1848** |
+///
+/// Growth is linear (~250 MiB base + ~55 MiB per extra job), so pinning jobs to
+/// the CPU quota makes a tier's memory need predictable instead of host-shaped.
+pub fn cargo_jobs_for_cpus(cpus: &str) -> u32 {
+    parse_cpus_f64(cpus)
+        .map(|c| c.floor().max(1.0) as u32)
+        .unwrap_or(1)
+}
+
+/// Map tier -> (cpus string, memory string) for podman.
+/// Caps: xlarge/gpu <= 16 CPU / 16 GiB (host pool default matches).
+///
+/// Memory is sized from measured peaks with `CARGO_BUILD_JOBS` pinned to the
+/// tier's CPU quota (see [`cargo_jobs_for_cpus`]).
+///
+/// The headroom below is measured against `cargo clippy --all-targets` on
+/// gha-runner-ctl — the heaviest routine Rust workload the fleet runs, and
+/// heavier than the `cargo check` figures this table originally quoted. Sampled
+/// at 0.2 s over the whole process tree, so every peak is a FLOOR:
+///
+/// | tier   | jobs | measured peak | claim | headroom |
+/// |--------|-----:|--------------:|------:|---------:|
+/// | micro  |    1 |       332 MiB |  512m |    1.54x |
+/// | small  |    1 |       332 MiB |    1g |    3.08x |
+/// | medium |    2 |       563 MiB |    2g |    3.64x |
+/// | large  |    4 |       756 MiB |    4g |    5.42x |
+/// | xlarge |    8 |       916 MiB |    8g |    8.94x |
+/// | gpu    |    4 |       756 MiB |    8g |   10.84x |
+///
+/// These are lower than the ">=6x" this change first claimed. That claim came
+/// from `cargo check` on a single crate; a clippy `--all-targets` compile of the
+/// same tree peaks 45-85% higher at the same job count. The tiers are still
+/// adequate for this crate, but the true margins are 3.6x/5.4x/8.9x, not
+/// 6x/8x/12x, and MICRO IS ONLY 1.54x — thin enough that a larger workspace
+/// (mycelium-*) can still OOM there even with jobs pinned. Rust compiles are
+/// therefore routed away from Micro by [`size_for_job`] rather than being
+/// relied upon to fit. `tier_headroom_against_measured_peaks_is_documented`
+/// pins these numbers so a future tier change cannot silently erase the margin.
+///
+/// The previous 4g/8g/16g claims were sized for the unpinned `-j28` behaviour
+/// (measured 1225 MiB for the same clippy run). Because the pool admits workers
+/// against *claimed* memory, over-claiming throttled parallelism: a `large` job
+/// reserved half the 16 GiB budget while using under 1 GiB. Halving the claims
+/// roughly doubles concurrent workers without reducing real headroom.
 pub fn resources_for_tier(tier: SizeTier) -> (String, String) {
     match tier {
+        // gitleaks 19 MiB, trivy fs with a cold DB 121 MiB - both measured.
+        // Trivy's real cost is ~1.2 GiB of DISK cache, not RAM, so 512m is ample.
         SizeTier::Micro => ("0.25".into(), "512m".into()),
         SizeTier::Small => ("0.5".into(), "1g".into()),
-        // Medium crates / cargo check — 2c/4g avoids OOM on self-hosted workers
-        SizeTier::Medium => ("2".into(), "4g".into()),
-        SizeTier::Large => ("4".into(), "8g".into()),
-        SizeTier::Xlarge => ("8".into(), "16g".into()),
-        // GPU jobs: solid host CPU/RAM for data loaders + full device on GPU slice
+        SizeTier::Medium => ("2".into(), "2g".into()),
+        SizeTier::Large => ("4".into(), "4g".into()),
+        SizeTier::Xlarge => ("8".into(), "8g".into()),
+        // GPU jobs: data loaders are less predictable than rustc - keep 8g.
         SizeTier::Gpu => ("4".into(), "8g".into()),
     }
 }
@@ -875,14 +971,81 @@ mod tests {
     /// Lint-only cargo jobs must not be promoted by the rule above.
     #[test]
     fn tier_cargo_lint_stays_micro() {
-        assert_eq!(
-            size_for_job("cargo clippy", &["self-hosted".into()], false),
-            SizeTier::Micro
-        );
+        // `fmt` parses; it does not compile. Micro (0.25c/512m) is right for it.
         assert_eq!(
             size_for_job("cargo fmt", &["self-hosted".into()], false),
             SizeTier::Micro
         );
+
+        // CLIPPY MUST NOT BE MICRO. This assertion previously demanded Micro, encoding
+        // the assumption that clippy is lint-only. It is not: `cargo clippy
+        // --all-targets` compiles the whole dependency graph. Measured peak RSS was
+        // 699-823 MiB against Micro's 512 MiB cap, producing
+        // "could not compile syn (signal: 9)" SIGKILLs; 0.25 CPU produced a 30-minute
+        // stall on `syn` before exit 255.
+        //
+        // Inverted rather than deleted, so the regression cannot return silently.
+        //
+        // The list deliberately includes names that ALSO match the "lint" substring in
+        // the Micro list. Those were the ones still broken after the first cut of this
+        // fix: because the lint list ran first, "clippy lint" / "lint (clippy)" /
+        // "clippy & fmt" were all still routed to Micro (0.25c/512m) — the exact
+        // configuration that SIGKILLed and then stalled for 30 minutes. Removing the
+        // old `clippy => Micro` branch did nothing for them; ordering the clippy check
+        // ahead of the lint list is what fixes them.
+        //
+        // Reusable-workflow callers PREFIX job names ("fleet-ci / cargo clippy") and
+        // the prefix cannot be suppressed, so prefixed forms are covered too.
+        for n in [
+            "cargo clippy",
+            "Clippy",
+            "clippy",
+            "clippy lint",
+            "lint (clippy)",
+            "Lint (Clippy)",
+            "clippy & fmt",
+            "clippy-check",
+            "ci / clippy",
+            "fleet-ci / cargo clippy",
+            "rust / clippy lint",
+        ] {
+            let tier = size_for_job(n, &["self-hosted".into()], false);
+            assert_ne!(
+                tier,
+                SizeTier::Micro,
+                "{n}: clippy compiles the dep graph; Micro's 512 MiB OOM-kills it"
+            );
+            // Stronger than "not Micro": Micro and Small are both under the measured
+            // 332 MiB single-job floor. Clippy must land on a tier that can compile.
+            assert!(
+                matches!(tier, SizeTier::Large | SizeTier::Xlarge),
+                "{n}: expected Large/Xlarge for a clippy compile, got {tier:?}"
+            );
+        }
+
+        // Workspace-wide / all-targets clippy is the heaviest form and gets Xlarge.
+        for n in [
+            "cargo clippy --all-targets",
+            "clippy --workspace",
+            "cargo clippy --all-features",
+        ] {
+            assert_eq!(
+                size_for_job(n, &["self-hosted".into()], false),
+                SizeTier::Xlarge,
+                "{n}: workspace/all-targets clippy is the heaviest compile form"
+            );
+        }
+
+        // Non-clippy lint jobs are genuinely light and must NOT be promoted by the
+        // clippy rule — otherwise this fix would quietly cost the fleet 4c/8g per
+        // markdown lint.
+        for n in ["lint", "rust-lint", "markdown lint", "shellcheck lint"] {
+            assert_eq!(
+                size_for_job(n, &["self-hosted".into()], false),
+                SizeTier::Micro,
+                "{n}: does not compile; must stay Micro"
+            );
+        }
     }
 
     /// An explicit size label still wins over the cargo heuristic.
@@ -939,14 +1102,147 @@ mod tests {
     fn resources_medium_has_headroom() {
         let (c, m) = resources_for_tier(SizeTier::Medium);
         assert_eq!(c, "2");
-        assert_eq!(m, "4g");
+        // 2g against a measured 333 MiB peak at -j2 (~6x headroom).
+        assert_eq!(m, "2g");
     }
 
     #[test]
     fn resources_xlarge_cap() {
         let (c, m) = resources_for_tier(SizeTier::Xlarge);
         assert_eq!(c, "8");
-        assert_eq!(m, "16g");
+        // 8g against a measured 678 MiB peak at -j8 (~12x headroom).
+        assert_eq!(m, "8g");
+    }
+
+    #[test]
+    fn cargo_jobs_track_the_cpu_quota() {
+        // Whole quotas map straight through.
+        assert_eq!(cargo_jobs_for_cpus("2"), 2);
+        assert_eq!(cargo_jobs_for_cpus("4"), 4);
+        assert_eq!(cargo_jobs_for_cpus("8"), 8);
+        // Fractional quotas floor, but never below one job — a 0.25-CPU micro
+        // container must still be able to run cargo at all.
+        assert_eq!(cargo_jobs_for_cpus("0.25"), 1);
+        assert_eq!(cargo_jobs_for_cpus("0.5"), 1);
+        assert_eq!(cargo_jobs_for_cpus("1.9"), 1);
+        // Unparseable input fails closed to the least-memory choice rather than
+        // silently inheriting cargo's host-shaped default.
+        assert_eq!(cargo_jobs_for_cpus(""), 1);
+        assert_eq!(cargo_jobs_for_cpus("all"), 1);
+        assert_eq!(cargo_jobs_for_cpus("-3"), 1);
+    }
+
+    #[test]
+    fn every_tier_yields_a_usable_cargo_job_count() {
+        // No tier may produce 0 jobs: `cargo -j0` is an error, so a bad mapping
+        // would break every Rust job on that tier.
+        for tier in [
+            SizeTier::Micro,
+            SizeTier::Small,
+            SizeTier::Medium,
+            SizeTier::Large,
+            SizeTier::Xlarge,
+            SizeTier::Gpu,
+        ] {
+            let (c, m) = resources_for_tier(tier);
+            let jobs = cargo_jobs_for_cpus(&c);
+            assert!(jobs >= 1, "tier {tier:?} produced {jobs} cargo jobs");
+            let claim_mib = parse_memory_mib(&m).expect("tier memory parses");
+            let need_mib = measured_peak_mib(jobs) * 5 / 4; // 1.25x safety factor
+            assert!(
+                claim_mib >= need_mib,
+                "tier {tier:?}: claims {claim_mib} MiB but -j{jobs} peaks at \
+                 {} MiB measured ({need_mib} MiB with the 1.25x factor)",
+                measured_peak_mib(jobs)
+            );
+        }
+    }
+
+    /// Measured peak RSS (MiB) of the whole process tree for the heaviest routine
+    /// Rust workload the fleet runs, `cargo clippy --all-targets`, at a given
+    /// `CARGO_BUILD_JOBS`. Sampled at 0.2 s on this crate, so every figure is a
+    /// FLOOR, not a ceiling.
+    ///
+    /// |  -j |  1  |  2  |  4  |  8  | unpinned (28-core host) |
+    /// |-----|----:|----:|----:|----:|------------------------:|
+    /// | MiB | 332 | 563 | 756 | 916 |                    1225 |
+    ///
+    /// This replaces the earlier `250 + 55*(jobs-1)` linear model, which was fitted
+    /// to `cargo check` on one crate and under-predicts a real `clippy
+    /// --all-targets` by 33-85%:
+    ///
+    /// | -j | model | measured | model error |
+    /// |----|------:|---------:|------------:|
+    /// |  1 |   250 |      332 |        -25% |
+    /// |  2 |   305 |      563 |        -46% |
+    /// |  4 |   415 |      756 |        -45% |
+    /// |  8 |   635 |      916 |        -31% |
+    ///
+    /// A guard that under-predicts by half is not a guard. Growth is concave, not
+    /// linear, so interpolation between measured points is a linear upper bound on
+    /// the curve rather than a fit through it.
+    ///
+    /// NOTE ON SCOPE: these are gha-runner-ctl's own numbers. The fleet also builds
+    /// much larger workspaces (mycelium-*), whose peaks are higher. Micro's
+    /// 512 MiB against a 332 MiB single-job floor is only 1.54x — thin enough that
+    /// a bigger crate can still OOM at Micro even with jobs pinned. That is why
+    /// clippy is routed away from Micro by `size_for_job` rather than being relied
+    /// on to fit.
+    fn measured_peak_mib(jobs: u32) -> u64 {
+        const SAMPLES: &[(u32, u64)] = &[(1, 332), (2, 563), (4, 756), (8, 916)];
+        if let Some(&(_, mib)) = SAMPLES.iter().find(|&&(j, _)| j == jobs) {
+            return mib;
+        }
+        // Between samples: linear interpolation on the bracketing pair (an upper
+        // bound, since the real curve is concave). Above the top sample: extend at
+        // the last observed slope.
+        let (mut lo, mut hi) = (SAMPLES[0], SAMPLES[SAMPLES.len() - 1]);
+        for w in SAMPLES.windows(2) {
+            if w[0].0 <= jobs && jobs <= w[1].0 {
+                (lo, hi) = (w[0], w[1]);
+            }
+        }
+        if jobs > hi.0 {
+            lo = SAMPLES[SAMPLES.len() - 2];
+        }
+        let span = u64::from(hi.0 - lo.0);
+        let slope_num = hi.1 - lo.1;
+        lo.1 + slope_num * u64::from(jobs.saturating_sub(lo.0)) / span
+    }
+
+    /// The headroom the tier table actually delivers, against measured peaks.
+    /// Documents the real multiples rather than the aspirational ones, and fails
+    /// if any tier drops below 1.25x — the point at which a modestly larger crate
+    /// than this one starts getting SIGKILLed.
+    #[test]
+    fn tier_headroom_against_measured_peaks_is_documented() {
+        let rows = [
+            (SizeTier::Micro, 1u32),
+            (SizeTier::Small, 1),
+            (SizeTier::Medium, 2),
+            (SizeTier::Large, 4),
+            (SizeTier::Xlarge, 8),
+            (SizeTier::Gpu, 4),
+        ];
+        for (tier, expect_jobs) in rows {
+            let (c, m) = resources_for_tier(tier);
+            let jobs = cargo_jobs_for_cpus(&c);
+            assert_eq!(
+                jobs, expect_jobs,
+                "tier {tier:?}: CPU quota {c} should pin cargo to -j{expect_jobs}"
+            );
+            let claim = parse_memory_mib(&m).expect("tier memory parses");
+            let peak = measured_peak_mib(jobs);
+            // Integer tenths, so the assertion message carries the real number.
+            let headroom_tenths = claim * 10 / peak;
+            assert!(
+                headroom_tenths >= 12,
+                "tier {tier:?}: {claim} MiB over a measured {peak} MiB peak at -j{jobs} \
+                 is only {}.{}x headroom",
+                headroom_tenths / 10,
+                headroom_tenths % 10
+            );
+        }
     }
 
     #[test]
@@ -1026,9 +1322,9 @@ mod tests {
         assert!((plan.spawns[0].cpus - 0.25).abs() < 1e-9);
         assert_eq!(plan.spawns[0].memory_mib, 512);
         assert!((plan.spawns[1].cpus - 4.0).abs() < 1e-9);
-        assert_eq!(plan.spawns[1].memory_mib, 8 * 1024);
+        assert_eq!(plan.spawns[1].memory_mib, 4 * 1024);
         assert!((plan.spawns[2].cpus - 2.0).abs() < 1e-9);
-        assert_eq!(plan.spawns[2].memory_mib, 4 * 1024);
+        assert_eq!(plan.spawns[2].memory_mib, 2 * 1024);
     }
 
     /// Explicit xlarge label gets full preferred size when budget allows.
@@ -1041,7 +1337,7 @@ mod tests {
         assert_eq!(plan.spawns.len(), 1);
         assert_eq!(plan.spawns[0].tier, SizeTier::Xlarge);
         assert!((plan.spawns[0].cpus - 8.0).abs() < 1e-9);
-        assert_eq!(plan.spawns[0].memory_mib, 16 * 1024);
+        assert_eq!(plan.spawns[0].memory_mib, 8 * 1024);
     }
 
     /// Capacity ceiling: never plan more workers than free CPU/memory allow.

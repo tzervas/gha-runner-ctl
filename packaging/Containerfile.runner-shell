@@ -1,0 +1,72 @@
+# fleet-runner-shell — shell/bash CI class: adds shellcheck, shfmt, bats to
+# fleet-runner-base. Class table (frozen): see packaging/Containerfile.runner-base
+# header and docs/WORK_IMAGES.md.
+#
+# Tag as fleet-runner-shell:<semver>, starting 0.1.0. NEVER :latest.
+#
+# Base choice: FROM fleet-runner-base, not a fresh distro FROM. Every class stacks
+# on the one shared thin base so the runner-agent/git/curl/jq/gitleaks layer is
+# built once and reused, per the frozen "thin and per-class, never one fat base"
+# rule. fleet-runner-base is produced in this same repo/pipeline (not a third-party
+# upstream), so there is no external digest to resolve for it yet — pin
+# `fleet-runner-base:0.1.0@sha256:<digest>` once that image is pushed to a
+# registry; do not invent a digest before then.
+#
+# Why this image exists: tzervas/fleet-config PR #3's `validate` job fails with
+# `shellcheck not installed on runner` — no runner image in any repo currently
+# carries shellcheck. This class is what the `shell` job-label token
+# (`runs-on: [..., podman, <size>, shell]`) should resolve to.
+#
+# Every tool below is a vendor-published, self-contained Linux binary release,
+# downloaded and verified against a pinned upstream sha256 (recomputed by hand on
+# 2026-07-26 from a fresh download of each asset — all matched), matching the
+# gitleaks pattern already established in packaging/Containerfile.
+#
+# Runs as non-root UID 1001 (inherited from fleet-runner-base).
+# Style: one logical step per RUN (no && chains) — matches packaging/Containerfile.
+# After edit: `podman build -f packaging/Containerfile.runner-shell -t fleet-runner-shell:0.1.0 .`
+
+FROM localhost/fleet-runner-base:0.1.0
+
+# shellcheck pin: https://github.com/koalaman/shellcheck/releases/tag/v0.11.0
+ARG SHELLCHECK_VERSION=0.11.0
+ARG SHELLCHECK_SHA256=b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6
+# shfmt pin: https://github.com/mvdan/sh/releases/tag/v3.13.1
+ARG SHFMT_VERSION=3.13.1
+ARG SHFMT_SHA256=fb096c5d1ac6beabbdbaa2874d025badb03ee07929f0c9ff67563ce8c75398b1
+# bats-core pin (GitHub source archive, no compiled binary exists for a shell-script
+# project): https://github.com/bats-core/bats-core/releases/tag/v1.14.0
+ARG BATS_VERSION=1.14.0
+ARG BATS_SHA256=bb537b70b15b732f6d8827dd6578e3d8ce166636ce1f18ea9a074184fcce9177
+
+USER root
+WORKDIR /
+
+# shellcheck pinned binary → /usr/local/bin
+RUN curl -fsSL -o /tmp/shellcheck.tar.gz \
+      "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.gz"
+RUN echo "${SHELLCHECK_SHA256}  /tmp/shellcheck.tar.gz" | sha256sum -c -
+RUN tar -xzf /tmp/shellcheck.tar.gz -C /tmp "shellcheck-v${SHELLCHECK_VERSION}/shellcheck"
+RUN install -m 755 "/tmp/shellcheck-v${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/shellcheck
+RUN rm -rf /tmp/shellcheck.tar.gz "/tmp/shellcheck-v${SHELLCHECK_VERSION}"
+RUN shellcheck --version
+
+# shfmt pinned binary → /usr/local/bin (single static Go binary, no archive)
+RUN curl -fsSL -o /tmp/shfmt \
+      "https://github.com/mvdan/sh/releases/download/v${SHFMT_VERSION}/shfmt_v${SHFMT_VERSION}_linux_amd64"
+RUN echo "${SHFMT_SHA256}  /tmp/shfmt" | sha256sum -c -
+RUN install -m 755 /tmp/shfmt /usr/local/bin/shfmt
+RUN rm -f /tmp/shfmt
+RUN shfmt --version
+
+# bats-core pinned source tarball, installed via its own install.sh → /usr/local
+RUN curl -fsSL -o /tmp/bats-core.tar.gz \
+      "https://github.com/bats-core/bats-core/archive/refs/tags/v${BATS_VERSION}.tar.gz"
+RUN echo "${BATS_SHA256}  /tmp/bats-core.tar.gz" | sha256sum -c -
+RUN tar -xzf /tmp/bats-core.tar.gz -C /tmp
+RUN "/tmp/bats-core-${BATS_VERSION}/install.sh" /usr/local
+RUN rm -rf /tmp/bats-core.tar.gz "/tmp/bats-core-${BATS_VERSION}"
+RUN bats --version
+
+USER runner
+WORKDIR /opt/actions-runner

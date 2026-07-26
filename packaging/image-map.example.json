@@ -7,7 +7,10 @@
     "rocky-9": "docker.io/library/rockylinux:9",
     "fedora-40": "docker.io/library/fedora:40",
     "alpine-3.20": "docker.io/library/alpine:3.20",
-    "custom-ci": "ghcr.io/example/ci-base:2026.07"
+    "custom-ci": "ghcr.io/example/ci-base:2026.07",
+    "base": "ghcr.io/example/fleet-runner-base:0.1.0",
+    "shell": "ghcr.io/example/fleet-runner-shell:0.1.0",
+    "python": "ghcr.io/example/fleet-runner-python:0.1.0"
   },
   "arches": {
     "arm64": "linux/arm64",

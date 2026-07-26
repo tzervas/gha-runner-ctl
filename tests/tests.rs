@@ -124,6 +124,18 @@ fn test_case_insensitive_wake_auth_headers() {
         &format!("X-WaKe-ToKeN: {token}"),
         token
     ));
+
+    // Verify that multi-byte (non-ASCII) strings do not cause panic or crash due to slice boundary issues
+    assert!(!wake_request_line_authorized(
+        "🌟 Authorization: Bearer some_token",
+        token
+    ));
+    assert!(!wake_request_line_authorized(
+        "Authorization: Bearer 🌟",
+        token
+    ));
+    assert!(!wake_request_line_authorized("x-wake-token: 🌟", token));
+    assert!(!wake_request_line_authorized("🌟", token));
 }
 
 #[test]
