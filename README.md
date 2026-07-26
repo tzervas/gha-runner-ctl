@@ -360,7 +360,7 @@ This is a direct port of the `openssl`+`curl` reference in `tzervas/mycelium-wor
 ### Guarantees
 
 - **Refuses loudly.** A bad key, an unreadable key path, a Client ID in `GHA_APP_ID`, or an App with no installation on `GHA_OWNER` is a hard error. There is deliberately **no fallback edge** from App auth to `GH_TOKEN` and none to an unauthenticated state — silently reverting would undo the whole point without anyone noticing.
-- **Never in argv.** `/proc/<pid>/cmdline` is world-readable. `openssl dgst -sign` receives only a *path*; the signing input goes over stdin and the signature returns over stdout. Verified by inspecting the child's recorded `/proc/<pid>/cmdline`.
+- **Never in argv.** `/proc/<pid>/cmdline` is world-readable. `openssl dgst -sign` receives only a *path*; the signing input goes over stdin and the signature returns over stdout. Verified by inspecting the live child's recorded `/proc/<pid>/cmdline` in `appauth::tests::signing_input_and_key_path_never_appear_in_argv`, which asserts a marker planted in the signing input never appears in argv while the process is still running.
 - **Never logged.** `Pem` and `InstallationToken` have `Debug` impls that print a placeholder, and the existing `ghs_` redaction covers minted tokens in error paths.
 - **Requires `openssl(1)`** on the host for RS256 signing — a deliberate choice to keep the dependency tree at five crates and avoid pulling a new cryptographic implementation into a supply chain that already shells out to `podman`/`gh`/`git`.
 

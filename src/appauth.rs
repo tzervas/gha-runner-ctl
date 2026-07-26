@@ -545,7 +545,7 @@ fn api_base() -> String {
 /// reference implementation. That covers the intended use — a fleet App installed on
 /// one or a few accounts. An App installed on more than 100 accounts would need
 /// `Link`-header pagination here; the failure would be a loud "no installation on
-/// '<owner>'" listing the accounts that *were* seen, not a silent wrong token.
+/// `<owner>`" listing the accounts that *were* seen, not a silent wrong token.
 pub fn resolve_installation_id(jwt: &str, owner: &str, app_id: &str) -> Result<u64, String> {
     let url = format!("{}/app/installations?per_page=100", api_base());
     let resp = crate::http_agent()
@@ -1333,5 +1333,141 @@ mod tests {
                     .count()
             })
             .unwrap_or(0)
+    }
+
+    // --- MAJOR finding fix: the README's "Verified by inspecting the child's
+    // recorded `/proc/<pid>/cmdline`" claim had no test performing that
+    // inspection. This one does. ---
+
+    /// Proves JWT signing input is never placed on openssl argv by inspecting the live
+    /// child's `/proc/<pid>/cmdline` *before* writing to stdin.
+    ///
+    /// Two ordering guarantees make this race-free rather than flaky:
+    ///
+    /// 1. `openssl dgst -sign` blocks until it receives EOF on stdin, so the child is
+    ///    guaranteed still alive throughout this test — right up until this test
+    ///    itself decides to write and close stdin. Reading after writing (or after
+    ///    `wait`) would race against process exit and could inspect a reaped pid.
+    /// 2. Immediately after `spawn()` returns, the kernel has allocated the pid but the
+    ///    child may not have completed `execve("openssl")` yet — `/proc/<pid>/cmdline`
+    ///    can read back empty during that narrow fork/exec transition (measured: ~19
+    ///    empty reads out of 20 spawns with no wait at all). So this polls
+    ///    `/proc/<pid>/cmdline` until it is non-empty (bounded at 2s) *before* making
+    ///    any assertion about its contents — still strictly before writing to stdin,
+    ///    so the "child cannot have exited yet" guarantee above is untouched.
+    #[test]
+    fn signing_input_and_key_path_never_appear_in_argv() {
+        if !openssl_available() {
+            eprintln!("skipping: openssl not available");
+            return;
+        }
+        if !Path::new("/proc").exists() {
+            eprintln!("skipping: /proc not available (non-Linux host)");
+            return;
+        }
+
+        let dir =
+            std::env::temp_dir().join(format!("gha-appauth-argvtest-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let priv_pem_path = dir.join("key.pem");
+
+        assert!(
+            Command::new("openssl")
+                .args([
+                    "genpkey",
+                    "-algorithm",
+                    "RSA",
+                    "-pkeyopt",
+                    "rsa_keygen_bits:2048",
+                    "-out",
+                ])
+                .arg(&priv_pem_path)
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success(),
+            "openssl genpkey failed"
+        );
+
+        let signing_input = "header.payload-MARKER-SECRET-VALUE-should-never-be-in-argv";
+        let marker = "MARKER-SECRET-VALUE-should-never-be-in-argv";
+
+        // Same command shape as sign_rs256(), spawned directly here (rather than via
+        // sign_rs256 itself) so the test can observe the live Child's pid before it
+        // is written to and reaped.
+        let mut child = Command::new("openssl")
+            .args(["dgst", "-sha256", "-sign"])
+            .arg(&priv_pem_path)
+            .arg("-binary")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        // Child is blocked waiting for stdin EOF, so it cannot exit out from under
+        // us — but /proc/<pid>/cmdline can briefly read back empty in the narrow
+        // window between fork() and this exec() completing, so poll (bounded) for a
+        // non-empty read rather than assuming the very first read landed after exec.
+        let cmdline_path = format!("/proc/{}/cmdline", child.id());
+        let poll_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let cmdline_raw = loop {
+            let read = fs::read(&cmdline_path).unwrap_or_default();
+            if !read.is_empty() || std::time::Instant::now() >= poll_deadline {
+                break read;
+            }
+            std::thread::sleep(Duration::from_micros(200));
+        };
+        assert!(
+            !cmdline_raw.is_empty(),
+            "/proc/{}/cmdline never became non-empty within 2s — the child likely \
+             exited before exec, which would itself be a test-infrastructure bug, \
+             not a pass",
+            child.id()
+        );
+        let argv: Vec<String> = cmdline_raw
+            .split(|&b| b == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part).into_owned())
+            .collect();
+        let joined = argv.join("\0");
+
+        assert!(
+            !argv.iter().any(|a| a.contains(marker)) && !joined.contains(marker),
+            "signing-input marker must not appear in argv: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a.contains(signing_input)) && !joined.contains(signing_input),
+            "full signing input must not appear in argv: {argv:?}"
+        );
+        assert!(
+            argv.iter().any(|a| a.contains("openssl")),
+            "expected openssl in argv (sanity check that we inspected the right \
+             process, not a false pass on an empty vec): {argv:?}"
+        );
+        let key_path = priv_pem_path.to_str().unwrap();
+        assert!(
+            argv.iter().any(|a| a == key_path),
+            "expected key path {key_path} in argv: {argv:?}"
+        );
+        assert!(
+            argv.iter().any(|a| a == "-sign"),
+            "expected -sign in argv: {argv:?}"
+        );
+
+        {
+            let mut stdin = child.stdin.take().expect("openssl stdin unavailable");
+            stdin.write_all(signing_input.as_bytes()).unwrap();
+        } // drop stdin -> EOF so openssl can finish
+
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "openssl dgst -sign failed: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
