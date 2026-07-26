@@ -24,7 +24,7 @@ jobs:
       rust: ${{ steps.d.outputs.rust }}
       python: ${{ steps.d.outputs.python }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: d
         run: |
           set -euo pipefail
@@ -51,7 +51,7 @@ jobs:
     if: needs.detect.outputs.rust == 'true'
     runs-on: [self-hosted, linux, x64, podman]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Pin to package MSRV / rust-toolchain.toml (1.96). Prefer ambient cargo from the
       # work image when present; otherwise install via rustup (no Docker — Podman fleet).
       - name: Ensure Rust toolchain (1.96)
@@ -90,9 +90,9 @@ jobs:
     if: needs.detect.outputs.python == 'true'
     runs-on: [self-hosted, linux, x64, podman]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
         with:
           version: "latest"
           enable-cache: true

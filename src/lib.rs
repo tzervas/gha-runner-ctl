@@ -255,10 +255,23 @@ pub struct Cli {
     /// When set, **only** these repos are polled (allowlist) — avoids burning the
     /// GitHub API rate limit across hundreds of owned repos.
     /// Example: `tzervas/gha-runner-ctl,tzervas/tg-agent-relay,tzervas/agent-harness`
+    ///
+    /// DEPRECATED (WP-09): this is a flat allowlist, not a preference ordering — the honest
+    /// name is `GHA_ALLOWLIST_REPOS`. `GHA_PREFER_REPOS` still works during the deprecation
+    /// window (a warning is printed) but is ignored if `GHA_ALLOWLIST_REPOS` is also set.
+    /// See `Cli::effective_prefer_repos`.
     #[arg(long, env = "GHA_PREFER_REPOS", global = true)]
     prefer_repos: Option<String>,
 
-    /// Path to prefer-repos file (one `owner/repo` per line and/or CSV). Merged with GHA_PREFER_REPOS.
+    /// Comma-separated `owner/repo` for user-batch demand poll (allowlist, not an ordering).
+    /// Preferred name — supersedes the deprecated `GHA_PREFER_REPOS`. Same semantics: when set,
+    /// only these repos are polled. Example: `tzervas/gha-runner-ctl,tzervas/tg-agent-relay`
+    #[arg(long = "allowlist-repos", env = "GHA_ALLOWLIST_REPOS", global = true)]
+    allowlist_repos: Option<String>,
+
+    /// Path to prefer-repos file (one `owner/repo` per line and/or CSV). Merged with
+    /// GHA_ALLOWLIST_REPOS / GHA_PREFER_REPOS (inline CSV wins over the file — see
+    /// `prefer_repos_list`; a fully-inline allowlist has silently shadowed this file before).
     /// Survives large allowlists without overflowing env. Example: `$XDG_DATA_HOME/.../prefer.list`
     #[arg(long, env = "GHA_PREFER_REPOS_FILE", global = true)]
     prefer_repos_file: Option<String>,
@@ -354,6 +367,36 @@ pub struct Cli {
     platform: Option<String>,
 }
 
+impl Cli {
+    /// Resolves the flat repo allowlist, preferring the honestly-named `GHA_ALLOWLIST_REPOS`
+    /// over the deprecated `GHA_PREFER_REPOS` (WP-09 rename: it's an allowlist, not an
+    /// ordering). If both are set, `GHA_ALLOWLIST_REPOS` wins silently — no need to warn about
+    /// the one being used correctly. If only the old name is set, a one-line deprecation
+    /// warning goes to stderr; the value is still honored — this is a warning window, not a
+    /// breaking change. Do not delete `prefer_repos` parsing without a real deprecation period;
+    /// fleets pin config and won't all move on the same day.
+    fn effective_prefer_repos(&self) -> Option<String> {
+        let v = self.effective_prefer_repos_quiet()?;
+        if self.allowlist_repos.is_none() {
+            eprintln!(
+                "listen: warning: GHA_PREFER_REPOS is deprecated, rename to GHA_ALLOWLIST_REPOS \
+                 (identical flat-allowlist behavior; GHA_PREFER_REPOS support will be removed in \
+                 a future release)"
+            );
+        }
+        Some(v)
+    }
+
+    /// Same resolution as `effective_prefer_repos` but silent — for presence/shape checks
+    /// (e.g. `validate_cli`) that shouldn't print the deprecation warning a second time.
+    fn effective_prefer_repos_quiet(&self) -> Option<String> {
+        self.allowlist_repos
+            .as_ref()
+            .or(self.prefer_repos.as_ref())
+            .cloned()
+    }
+}
+
 #[derive(Debug, Subcommand, Clone)]
 pub enum Cmd {
     /// Obtain work image (build packaging or pull external) + seed runner volume
@@ -439,6 +482,7 @@ pub fn debug_dump_on_error(err: &str) {
         "GHA_USER",
         "GHA_REPO",
         "GHA_PREFER_REPOS",
+        "GHA_ALLOWLIST_REPOS",
         "GHA_MODE",
         "GHA_CONTAINER",
         "GHA_VOLUME",
@@ -2022,10 +2066,9 @@ fn validate_cli(cli: &Cli) -> Result<(), String> {
     match cli.scope {
         Scope::Repo => {
             if cli.repo.is_none() {
-                // `warm` uses prefer_repos only (no single --repo).
+                // `warm` uses the allowlist only (no single --repo).
                 if cli
-                    .prefer_repos
-                    .as_ref()
+                    .effective_prefer_repos_quiet()
                     .is_some_and(|p| !p.trim().is_empty())
                 {
                     // ok
@@ -2060,8 +2103,7 @@ fn validate_cli(cli: &Cli) -> Result<(), String> {
             // or explicit --repo). Multi-repo user-batch still needs ephemeral re-target.
             if matches!(cli.mode, Mode::Retain) {
                 let multi = cli
-                    .prefer_repos
-                    .as_ref()
+                    .effective_prefer_repos_quiet()
                     .map(|p| p.split(',').filter(|x| !x.trim().is_empty()).count() > 1)
                     .unwrap_or(true);
                 if multi && cli.repo.is_none() {
@@ -3273,7 +3315,7 @@ fn update_host_packages() -> Result<(), String> {
 /// Paced batch warm: one retain runner per allowlisted repo (or single --repo).
 /// After this, GitHub pushes jobs to online runners — no demand registration storm.
 fn warm(cli: &Cli, gap_secs: u64, start: bool) -> Result<(), String> {
-    let repos: Vec<String> = if let Some(pref) = cli.prefer_repos.as_ref() {
+    let repos: Vec<String> = if let Some(pref) = cli.effective_prefer_repos() {
         pref.split(',')
             .map(|x| x.trim().to_string())
             .filter(|x| !x.is_empty())
@@ -4097,8 +4139,8 @@ fn prefer_repos_list(cli: &Cli) -> Vec<String> {
             Err(e) => eprintln!("listen: prefer-repos-file {path}: {e}"),
         }
     }
-    if let Some(pref) = cli.prefer_repos.as_ref() {
-        for p in parse_repo_csv(pref) {
+    if let Some(pref) = cli.effective_prefer_repos() {
+        for p in parse_repo_csv(&pref) {
             if !out.contains(&p) {
                 out.push(p);
             }
@@ -5676,6 +5718,7 @@ impl Cli {
             demand_require_labels: self.demand_require_labels.clone(),
             demand_exclude_labels: self.demand_exclude_labels.clone(),
             prefer_repos: self.prefer_repos.clone(),
+            allowlist_repos: self.allowlist_repos.clone(),
             prefer_repos_file: self.prefer_repos_file.clone(),
             priority_repos: self.priority_repos.clone(),
             listen_min_interval: self.listen_min_interval,
@@ -5733,6 +5776,7 @@ struct CliSnap {
     demand_require_labels: Option<String>,
     demand_exclude_labels: Option<String>,
     prefer_repos: Option<String>,
+    allowlist_repos: Option<String>,
     prefer_repos_file: Option<String>,
     priority_repos: Option<String>,
     listen_min_interval: u64,
@@ -5788,6 +5832,7 @@ fn cli_snapshot(cli: &Cli) -> CliSnap {
         demand_require_labels: cli.demand_require_labels.clone(),
         demand_exclude_labels: cli.demand_exclude_labels.clone(),
         prefer_repos: cli.prefer_repos.clone(),
+        allowlist_repos: cli.allowlist_repos.clone(),
         prefer_repos_file: cli.prefer_repos_file.clone(),
         priority_repos: cli.priority_repos.clone(),
         listen_min_interval: cli.listen_min_interval,
@@ -5845,6 +5890,7 @@ fn snap_to_cli(s: &CliSnap) -> Cli {
         demand_require_labels: s.demand_require_labels.clone(),
         demand_exclude_labels: s.demand_exclude_labels.clone(),
         prefer_repos: s.prefer_repos.clone(),
+        allowlist_repos: s.allowlist_repos.clone(),
         prefer_repos_file: s.prefer_repos_file.clone(),
         priority_repos: s.priority_repos.clone(),
         listen_min_interval: s.listen_min_interval,
@@ -6011,6 +6057,42 @@ mod robust_queue_tests {
 
         let _ = fs::remove_file(&empty);
         let _ = fs::remove_file(&live);
+    }
+
+    #[test]
+    fn allowlist_repos_supersedes_deprecated_prefer_repos() {
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from([
+            "gha-runner-ctl",
+            "--allowlist-repos",
+            "owner/a,owner/b",
+            "--prefer-repos",
+            "owner/old",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.effective_prefer_repos_quiet().as_deref(),
+            Some("owner/a,owner/b"),
+            "GHA_ALLOWLIST_REPOS must win when both names are set"
+        );
+    }
+
+    #[test]
+    fn deprecated_prefer_repos_alone_still_resolves() {
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from(["gha-runner-ctl", "--prefer-repos", "owner/old"]).unwrap();
+        assert_eq!(
+            cli.effective_prefer_repos_quiet().as_deref(),
+            Some("owner/old"),
+            "the deprecated name must still work during the deprecation window"
+        );
+    }
+
+    #[test]
+    fn neither_allowlist_name_set_resolves_to_none() {
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from(["gha-runner-ctl"]).unwrap();
+        assert_eq!(cli.effective_prefer_repos_quiet(), None);
     }
 
     #[test]
