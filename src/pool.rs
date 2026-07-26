@@ -55,7 +55,11 @@ impl SizeTier {
 /// Example: `runs-on: [self-hosted, linux, x64, podman, large]`
 fn tier_from_labels(labs: &[String]) -> Option<SizeTier> {
     // Prefer most specific / largest explicit label.
-    let has = |s: &str| labs.iter().any(|l| l == s || l == &format!("size-{s}"));
+    // Optimized: strip_prefix avoids expensive format!("size-{s}") String allocations inside the loop.
+    let has = |s: &str| {
+        labs.iter()
+            .any(|l| l == s || l.strip_prefix("size-") == Some(s))
+    };
     if has("gpu")
         || labs
             .iter()
