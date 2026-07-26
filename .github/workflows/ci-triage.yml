@@ -88,8 +88,20 @@ jobs:
           # re-read from the API now. This fleet has already produced a case where an
           # agent asserted a tag "does not exist" while it did, because it never
           # re-checked after its own attempt was blocked.
-          num="$(gh api "repos/${REPO}/commits/${RUN_SHA}/pulls" \
-                   --jq '[.[] | select(.state == "open")][0].number // empty' 2>/dev/null || true)"
+          # A `gh api` failure (auth, rate limit, 5xx, network) must not look like
+          # "no open PR" -- that would silently take the same "nothing to triage"
+          # exit as a genuine empty result, and this whole loop's entry gate would
+          # never be observed failing. Capture the call's own exit status first.
+          num_file="$(mktemp)"
+          if ! gh api "repos/${REPO}/commits/${RUN_SHA}/pulls" \
+                 --jq '[.[] | select(.state == "open")][0].number // empty' \
+                 >"$num_file" 2>/dev/null; then
+            rm -f "$num_file"
+            echo "::error::gh api failed for repos/${REPO}/commits/${RUN_SHA}/pulls -- cannot determine open PR for ${RUN_SHA}" >&2
+            exit 1
+          fi
+          num="$(cat "$num_file")"
+          rm -f "$num_file"
           if [ -z "$num" ]; then
             echo "::notice::no open PR for ${RUN_SHA} -- nothing to triage"
             echo "skip=no-pr" >> "$GITHUB_OUTPUT"; exit 0
@@ -202,14 +214,26 @@ jobs:
           # the base branch's own most recent completed run of the same workflow --
           # no re-runs, no extra queue pressure.
           wf_file="$(basename "$WF_PATH")"
-          base_concl="$(gh api "repos/${REPO}/actions/workflows/${wf_file}/runs?branch=${BASE_REF}&status=completed&per_page=1" \
-                          --jq '.workflow_runs[0].conclusion // empty' 2>/dev/null || true)"
-          case "$base_concl" in
-            failure) echo "base_state=ALSO FAILING on \`${BASE_REF}\` -- likely pre-existing drift this PR merely exposed, not this PR's defect" ;;
-            success) echo "base_state=passing on \`${BASE_REF}\` -- the defect is most likely in this PR" ;;
-            "")      echo "base_state=UNKNOWN -- \`${WF_NAME}\` has no completed run on \`${BASE_REF}\` to compare against" ;;
-            *)       echo "base_state=inconclusive on \`${BASE_REF}\` (last run: ${base_concl})" ;;
-          esac >> "$GITHUB_OUTPUT"
+          # Same "API failure must not look like an empty/known result" concern as
+          # above, but this check is informational (not a hard exit gate) -- so a
+          # failed `gh api` call gets its own distinct base_state instead of being
+          # folded into the "no completed run" ("") case.
+          base_concl_file="$(mktemp)"
+          if ! gh api "repos/${REPO}/actions/workflows/${wf_file}/runs?branch=${BASE_REF}&status=completed&per_page=1" \
+                 --jq '.workflow_runs[0].conclusion // empty' \
+                 >"$base_concl_file" 2>/dev/null; then
+            rm -f "$base_concl_file"
+            echo "base_state=UNKNOWN (gh api failed -- could not query ${BASE_REF})" >> "$GITHUB_OUTPUT"
+          else
+            base_concl="$(cat "$base_concl_file")"
+            rm -f "$base_concl_file"
+            case "$base_concl" in
+              failure) echo "base_state=ALSO FAILING on \`${BASE_REF}\` -- likely pre-existing drift this PR merely exposed, not this PR's defect" ;;
+              success) echo "base_state=passing on \`${BASE_REF}\` -- the defect is most likely in this PR" ;;
+              "")      echo "base_state=UNKNOWN -- \`${WF_NAME}\` has no completed run on \`${BASE_REF}\` to compare against" ;;
+              *)       echo "base_state=inconclusive on \`${BASE_REF}\` (last run: ${base_concl})" ;;
+            esac >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Read the attempt count from the sticky comment
         id: attempts

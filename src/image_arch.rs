@@ -479,7 +479,7 @@ pub fn binfmt_missing_error(arch: TargetArch) -> String {
 }
 
 /// Ensure binfmt is available when `needs_emulation`. Pure when `entries` is supplied;
-/// host path uses [`read_binfmt_entries`].
+/// host path uses `read_binfmt_entries` (crate-private — not linkable from public docs).
 pub fn ensure_binfmt_for_arch(
     arch: TargetArch,
     needs_emulation: bool,
