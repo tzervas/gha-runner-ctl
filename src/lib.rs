@@ -19,10 +19,10 @@ pub use image_arch::{
     resolve_job_image_arch, ImageMap, JobImageArch, TargetArch,
 };
 pub use pool::{
-    demand_empty_confirmed, empty_sweep_ticks, fit_to_budget, format_cpus, format_memory_mib,
-    is_busy, parse_cpus_f64, parse_memory_mib, plan_scale, resources_for_tier, size_for_job,
-    DemandSignal, ResourcePool, ScaleInput, ScalePlan, SizeTier, SpawnRequest, WorkerSnapshot,
-    DEFAULT_MAX_SPAWN_PER_TICK,
+    cargo_jobs_for_cpus, demand_empty_confirmed, empty_sweep_ticks, fit_to_budget, format_cpus,
+    format_memory_mib, is_busy, parse_cpus_f64, parse_memory_mib, plan_scale, resources_for_tier,
+    size_for_job, DemandSignal, ResourcePool, ScaleInput, ScalePlan, SizeTier, SpawnRequest,
+    WorkerSnapshot, DEFAULT_MAX_SPAWN_PER_TICK,
 };
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -2847,6 +2847,12 @@ fn up(cli: &Cli) -> Result<(), String> {
     let ret = if ephemeral { "false" } else { "true" };
     let eph_kv = format!("RUNNER_EPHEMERAL={eph}");
     let ret_kv = format!("RUNNER_RETAIN={ret}");
+    // `--cpus` is a quota, not a cpuset, so `nproc` in the container still reports
+    // the host's core count and cargo defaults to `-j$(nproc)`. On a 28-core host a
+    // 2-CPU container would spawn 28 rustc and peak ~1.8 GiB instead of ~330 MiB,
+    // blowing the memory cap. Tell cargo the quota it actually has. Jobs may still
+    // override this per-workflow; this only replaces cargo's host-shaped default.
+    let cargo_jobs_kv = format!("CARGO_BUILD_JOBS={}", cargo_jobs_for_cpus(&cli.cpus));
 
     // Host entrypoint for external images (stock image already has ENTRYPOINT).
     let entrypoint_path = if needs_host_entrypoint(cli) {
@@ -2896,6 +2902,8 @@ fn up(cli: &Cli) -> Result<(), String> {
         eph_kv.as_str(),
         "-e",
         ret_kv.as_str(),
+        "-e",
+        cargo_jobs_kv.as_str(),
         "-v",
         vol.as_str(),
     ]);
