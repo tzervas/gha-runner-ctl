@@ -55,7 +55,11 @@ impl SizeTier {
 /// Example: `runs-on: [self-hosted, linux, x64, podman, large]`
 fn tier_from_labels(labs: &[String]) -> Option<SizeTier> {
     // Prefer most specific / largest explicit label.
-    let has = |s: &str| labs.iter().any(|l| l == s || l == &format!("size-{s}"));
+    // Optimized: strip_prefix avoids expensive format!("size-{s}") String allocations inside the loop.
+    let has = |s: &str| {
+        labs.iter()
+            .any(|l| l == s || l.strip_prefix("size-") == Some(s))
+    };
     if has("gpu")
         || labs
             .iter()
@@ -138,7 +142,44 @@ pub fn size_for_job(job_name: &str, labels: &[String], force_gpu: bool) -> SizeT
     ) {
         return SizeTier::Large;
     }
-    // Light / security / lint (docs/clippy alone stay micro)
+    // CLIPPY IS NOT LINT-ONLY, and treating it as such was OOM-killing jobs.
+    //
+    // `cargo clippy --all-targets` compiles the ENTIRE dependency graph — it is a
+    // build that also lints. Measured peak RSS of the whole process tree for
+    // `cargo clippy --all-targets` on this crate (0.2 s sampler, so these are floors):
+    //
+    //   | CARGO_BUILD_JOBS |  1  |  2  |  4  |  8  | unpinned (28-core host) |
+    //   |------------------|----:|----:|----:|----:|------------------------:|
+    //   | peak MiB         | 332 | 563 | 756 | 916 |                    1225 |
+    //
+    // Micro is 0.25 cpu / 512 MiB. Unpinned, clippy peaks at 1225 MiB — 2.4x over the
+    // cap — which produced "could not compile syn (signal: 9)" SIGKILLs, and 0.25 CPU
+    // produced a 30-minute stall on `syn` then exit 255.
+    //
+    // THIS CHECK MUST PRECEDE THE LINT LIST BELOW. That list matches the substring
+    // "lint", so job names that are common in the wild — "clippy lint", "lint
+    // (clippy)", "Lint (Clippy)", "clippy & fmt" — were routed to Micro *before* any
+    // clippy-specific rule could see them. Simply deleting the old `clippy => Micro`
+    // branch (which sat after the lint list) did not fix those names at all; only
+    // bare "clippy"/"cargo clippy" escaped. Ordering is the fix.
+    //
+    // Clippy is also sized explicitly here rather than falling through to the cargo
+    // rule further down: that rule requires "cargo" AND one of check/test/build/doc,
+    // and "cargo clippy" contains none of them — it fell through to the Medium
+    // catch-all, and a bare "Clippy" never matched "cargo" at all.
+    //
+    // `fmt` genuinely does not compile and stays in the lint list below.
+    if name.contains("clippy") {
+        return if name_contains_any(
+            &name,
+            &["workspace", "all-targets", "all targets", "all-features"],
+        ) {
+            SizeTier::Xlarge
+        } else {
+            SizeTier::Large
+        };
+    }
+    // Light / security / lint (fmt/docs stay micro; clippy is handled above)
     if name_contains_any(
         &name,
         &[
@@ -161,10 +202,6 @@ pub fn size_for_job(job_name: &str, labels: &[String], force_gpu: bool) -> SizeT
     ) {
         return SizeTier::Micro;
     }
-    // Clippy-only jobs are light; "cargo clippy" with build stays medium via cargo below
-    if name.contains("clippy") && !name.contains("build") && !name.contains("test") {
-        return SizeTier::Micro;
-    }
     // Single "build" jobs (product ci.yml job name) need RAM for rustup + LTO-ish
     // builds. Undersizing caused OOM kill 137 on self-hosted. Prefer large.
     if name == "build" || name.starts_with("build ") || name.ends_with(" build") {
@@ -176,8 +213,9 @@ pub fn size_for_job(job_name: &str, labels: &[String], force_gpu: bool) -> SizeT
     // "cargo check/test", which landed on Medium via the catch-all below.
     //
     // A workspace-wide compile gets Xlarge; any other cargo compile/check/test gets
-    // Large. Lint-only cargo jobs (clippy/fmt without build or test) are already
-    // routed to Micro above, so they are unaffected.
+    // Large. Clippy never reaches this rule — it is sized explicitly above, because
+    // "cargo clippy" satisfies neither half of this condition's check/test/build/doc
+    // requirement. Only `fmt` is routed to Micro, by the lint list.
     if name.contains("cargo") && name_contains_any(&name, &["check", "test", "build", "doc"]) {
         return if name_contains_any(&name, &["workspace", "all-targets", "all targets"]) {
             SizeTier::Xlarge
@@ -945,14 +983,81 @@ mod tests {
     /// Lint-only cargo jobs must not be promoted by the rule above.
     #[test]
     fn tier_cargo_lint_stays_micro() {
-        assert_eq!(
-            size_for_job("cargo clippy", &["self-hosted".into()], false),
-            SizeTier::Micro
-        );
+        // `fmt` parses; it does not compile. Micro (0.25c/512m) is right for it.
         assert_eq!(
             size_for_job("cargo fmt", &["self-hosted".into()], false),
             SizeTier::Micro
         );
+
+        // CLIPPY MUST NOT BE MICRO. This assertion previously demanded Micro, encoding
+        // the assumption that clippy is lint-only. It is not: `cargo clippy
+        // --all-targets` compiles the whole dependency graph. Measured peak RSS was
+        // 699-823 MiB against Micro's 512 MiB cap, producing
+        // "could not compile syn (signal: 9)" SIGKILLs; 0.25 CPU produced a 30-minute
+        // stall on `syn` before exit 255.
+        //
+        // Inverted rather than deleted, so the regression cannot return silently.
+        //
+        // The list deliberately includes names that ALSO match the "lint" substring in
+        // the Micro list. Those were the ones still broken after the first cut of this
+        // fix: because the lint list ran first, "clippy lint" / "lint (clippy)" /
+        // "clippy & fmt" were all still routed to Micro (0.25c/512m) — the exact
+        // configuration that SIGKILLed and then stalled for 30 minutes. Removing the
+        // old `clippy => Micro` branch did nothing for them; ordering the clippy check
+        // ahead of the lint list is what fixes them.
+        //
+        // Reusable-workflow callers PREFIX job names ("fleet-ci / cargo clippy") and
+        // the prefix cannot be suppressed, so prefixed forms are covered too.
+        for n in [
+            "cargo clippy",
+            "Clippy",
+            "clippy",
+            "clippy lint",
+            "lint (clippy)",
+            "Lint (Clippy)",
+            "clippy & fmt",
+            "clippy-check",
+            "ci / clippy",
+            "fleet-ci / cargo clippy",
+            "rust / clippy lint",
+        ] {
+            let tier = size_for_job(n, &["self-hosted".into()], false);
+            assert_ne!(
+                tier,
+                SizeTier::Micro,
+                "{n}: clippy compiles the dep graph; Micro's 512 MiB OOM-kills it"
+            );
+            // Stronger than "not Micro": Micro and Small are both under the measured
+            // 332 MiB single-job floor. Clippy must land on a tier that can compile.
+            assert!(
+                matches!(tier, SizeTier::Large | SizeTier::Xlarge),
+                "{n}: expected Large/Xlarge for a clippy compile, got {tier:?}"
+            );
+        }
+
+        // Workspace-wide / all-targets clippy is the heaviest form and gets Xlarge.
+        for n in [
+            "cargo clippy --all-targets",
+            "clippy --workspace",
+            "cargo clippy --all-features",
+        ] {
+            assert_eq!(
+                size_for_job(n, &["self-hosted".into()], false),
+                SizeTier::Xlarge,
+                "{n}: workspace/all-targets clippy is the heaviest compile form"
+            );
+        }
+
+        // Non-clippy lint jobs are genuinely light and must NOT be promoted by the
+        // clippy rule — otherwise this fix would quietly cost the fleet 4c/8g per
+        // markdown lint.
+        for n in ["lint", "rust-lint", "markdown lint", "shellcheck lint"] {
+            assert_eq!(
+                size_for_job(n, &["self-hosted".into()], false),
+                SizeTier::Micro,
+                "{n}: does not compile; must stay Micro"
+            );
+        }
     }
 
     /// An explicit size label still wins over the cargo heuristic.
