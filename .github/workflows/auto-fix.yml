@@ -1,0 +1,444 @@
+# Tier 1 of the two-tier auto-fix loop.
+#
+# WHAT IT DOES
+#   Applies MECHANICAL, behaviour-preserving fixes to a pull request's OWN head
+#   branch so the checks re-run and the PR can go green without a human.
+#
+# THE TRAP THIS WORKFLOW IS BUILT AROUND
+#   A push made with GITHUB_TOKEN does NOT trigger workflows. That is deliberate
+#   GitHub behaviour to prevent loops. A fix pushed with the default token would
+#   land on the branch and the checks would NEVER RE-RUN -- the PR sits red with a
+#   fix already applied, which is worse than not fixing it because it looks
+#   handled and is not. So:
+#     * the push uses AUTOFIX_TOKEN (a repo-scoped fine-grained PAT), and
+#     * checkout runs with `persist-credentials: false` so actions/checkout does
+#       NOT leave `http.https://github.com/.extraheader` in .git/config. That
+#       header takes precedence over any credential helper, so leaving it in
+#       place would silently push as GITHUB_TOKEN and re-open the exact trap.
+#   Both are asserted at runtime, not assumed.
+#
+# Full design, closed fix list, token scope and kill switch: docs/AUTO_FIX.md
+name: auto-fix
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+# One run per PR, newest wins. cancel-in-progress is safe HERE because this is
+# pull_request-triggered. It is NOT safe on a scheduled workflow on this fleet: a
+# scheduled self-hosted job queues with no runner, the next schedule cancels it,
+# and it reports `cancelled` rather than `failed` -- i.e. it silently never runs.
+concurrency:
+  group: auto-fix-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+# GITHUB_TOKEN is used for the checkout read and nothing else. Every write goes
+# through AUTOFIX_TOKEN, which is scoped to this repository only.
+permissions:
+  contents: read
+
+env:
+  # Pinned so two runs over the same content produce the same bytes. Bump
+  # deliberately, in its own PR, never as a drive-by.
+  RUFF_VERSION: "0.15.21"
+
+jobs:
+  safe-fix:
+    name: auto-fix (safe fixes only)
+    # EXPLICIT tier label. gha-runner-ctl's size_for_job() checks LABELS BEFORE the
+    # job-name heuristic, so this pins small (0.5 cpu / 1 GiB) deterministically
+    # instead of letting the words "fix"/"fmt"/"format" in the job name route it to
+    # micro (0.25 cpu / 512 MiB). Undersizing is not theoretical here:
+    # `cargo clippy --all-targets` was measured at 1225 MiB against micro's 512 MiB
+    # cap, producing SIGKILLs and a 30-minute stall that looked like a hang.
+    #
+    # small is correct for this job because NOTHING HERE COMPILES: rustfmt and ruff
+    # only, plus a conservative `cargo metadata` for the lockfile refresh. There is
+    # no cargo build, no cargo check and no clippy. `small` is also the only tier
+    # label currently registered on an online worker in this fleet.
+    runs-on: [self-hosted, linux, x64, podman, small]
+
+    # Gate 1 of 3 on the blast radius. The other two are re-asserted in-job, after
+    # checkout and again immediately before the push, because an `if:` expression is
+    # evaluated once against event payload that the job then never re-reads.
+    #
+    #  * AUTOFIX_ENABLED  -- repository VARIABLE, not a secret. Ships absent, so this
+    #                        workflow is INERT until an operator opts in. Also the
+    #                        kill switch: `gh variable set AUTOFIX_ENABLED --body false`.
+    #  * head.repo        -- same-repo PRs only. A fork PR's head branch is
+    #                        attacker-controlled; pushing to it with our token is a
+    #                        credential-exposure path. (`pull_request` also withholds
+    #                        secrets from forks, so this is belt and braces -- and the
+    #                        reason this workflow does NOT use pull_request_target.)
+    if: >-
+      vars.AUTOFIX_ENABLED == 'true' &&
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
+
+    steps:
+      - name: Blast-radius guard (pre-checkout)
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          THIS_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ "$HEAD_REPO" != "$THIS_REPO" ]; then
+            echo "::error::head repo '$HEAD_REPO' is not '$THIS_REPO' -- refusing" >&2
+            exit 1
+          fi
+          # Refuse to touch any trunk. This workflow pushes ONLY to a PR's own work
+          # branch; a PR whose head IS a trunk is a sync or release PR and must be
+          # resolved by a human.
+          case "$HEAD_REF" in
+            main|master|dev|sec|release/*)
+              echo "::error::refusing to auto-fix trunk branch '$HEAD_REF'" >&2
+              exit 1 ;;
+          esac
+          # Reject anything that is not a plain branch name -- cheap defence against a
+          # ref crafted to be reinterpreted as an option or a path traversal.
+          case "$HEAD_REF" in
+            ""|-*|*" "*|*".."*|*"~"*|*"^"*|*":"*|*"?"*|*"*"*|*"["*|*"\\"*)
+              echo "::error::refusing suspicious head ref '$HEAD_REF'" >&2
+              exit 1 ;;
+          esac
+          printf 'guard ok: head=%s repo=%s\n' "$HEAD_REF" "$THIS_REPO"
+
+      - name: Checkout PR head (no persisted credentials)
+        uses: actions/checkout@v4
+        with:
+          # The exact SHA the run was triggered for, so the fix is computed against
+          # known content. If the branch moved on since, the plain (non-force) push
+          # below is rejected and the run reports "superseded" -- never a clobber.
+          # This workflow never force-pushes.
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          # Load-bearing -- see the header comment.
+          persist-credentials: false
+
+      - name: Assert no GITHUB_TOKEN credential survived checkout
+        run: |
+          set -euo pipefail
+          leftover="$(git config --local --get-regexp 'http\..*\.extraheader' || true)"
+          if [ -n "$leftover" ]; then
+            echo "::error::actions/checkout left an auth extraheader in .git/config." >&2
+            echo "::error::A push would use GITHUB_TOKEN and the checks would NOT re-run." >&2
+            exit 1
+          fi
+          if git config --local --get remote.origin.url | grep -qi '@github.com'; then
+            echo "::error::origin URL carries embedded credentials -- refusing" >&2
+            exit 1
+          fi
+          echo "no persisted push credential -- good"
+
+      - name: Resolve base branch (best effort, read-only)
+        id: base
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          # checkout by SHA does not create origin/<base>, so fetch it explicitly.
+          # Anonymous because no push credential is persisted; both fleet repos are
+          # public. Failure is tolerated and handled by the callers below, each of
+          # which fails CLOSED (does less, never more) when the base is unknown.
+          git fetch --no-tags --quiet origin \
+            "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}" 2>/dev/null || true
+          if git rev-parse --verify --quiet "refs/remotes/origin/${BASE_REF}" >/dev/null; then
+            echo "have_base=true" >> "$GITHUB_OUTPUT"
+            echo "base resolved: origin/${BASE_REF}"
+          else
+            echo "have_base=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::could not resolve origin/${BASE_REF}; the secondary loop bound and the lockfile refresh are both disabled for this run (fail closed)."
+          fi
+
+      - name: Loop bound
+        id: bound
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HAVE_BASE: ${{ steps.base.outputs.have_base }}
+        run: |
+          set -euo pipefail
+          # BOUND 1 -- load-bearing, purely local, always evaluable.
+          # Never auto-fix on top of our own auto-fix. Our push re-triggers this
+          # workflow (that is the whole point of using a non-default token), so
+          # without this the pair could ping-pong. HEAD being an auto-fix commit
+          # means the previous round already ran and nothing new arrived from a
+          # human. Consequence: at most ONE auto-fix commit per human push, ever.
+          if git log -1 --format='%B' | grep -qF 'Auto-Fix-Bot: safe-fixes'; then
+            echo "HEAD is already an auto-fix commit -- stopping (loop bound 1)"
+            echo "skip=already-autofixed" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # BOUND 2 -- secondary net, needs the base. Caps total auto-fix commits on
+          # one branch, catching a formatter that oscillates between two outputs.
+          if [ "$HAVE_BASE" = "true" ]; then
+            n="$(git log --format='%B' "origin/${BASE_REF}..HEAD" | grep -cF 'Auto-Fix-Bot: safe-fixes' || true)"
+            n="${n:-0}"
+            echo "auto-fix commits already on this branch: $n"
+            if [ "$n" -ge 3 ]; then
+              echo "::error::3 auto-fix commits already on this branch -- refusing a 4th." >&2
+              echo "::error::A formatter that keeps changing its own output is a real defect." >&2
+              exit 1
+            fi
+          fi
+          echo "skip=" >> "$GITHUB_OUTPUT"
+
+      - name: Detect stack
+        id: stack
+        if: steps.bound.outputs.skip == ''
+        run: |
+          set -euo pipefail
+          rust=false; cargo=false; python=false
+          # Require an actual .rs file, not just a Cargo.toml: a workspace with
+          # `members = []` has no targets and `cargo fmt --all` is a confusing no-op.
+          [ -f Cargo.toml ] && cargo=true
+          if [ "$cargo" = true ] && git ls-files -- '*.rs' | head -1 | grep -q .; then rust=true; fi
+          if [ -f pyproject.toml ] && git ls-files -- '*.py' '*.pyi' | head -1 | grep -q .; then python=true; fi
+          # A Cargo.lock with no .rs anywhere still needs cargo for the lock refresh.
+          if [ -f Cargo.lock ]; then cargo=true; fi
+          echo "rust=$rust"     >> "$GITHUB_OUTPUT"
+          echo "cargo=$cargo"   >> "$GITHUB_OUTPUT"
+          echo "python=$python" >> "$GITHUB_OUTPUT"
+          printf 'rust=%s cargo=%s python=%s\n' "$rust" "$cargo" "$python"
+
+      - name: Rust toolchain
+        if: steps.bound.outputs.skip == '' && steps.stack.outputs.cargo == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Install uv
+        if: steps.bound.outputs.skip == '' && steps.stack.outputs.python == 'true'
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "latest"
+          enable-cache: true
+
+      # -----------------------------------------------------------------------
+      # THE CLOSED SAFE-FIX LIST. Nothing outside these four may ever be applied.
+      # Adding to this list is a design decision, not a maintenance edit -- read
+      # docs/AUTO_FIX.md before touching it.
+      # -----------------------------------------------------------------------
+
+      - name: Safe fix 1 of 4 -- cargo fmt
+        if: steps.bound.outputs.skip == '' && steps.stack.outputs.rust == 'true'
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          echo "cargo fmt --all done"
+
+      - name: Safe fix 2 of 4 -- ruff format
+        if: steps.bound.outputs.skip == '' && steps.stack.outputs.python == 'true'
+        run: |
+          set -euo pipefail
+          # Run via `uvx` WITHOUT installing the project, so no build backend,
+          # setup.py or plugin from the PR is executed by the fixer.
+          uvx "ruff@${RUFF_VERSION}" format .
+          echo "ruff format done"
+
+      - name: Safe fix 3 of 4 -- ruff check --fix (SAFE rules only)
+        if: steps.bound.outputs.skip == '' && steps.stack.outputs.python == 'true'
+        run: |
+          set -euo pipefail
+          # --no-unsafe-fixes is stated explicitly even though safe-only is the
+          # default: this is the one flag whose accidental flip would let the
+          # workflow change behaviour.
+          #
+          # `|| true` because leftover UNFIXABLE violations are a real defect for the
+          # CI lint gate to report -- not something this job should swallow, and not
+          # something it should go red over. Its job is to apply what it safely can.
+          uvx "ruff@${RUFF_VERSION}" check --fix --no-unsafe-fixes . || true
+          echo "ruff check --fix done"
+
+      - name: Safe fix 4 of 4 -- lockfile refresh (only if the manifest changed)
+        id: lock
+        if: steps.bound.outputs.skip == ''
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HAVE_BASE: ${{ steps.base.outputs.have_base }}
+        run: |
+          set -euo pipefail
+          allow_cargo=0
+          allow_uv=0
+          if [ "$HAVE_BASE" != "true" ]; then
+            echo "base unknown -- cannot prove a manifest changed, so lockfiles are left alone"
+          else
+            base="$(git merge-base "origin/${BASE_REF}" HEAD)"
+            changed="$(git diff --name-only "$base" HEAD || true)"
+            # A lockfile is only ever refreshed to match a manifest change made BY
+            # THIS PR. Refreshing an untouched lock is a dependency bump wearing a
+            # hat, and dependency bumps are explicitly NOT a safe fix.
+            if printf '%s\n' "$changed" | grep -qE '(^|/)Cargo\.toml$' && [ -f Cargo.lock ]; then
+              allow_cargo=1
+              # `cargo metadata` re-resolves CONSERVATIVELY: existing locked versions
+              # are kept wherever they still satisfy the manifest. It does not
+              # compile and does not run build scripts. `cargo update` would upgrade
+              # transitive dependencies and is deliberately not used.
+              cargo metadata --format-version 1 >/dev/null
+              echo "Cargo.lock refreshed against the Cargo.toml change in this PR"
+            fi
+            if printf '%s\n' "$changed" | grep -qE '(^|/)pyproject\.toml$' && [ -f uv.lock ]; then
+              allow_uv=1
+              # `uv lock` is likewise conservative: existing pins survive unless the
+              # manifest forces a change. NOT `uv lock --upgrade`.
+              uv lock
+              echo "uv.lock refreshed against the pyproject.toml change in this PR"
+            fi
+            if [ "$allow_cargo" = 0 ] && [ "$allow_uv" = 0 ]; then
+              echo "no manifest change in this PR -- lockfiles left untouched"
+            fi
+          fi
+          echo "allow_cargo=$allow_cargo" >> "$GITHUB_OUTPUT"
+          echo "allow_uv=$allow_uv"       >> "$GITHUB_OUTPUT"
+
+      - name: Stage against the allowlist
+        id: stage
+        if: steps.bound.outputs.skip == ''
+        env:
+          ALLOW_CARGO: ${{ steps.lock.outputs.allow_cargo }}
+          ALLOW_UV: ${{ steps.lock.outputs.allow_uv }}
+        run: |
+          set -euo pipefail
+          # `git add -u` updates TRACKED files only, so the auto-fixer cannot
+          # introduce a new file under any circumstance.
+          git add -u
+          git diff --cached --name-only > /tmp/autofix-staged.txt
+          if [ ! -s /tmp/autofix-staged.txt ]; then
+            echo "nothing to fix"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Every staged path is checked against the allowlist; anything else aborts
+          # the run WITHOUT pushing. This is the enforcement point for "safe fix is a
+          # closed list" -- the tool invocations above are the intent, this is the
+          # proof.
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            case "$f" in
+              # Explicit DENY first: `.github/scripts/x.py` would otherwise match the
+              # *.py allow rule below and let the fixer edit CI itself.
+              .github/*|*/.github/*)
+                echo "::error::refusing to stage CI configuration: $f" >&2; exit 1 ;;
+            esac
+            case "$f" in
+              *.rs|*.py|*.pyi) ;;
+              Cargo.lock)
+                [ "$ALLOW_CARGO" = 1 ] || { echo "::error::Cargo.lock changed with no Cargo.toml change in this PR" >&2; exit 1; } ;;
+              uv.lock)
+                [ "$ALLOW_UV" = 1 ] || { echo "::error::uv.lock changed with no pyproject.toml change in this PR" >&2; exit 1; } ;;
+              *)
+                echo "::error::$f is outside the safe-fix allowlist -- refusing to push" >&2
+                echo "::error::allowlist: *.rs *.py *.pyi, plus Cargo.lock/uv.lock on a manifest change" >&2
+                exit 1 ;;
+            esac
+          done < /tmp/autofix-staged.txt
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "staged:"; cat /tmp/autofix-staged.txt
+          {
+            printf '### auto-fix -- files changed\n\n```\n'
+            cat /tmp/autofix-staged.txt
+            printf '```\n\n<details><summary>diff</summary>\n\n```diff\n'
+            git diff --cached | head -c 40000
+            printf '\n```\n\n</details>\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Require AUTOFIX_TOKEN (only once there is something to push)
+        if: steps.stage.outputs.changed == 'true'
+        env:
+          AUTOFIX_TOKEN: ${{ secrets.AUTOFIX_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Deliberate ordering. "Secret missing" is a failure only once a fix
+          # actually needs pushing -- that is the "could not tell whether it landed"
+          # case and it must be LOUD. Failing on a PR with nothing to fix would be a
+          # false red, and false reds train people to ignore red.
+          if [ -z "${AUTOFIX_TOKEN:-}" ]; then
+            echo "::error::AUTOFIX_TOKEN is not set, but this PR has safe fixes to push." >&2
+            echo "::error::Create a FINE-GRAINED PAT scoped to THIS REPOSITORY ONLY with" >&2
+            echo "::error::  Repository permissions -> Contents: Read and write" >&2
+            echo "::error::and nothing else, then set it:" >&2
+            echo "::error::  gh secret set AUTOFIX_TOKEN -R ${GITHUB_REPOSITORY}" >&2
+            echo "::error::See docs/AUTO_FIX.md. Refusing to push with GITHUB_TOKEN: such a push" >&2
+            echo "::error::does not trigger workflows, so the checks would never re-run." >&2
+            exit 1
+          fi
+          echo "AUTOFIX_TOKEN present"
+
+      - name: Commit and push to the PR head branch
+        id: push
+        if: steps.stage.outputs.changed == 'true'
+        env:
+          AUTOFIX_TOKEN: ${{ secrets.AUTOFIX_TOKEN }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # BLAST-RADIUS GUARD, re-asserted immediately before the push. The
+          # pre-checkout check ran minutes ago against the event payload; this one
+          # runs against the ref we are actually about to write to.
+          case "$HEAD_REF" in
+            main|master|dev|sec|release/*)
+              echo "::error::refusing to push to trunk branch '$HEAD_REF'" >&2
+              exit 1 ;;
+            ""|-*|*" "*|*".."*|*":"*)
+              echo "::error::refusing suspicious head ref '$HEAD_REF'" >&2
+              exit 1 ;;
+          esac
+
+          git config user.name  'auto-fix[bot]'
+          git config user.email 'auto-fix@users.noreply.github.com'
+          git commit -q \
+            -m 'style(auto-fix): apply mechanical safe fixes' \
+            -m "Applied by .github/workflows/auto-fix.yml on PR #${PR_NUMBER}." \
+            -m 'Closed list only: cargo fmt, ruff format, ruff check --fix (safe rules), and a lockfile refresh matching a manifest change in this PR. No behaviour change.' \
+            -m 'Auto-Fix-Bot: safe-fixes'
+
+          git remote set-url origin "https://github.com/${REPO}.git"
+
+          # The token is handed to git over a PIPE (the credential helper's stdout
+          # into git's stdin) and read from the environment. It is never an argv
+          # element: /proc/<pid>/cmdline is world-readable, /proc/<pid>/environ is
+          # not. `-c credential.helper=` first clears any inherited helper so ours is
+          # the only one consulted. Single quotes keep this shell from expanding
+          # $AUTOFIX_TOKEN -- git's helper subshell expands it, from the environment.
+          set +e
+          git -c 'credential.helper=' \
+              -c 'credential.helper=!f() { printf "username=x-access-token\npassword=%s\n" "$AUTOFIX_TOKEN"; }; f' \
+              push origin "HEAD:refs/heads/${HEAD_REF}" >/tmp/push.out 2>/tmp/push.err
+          rc=$?
+          set -e
+          cat /tmp/push.out || true
+          cat /tmp/push.err >&2 || true
+          if [ "$rc" -ne 0 ]; then
+            if grep -qiE 'non-fast-forward|fetch first|rejected' /tmp/push.err; then
+              # Someone pushed while we were working, and a newer run is already
+              # going for that newer SHA -- so there is nothing left for THIS run to
+              # do. Never force-push over it.
+              echo "::notice::superseded by a newer push to ${HEAD_REF} -- nothing to do"
+              echo "pushed=superseded" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::error::push failed -- see the git output above" >&2
+            exit "$rc"
+          fi
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+          echo "::notice::safe fixes pushed to ${HEAD_REF}; checks re-run on the new commit"
+
+      - name: Summary
+        if: always() && steps.bound.outputs.skip == ''
+        env:
+          PUSHED: ${{ steps.push.outputs.pushed }}
+          CHANGED: ${{ steps.stage.outputs.changed }}
+        run: |
+          set -euo pipefail
+          if [ "${CHANGED:-}" != "true" ]; then
+            printf '### auto-fix\n\nNothing to fix. Exiting 0 -- an empty result is a real answer.\n' \
+              >> "$GITHUB_STEP_SUMMARY"
+          elif [ "${PUSHED:-}" = "superseded" ]; then
+            printf '### auto-fix\n\nSuperseded by a newer push; a later run owns this branch.\n' \
+              >> "$GITHUB_STEP_SUMMARY"
+          elif [ "${PUSHED:-}" = "true" ]; then
+            printf '### auto-fix\n\nSafe fixes pushed with `AUTOFIX_TOKEN`. Checks re-run on the new commit.\n' \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
