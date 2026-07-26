@@ -106,6 +106,12 @@ jobs:
           test -f "$ARCHIVE" && test -f "$SUMS"
           # Create the annotated tag if it is not already present (belt-and-suspenders with the gate).
           if ! git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            # An ANNOTATED tag records a tagger, so it needs an identity. Self-hosted runners
+            # have none configured (the container reports runner@<hostid>.(none)), which fails
+            # with "Committer identity unknown" — exit 128, at the tag step, after the build
+            # already succeeded. Set it locally rather than --global so nothing leaks between jobs.
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git tag -a "${TAG}" -m "gha-runner-ctl ${TAG}"
             git push origin "${TAG}"
           fi
