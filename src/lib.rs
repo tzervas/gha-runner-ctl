@@ -848,30 +848,14 @@ pub fn is_safe_image(s: &str) -> bool {
     if s.is_empty() || s.len() > 384 || s.contains("..") {
         return false;
     }
-    // No whitespace or shell metacharacters.
-    if s.chars().any(|c| {
-        c.is_ascii_whitespace()
-            || matches!(
-                c,
-                ';' | '|'
-                    | '&'
-                    | '$'
-                    | '`'
-                    | '('
-                    | ')'
-                    | '<'
-                    | '>'
-                    | '\''
-                    | '"'
-                    | '\\'
-                    | '\n'
-                    | '\r'
-            )
-    }) {
-        return false;
+    // Verify that every character is ASCII alphanumeric or an allowed registry symbol.
+    // This naturally rejects whitespace and shell metacharacters.
+    for c in s.chars() {
+        if !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | '@')) {
+            return false;
+        }
     }
-    s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | '@'))
+    true
 }
 
 /// Stock packaging default tag (only used by `ImageMode::Auto` convenience).
@@ -949,14 +933,21 @@ pub fn pull_policy_arg(p: &PullPolicy) -> &'static str {
 }
 
 pub fn is_safe_labels(s: &str) -> bool {
-    let parts: Vec<&str> = s
-        .split(',')
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .collect();
-    !parts.is_empty()
-        && parts.len() <= 16
-        && parts.iter().all(|p| is_safe_ident(p) && p.len() <= 64)
+    let mut count = 0;
+    for p in s.split(',') {
+        let trimmed = p.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        count += 1;
+        if count > 16 {
+            return false;
+        }
+        if trimmed.len() > 64 || !is_safe_ident(trimmed) {
+            return false;
+        }
+    }
+    count > 0
 }
 
 pub fn is_safe_cpus(s: &str) -> bool {
@@ -985,8 +976,7 @@ pub fn is_safe_memory(s: &str) -> bool {
 }
 
 pub fn redact(s: &str) -> String {
-    let mut out = s.to_string();
-    for key in [
+    let keys = [
         "ghp_",
         "gho_",
         "ghu_",
@@ -995,7 +985,21 @@ pub fn redact(s: &str) -> String {
         "github_pat_",
         "Bearer ",
         "RUNNER_TOKEN=",
-    ] {
+    ];
+    let has_any = keys.iter().any(|&k| s.contains(k));
+    if !has_any {
+        if s.len() <= 400 {
+            return s.to_string();
+        } else {
+            let mut truncate_at = 400;
+            while truncate_at > 0 && !s.is_char_boundary(truncate_at) {
+                truncate_at -= 1;
+            }
+            return format!("{}…", &s[..truncate_at]);
+        }
+    }
+    let mut out = s.to_string();
+    for key in keys {
         let mut start_search_idx = 0;
         while start_search_idx < out.len() {
             if let Some(offset) = out[start_search_idx..].find(key) {
@@ -1364,7 +1368,7 @@ struct Config {
 }
 
 #[cfg(unix)]
-fn chmod_0600(path: &Path) -> Result<(), String> {
+pub(crate) fn chmod_0600(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     let mut perms = fs::metadata(path)
         .map_err(|e| format!("Failed to read metadata for {}: {e}", path.display()))?
@@ -1372,6 +1376,28 @@ fn chmod_0600(path: &Path) -> Result<(), String> {
     perms.set_mode(0o600);
     fs::set_permissions(path, perms)
         .map_err(|e| format!("Failed to set permissions on {}: {e}", path.display()))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn chmod_0600(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+pub(crate) fn write_secure_file(path: &Path, content: &str) -> Result<(), String> {
+    let mut opts = OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
+        .open(path)
+        .map_err(|e| format!("Failed to open {}: {e}", path.display()))?;
+    f.write_all(content.as_bytes())
+        .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
+    chmod_0600(path)?;
+    Ok(())
 }
 
 fn load_config() -> Option<Config> {
@@ -1925,20 +1951,29 @@ fn pace_registration(cli: &Cli) -> Result<(), String> {
     let max_hour = cli.reg_max_per_hour.clamp(1, 500);
     // Spin gently: registration is rare if retain; ephemeral must not stampede.
     for attempt in 0..120 {
-        let _ = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path);
+        let mut opts = OpenOptions::new();
+        opts.write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        if opts.open(&lock_path).is_ok() {
+            let _ = chmod_0600(&lock_path);
+        }
         // Best-effort exclusive via create_new retry on companion lock.
         let exclusive = lock_path.with_extension("exclusive");
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&exclusive)
+        let mut opts_ex = OpenOptions::new();
+        opts_ex.write(true).create_new(true);
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts_ex.mode(0o600);
+        }
+        match opts_ex.open(&exclusive) {
             Ok(mut f) => {
                 let _ = writeln!(f, "{}", std::process::id());
+                let _ = chmod_0600(&exclusive);
                 let _guard = ExclusiveLockGuard {
                     path: exclusive.clone(),
                 };
@@ -1992,9 +2027,17 @@ fn pace_registration(cli: &Cli) -> Result<(), String> {
 /// preemptively, so it cannot delete a live holder's lock that is merely mid-creation.
 fn try_acquire_exclusive(path: &Path) -> Option<ExclusiveLockGuard> {
     for attempt in 0..2 {
-        match OpenOptions::new().write(true).create_new(true).open(path) {
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        match opts.open(path) {
             Ok(mut f) => {
                 let _ = writeln!(f, "{}", std::process::id());
+                let _ = chmod_0600(path);
                 return Some(ExclusiveLockGuard {
                     path: path.to_path_buf(),
                 });
@@ -2028,7 +2071,7 @@ fn commit_registration_slot() {
     state.last_unix = now;
     state.recent.push(now);
     if let Ok(s) = serde_json::to_string(&state) {
-        let _ = fs::write(&state_path, s);
+        let _ = write_secure_file(&state_path, &s);
     }
 }
 
@@ -2043,7 +2086,7 @@ fn note_registration_failure_backoff(secs: u64) {
         // Push last_unix forward to force min gap = backoff.
         state.last_unix = now_unix().saturating_add(secs.saturating_sub(1));
         if let Ok(s) = serde_json::to_string(&state) {
-            let _ = fs::write(&state_path, s);
+            let _ = write_secure_file(&state_path, &s);
         }
     }
     eprintln!("register: backing off {secs}s after failed registration-token POST");
@@ -3339,7 +3382,7 @@ fn select_repos_for_tick(cli: &Cli, repos: &[String]) -> Vec<String> {
         out.push(repos[(offset + i) % len].clone());
     }
     offset = (offset + take) % len;
-    let _ = fs::write(&path, offset.to_string());
+    let _ = write_secure_file(&path, &offset.to_string());
     out
 }
 

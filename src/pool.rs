@@ -429,7 +429,19 @@ impl ResourcePool {
         let out = f(&mut state);
         if out.is_ok() {
             let json = serde_json::to_string_pretty(&state).map_err(|e| e.to_string())?;
-            fs::write(&self.path, json).map_err(|e| format!("pool write: {e}"))?;
+            let mut opts = OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut file = opts
+                .open(&self.path)
+                .map_err(|e| format!("pool write open: {e}"))?;
+            file.write_all(json.as_bytes())
+                .map_err(|e| format!("pool write write: {e}"))?;
+            let _ = super::chmod_0600(&self.path);
         }
         out
     }
