@@ -1,0 +1,225 @@
+# One release path. One button. Idempotent at every step.
+#
+# WHY THIS REPLACES TWO WORKFLOWS
+#   release.yml and release-on-merge.yml BOTH ran `gh release create/upload` — two workflows
+#   racing to create the same release, with only one of them also tagging and publishing.
+#   Which one won depended on timing. That is not a release process, it is a coin flip.
+#
+# WHY DISPATCH RATHER THAN ON-PUSH
+#   A release should be a decision, not a side effect of a merge. Dispatch gives three entry
+#   points for free — the Actions UI button, `gh workflow run` (a single API call), and any
+#   MCP tool that wraps that same call — without a separate mechanism for each.
+#
+# IDEMPOTENCY IS THE CONTRACT
+#   Every mutating step is check-then-act, so a re-run after a partial failure resumes rather
+#   than duplicating or erroring. This matters because the previous release path died at the
+#   tag step AFTER the build succeeded, leaving no way to continue without redoing everything.
+#
+# GITHUB-HOSTED ON PURPOSE
+#   This must not depend on the self-hosted fleet. Shipping a fix for runner OOM behaviour
+#   cannot require those runners to be healthy — that is circular, and it fails precisely when
+#   you most need to ship.
+
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump. `none` releases the version already in Cargo.toml."
+        type: choice
+        options: [none, patch, minor, major]
+        default: none
+      dry_run:
+        description: "Resolve and report every action without mutating anything."
+        type: boolean
+        default: true
+      publish_crate:
+        description: "Publish to crates.io (skipped automatically if already published)."
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  # Never two releases at once. Do NOT cancel in progress — a half-cancelled release is the
+  # exact partial state this workflow exists to avoid.
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@1.97
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # ── resolve ────────────────────────────────────────────────────────────────────────
+      - name: Resolve the version to release
+        id: ver
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: |
+          set -euo pipefail
+          CUR=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          echo "current=$CUR" >> "$GITHUB_OUTPUT"
+
+          if [ "$BUMP" = "none" ]; then
+            NEW="$CUR"
+          else
+            # NOTE ON 0.x SEMANTICS: at 0.y.z the MINOR is the breaking position, so a
+            # non-breaking feature is a PATCH. cz's default bump_map disagrees (it maps
+            # feat -> minor), which is why the bump is an explicit input here rather than
+            # inferred from commit messages.
+            IFS=. read -r MA MI PA <<< "$CUR"
+            case "$BUMP" in
+              patch) NEW="$MA.$MI.$((PA+1))" ;;
+              minor) NEW="$MA.$((MI+1)).0" ;;
+              major) NEW="$((MA+1)).0.0" ;;
+            esac
+          fi
+          echo "new=$NEW"     >> "$GITHUB_OUTPUT"
+          echo "tag=v$NEW"    >> "$GITHUB_OUTPUT"
+          printf '### Release plan\n\n- current: `%s`\n- releasing: `%s`\n- tag: `v%s`\n- dry run: `%s`\n' \
+            "$CUR" "$NEW" "$NEW" "${{ inputs.dry_run }}" >> "$GITHUB_STEP_SUMMARY"
+
+      # ── preflight: report what already exists, so every later step can skip precisely ──
+      - name: Preflight — what already exists
+        id: pre
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          VER: ${{ steps.ver.outputs.new }}
+        run: |
+          set -euo pipefail
+          git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1 \
+            && T=yes || T=no
+          gh release view "$TAG" >/dev/null 2>&1 && R=yes || R=no
+
+          # crates.io: distinguish "already published" from "could not check". An
+          # unreachable registry must NOT read as "not published" — that would attempt a
+          # publish that then fails late, after tagging.
+          CODE=$(curl -s -o /tmp/cr.json -w '%{http_code}' \
+                 -H 'User-Agent: gha-runner-ctl-release' \
+                 "https://crates.io/api/v1/crates/gha-runner-ctl/$VER" || echo 000)
+          case "$CODE" in
+            200) C=yes ;;
+            404) C=no ;;
+            *)   C=unknown ;;
+          esac
+
+          { echo "tag_exists=$T"; echo "release_exists=$R"; echo "crate_published=$C"; } >> "$GITHUB_OUTPUT"
+          printf -- '- tag exists: `%s`\n- release exists: `%s`\n- crate published: `%s`\n' \
+            "$T" "$R" "$C" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Refuse to proceed on an unknown registry state
+        if: steps.pre.outputs.crate_published == 'unknown' && inputs.publish_crate
+        run: |
+          echo "::error::Could not determine whether $VER is on crates.io (registry unreachable)."
+          echo "Unknown is not the same as not-published. Refusing to tag before a publish that may fail."
+          exit 1
+
+      # ── build ──────────────────────────────────────────────────────────────────────────
+      - name: Build and test
+        run: |
+          set -euo pipefail
+          cargo fmt --all --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test --workspace
+          cargo build --release
+
+      - name: Package
+        id: pkg
+        env:
+          VER: ${{ steps.ver.outputs.new }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          A="dist/gha-runner-ctl-${VER}-x86_64-unknown-linux-gnu.tar.gz"
+          tar -czf "$A" -C target/release gha-runner-ctl
+          sha256sum "$A" > "dist/SHA256SUMS-${VER}.txt"
+          echo "archive=$A" >> "$GITHUB_OUTPUT"
+          echo "sums=dist/SHA256SUMS-${VER}.txt" >> "$GITHUB_OUTPUT"
+
+      - name: DRY RUN — stop here
+        if: inputs.dry_run
+        run: |
+          echo "::notice::Dry run. Built and packaged successfully; nothing was tagged, released or published."
+          echo '**Dry run — no mutations performed.**' >> "$GITHUB_STEP_SUMMARY"
+
+      # ── mutate: every step check-then-act ──────────────────────────────────────────────
+      - name: Commit the version bump
+        if: ${{ !inputs.dry_run && inputs.bump != 'none' }}
+        env:
+          NEW: ${{ steps.ver.outputs.new }}
+          CUR: ${{ steps.ver.outputs.current }}
+        run: |
+          set -euo pipefail
+          [ "$NEW" = "$CUR" ] && { echo "already at $NEW — nothing to bump"; exit 0; }
+          sed -i "0,/^version = \"$CUR\"/s//version = \"$NEW\"/" Cargo.toml
+          [ -f .cz.toml ] && sed -i "s/^version = \"$CUR\"/version = \"$NEW\"/" .cz.toml || true
+          cargo update -p gha-runner-ctl --precise "$NEW" 2>/dev/null || cargo check --quiet
+          # Identity is required for a commit AND for an annotated tag. Self-hosted runners
+          # have none; hosted ones do not either. Set it locally, never --global.
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock .cz.toml 2>/dev/null || git add Cargo.toml Cargo.lock
+          git commit -m "release: v$NEW"
+          git push "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" HEAD:main
+
+      - name: Tag
+        if: ${{ !inputs.dry_run && steps.pre.outputs.tag_exists == 'no' }}
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "gha-runner-ctl $TAG"
+          git push "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" "$TAG"
+
+      - name: GitHub release
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          A: ${{ steps.pkg.outputs.archive }}
+          S: ${{ steps.pkg.outputs.sums }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || gh release create "$TAG" --title "gha-runner-ctl $TAG" --generate-notes
+          # --clobber makes asset upload idempotent on re-run.
+          gh release upload "$TAG" "$A" "$S" --clobber
+
+      - name: Publish to crates.io
+        if: ${{ !inputs.dry_run && inputs.publish_crate && steps.pre.outputs.crate_published == 'no' }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "::warning::CARGO_REGISTRY_TOKEN not set — the GitHub release shipped, crates.io was skipped."
+            echo '- crates.io: **skipped** (no token)' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          cargo publish --no-verify
+
+      - name: Summary
+        if: ${{ !inputs.dry_run }}
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          printf -- '\n### Released `%s`\n\nhttps://github.com/%s/releases/tag/%s\n' \
+            "$TAG" "${{ github.repository }}" "$TAG" >> "$GITHUB_STEP_SUMMARY"
