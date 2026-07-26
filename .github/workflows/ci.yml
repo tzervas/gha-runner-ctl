@@ -41,6 +41,15 @@
 # the reusable call resolves to. Revisit and drop this job in favor of
 # `release-build: true` once ap-workflows' main supports the input. There are
 # no [[bench]] targets in this crate, so nothing is lost by dropping `bench`.
+#
+# CACHING: the only cargo build still run by this file is `release-build`'s
+# `cargo build --release`, which now carries a Swatinem/rust-cache@v2 step
+# (env: CARGO_INCREMENTAL=0, save-if restricted to main/dev). The build/test/
+# clippy compilation that used to dominate every run — the "95 crates
+# recompiling" cost — now happens inside the pinned ap-workflows commit's
+# reusable-rust-ci.yml, which this repo does not own; caching that gate is
+# upstream's responsibility to add (e.g. a rust-cache step, or a `cache: bool`
+# workflow_call input) in ap-workflows itself, not something to resurrect here.
 name: ci
 
 on:
@@ -96,9 +105,22 @@ jobs:
            || (inputs.runner == '' && (github.base_ref || github.ref_name) == 'main'))
           && fromJSON('["self-hosted","linux","x64","podman","large"]')
           || fromJSON('["ubuntu-latest"]') }}
+    env:
+      CARGO_INCREMENTAL: '0'
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97
+      - name: Cache cargo registry and target
+        # Keyed on Cargo.lock + rustc version, so the cache stays valid until a
+        # dependency actually changes. save-if restricts writes to trunk, so PRs
+        # RESTORE from trunk's cache without each one overwriting it. This is the
+        # one cargo build still run locally by this repo's ci.yml — the fmt/
+        # clippy/test/build steps this PR originally cached now run inside
+        # ap-workflows' reusable-rust-ci.yml (see header comment); caching those
+        # belongs upstream in that reusable workflow, not here.
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev' }}
       - name: cargo build --release
         run: cargo build --release
 
