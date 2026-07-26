@@ -165,6 +165,12 @@ jobs:
           PR_BODY="$(printf '%s\n' \
             "## Automated back-merge" \
             "" \
+            "### ⚠️ Merge method: required" \
+            "" \
+            "**Merge this PR with \"Create a merge commit.\"** Do **not** squash and do **not** rebase." \
+            "Squashing this PR would recreate the exact divergence this workflow exists to prevent —" \
+            "it would produce a new commit not reachable from \`main\`, freezing the merge base again." \
+            "" \
             "Merges \`main\` (\`${MAIN_SHORT}\`) into \`${DOWNSTREAM}\` with a **merge commit** (\`--no-ff\`)." \
             "" \
             "### Guarantee" \
