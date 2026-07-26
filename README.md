@@ -21,7 +21,7 @@ See **[docs/HOST_PLATFORMS.md](docs/HOST_PLATFORMS.md)**.
 
 CI badge reflects self-hosted workflow status on `main` (`runs-on: [self-hosted, linux, x64, podman]`). It is only green when a host listener registers a runner and completes the job—no GitHub-hosted fallback.
 
-Docs: [QUICKSTART](docs/QUICKSTART.md) · [HOST_PLATFORMS](docs/HOST_PLATFORMS.md) · [WORK_IMAGES](docs/WORK_IMAGES.md) · [HOST_OPS](docs/HOST_OPS.md) · [SECURITY](docs/SECURITY.md) · [CONSUMERS](docs/CONSUMERS.md) · [DESIGN](docs/DESIGN.md)
+Docs: [QUICKSTART](docs/QUICKSTART.md) · [HOST_PLATFORMS](docs/HOST_PLATFORMS.md) · [WORK_IMAGES](docs/WORK_IMAGES.md) · [HOST_OPS](docs/HOST_OPS.md) · [SECURITY](docs/SECURITY.md) · [CONSUMERS](docs/CONSUMERS.md) · [DESIGN](docs/DESIGN.md) · [BRANCH-SYNC](docs/branch-sync.md) · [MAINTENANCE-AND-SECURITY](docs/maintenance-and-security.md)
 
 [MIT](LICENSE) · [NOTICE](NOTICE) (cites [actions/runner](https://github.com/actions/runner), also MIT)
 

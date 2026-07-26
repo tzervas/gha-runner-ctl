@@ -12,14 +12,11 @@ on:
     - cron: "17 7 * * 1"
   workflow_dispatch:
 
+# No cancel-in-progress: scheduled self-hosted jobs queue without a runner; the
+# next schedule would cancel them and report "cancelled" (not failed), so the
+# scan silently never runs and nothing alerts. Group alone is enough for PR reuse.
 concurrency:
   group: fleet-security-${{ github.ref }}
-  # NEVER a bare `true` on a workflow that has an `on.schedule` trigger. On self-hosted
-  # runners the weekly full-history scan QUEUES when no runner is free; the next tick then
-  # cancels the queued run, and a cancelled run reports `cancelled`, not `failed`. Nothing
-  # alerts, no badge turns red, and the secret scan silently stops running. PR pushes still
-  # supersede each other — only the schedule is exempt.
-  cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 # Minimal token surface for checkout + scan (no write, no id-token).
 permissions:

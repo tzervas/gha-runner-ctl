@@ -76,9 +76,9 @@ jobs:
       - name: Publish to crates.io
         if: steps.gate.outputs.go == 'true'
         env:
-          # crates.io token lives in the CARGO_REGISTRY_KEY secret; cargo reads the
-          # CARGO_REGISTRY_TOKEN env var. GitHub secrets can't be renamed, so map it here.
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_KEY }}
+          # cargo reads the crates.io token from the CARGO_REGISTRY_TOKEN env var;
+          # source it from the identically-named repo secret (the idiomatic setup).
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -uo pipefail
           # Idempotent publish: if a prior run already published this version but failed
