@@ -1964,8 +1964,7 @@ mod redact_hardening_tests {
     fn registration_http_error_redacts_token_shaped_body() {
         let secret = "A".repeat(40);
         let body = format!(r#"{{"message":"leaked ghs_{}"}}"#, secret);
-        let msg =
-            registration_http_error("registration-token request failed", 403, Some(&body));
+        let msg = registration_http_error("registration-token request failed", 403, Some(&body));
         assert!(
             !msg.contains(&secret),
             "raw token-shaped body must not appear in error message: {msg}"
