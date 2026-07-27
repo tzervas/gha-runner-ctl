@@ -1,0 +1,131 @@
+# fleet-warm-python — per-repo dependency WARM image: pre-resolves ONE consuming repo's
+# exact locked Python dependency set into a venv baked into this image, so the job-time
+# command is a zero-egress cache hit instead of a resolve. This is the COLD half of the
+# cold/hot split (see docs/WORK_IMAGES.md "cold vs hot"): no application secret, no repo
+# source checkout — only the two dependency-manifest files the consuming repo committed.
+#
+# WHY THIS EXISTS (not an optimization — required for correctness): fleet runners have no
+# general egress (measured 2026-07-26 — see packaging/Containerfile.runner-base's PyYAML
+# story / gha-runner-ctl#51, where a job-time `uv pip install` simply could not reach
+# anything). A job-time `uv sync` inside a work container therefore cannot resolve or
+# download a single package. The only place a dependency CAN be fetched is at image-build
+# time, on a builder that has egress to PyPI/GHCR (the same assumption every existing
+# pinned-binary RUN step in this repo's Containerfiles already depends on — see
+# .github/workflows/publish-images.yml's header for where that egress is expected to come
+# from). Baking the resolved venv here is how the dependency set is ever present when the
+# job actually runs.
+#
+# FROM fleet-runner-python, not fleet-runner-base: needs uv + the uv-managed CPython
+# interpreter already baked (see Containerfile.runner-python's header for why that
+# interpreter is deliberately not apt python3 — reproducibility via
+# astral-sh/python-build-standalone). fleet-runner-python is produced in this same
+# repo/pipeline, not a third-party upstream, so pin
+# `fleet-runner-python:0.1.0@sha256:<digest>` once it is pushed to GHCR; do not invent a
+# digest before then (same rule Containerfile.runner-python itself states for its own FROM).
+#
+# BUILD CONTEXT CONTRACT: this Containerfile expects exactly the consuming repo's
+# dependency manifests as build context — nothing else:
+#   pyproject.toml   (required)
+#   uv.lock          (required — the frozen, committed, reviewed resolution)
+# It does NOT expect, and must NEVER receive, the repo's source tree, a .env file, or any
+# secret — those belong to the HOT path (repo checkout + secret injection at container
+# instantiation; see docs/WORK_IMAGES.md). Build with a context directory holding only
+# those two files, e.g.:
+#   mkdir -p /tmp/warm-ctx
+#   cp pyproject.toml uv.lock /tmp/warm-ctx/
+#   TAG="fleet-warm-python:<repo>-$(sha256sum uv.lock | cut -c1-12)"
+#   podman build -f packaging/Containerfile.warm-python -t "$TAG" /tmp/warm-ctx
+#
+# REPOS THAT ONLY HAVE requirements.txt (no uv.lock yet): this Containerfile deliberately
+# does NOT branch on which manifest file is present — a conditional COPY/RUN inside a
+# Containerfile can silently no-op on the wrong engine and that is exactly the "looks
+# deployable but does nothing" failure shape this fleet has been burned by before. Instead,
+# generate the missing lock as an explicit, auditable, no-secret PRE-STEP before invoking
+# this file at all:
+#   uv pip compile requirements.txt -o uv.lock
+# then build normally. The repo should commit that uv.lock going forward rather than
+# regenerate it on every warm build.
+#
+# WHY `uv sync --frozen` AND NOT PLAIN `uv sync`: plain `uv sync` is allowed to re-resolve
+# and rewrite uv.lock when it has drifted from pyproject.toml. Doing that at image-build
+# time would silently bake a dependency set that disagrees with the uv.lock the repo
+# actually committed and reviewed — the same "generated artifact disagrees with its source"
+# failure this fleet has already hit (see packaging/Containerfile.runner-base's PR #64 /
+# standards-gate PyYAML story: a checker that silently reports green on drifted state is
+# worse than one that fails loudly). `--frozen` refuses to touch the lock: it is the
+# contract, and this image either honors it exactly or fails the build. A repo with a
+# stale lock needs to fix its lock (which changes the content-addressed tag below, so a
+# fixed lock simply produces a new, distinct warm image) — this file must never paper over
+# that by re-resolving quietly.
+#
+# CONTENT ADDRESSING (provable cache hit / impossible-to-mistake-for-fresh staleness):
+#   fleet-warm-python:<repo>-<first 12 hex chars of `sha256sum uv.lock`>
+# Recompute with:
+#   sha256sum uv.lock | cut -c1-12
+# A changed uv.lock produces a different hash, therefore a different tag; the old tag is
+# simply never referenced again. No explicit cache-bust/invalidation step exists or is
+# needed.
+#
+# Runs as non-root UID 1001 (inherited from fleet-runner-python / fleet-runner-base).
+# Style: one logical step per RUN (no && chains) — matches packaging/Containerfile.
+#
+# NO APPLICATION SECRET may appear in this file, its build ARGs, or its build context (e.g.
+# a private package index credential). If a dependency needs one, that resolution step
+# belongs in the HOT path at container instantiation, not baked here — say so rather than
+# solving it with a secret in this file.
+#
+# COMPLEMENTARY CACHE (works today on podman 4.3.1, no Quadlet required — see
+# docs/WORK_IMAGES.md "Quadlet" note): a named `podman volume` holding `~/.cache/uv` can
+# additionally be mounted into warm-image builds and even job containers
+# (`-v fleet-uv-cache:/home/runner/.cache/uv`) to speed up repeat resolves across different
+# repos/locks without depending on any baked layer. It is a complement to this image, not a
+# substitute — it degrades gracefully (a cold volume just means a slower first resolve) but
+# provides no content-addressed guarantee and no zero-egress guarantee on its own.
+
+# BASE_* ARGs parameterize the parent so class images can be mixed and matched:
+#   - publish/pull bases from a registry (a `localhost/` name cannot be pulled)
+#   - use `podman build --cache-from <registry-ref>` against a real cache parent
+#     (verified available on the target host: podman 4.3.1 has --cache-from/--cache-to)
+#   - compose on a different base or base version without editing this file
+# Defaults reproduce today's behaviour exactly, so existing local builds are unchanged.
+#   podman build --build-arg BASE_REGISTRY=ghcr.io/tzervas --build-arg BASE_TAG=0.2.0 ...
+#
+# CRITICAL podman/OCI gotcha: an ARG declared before FROM is consumed BY the FROM
+# instruction and is NOT in scope in the build stage afterwards. Re-declare it after
+# FROM if it is needed later. Forgetting yields an empty string at build time with no
+# error — a silent failure, which ranks worse here than a loud one.
+ARG BASE_REGISTRY=localhost
+ARG BASE_IMAGE=fleet-runner-python
+ARG BASE_TAG=0.1.0
+FROM ${BASE_REGISTRY}/${BASE_IMAGE}:${BASE_TAG}
+
+# Re-declare: ARG-before-FROM values are not in scope after FROM (see gotcha above).
+ARG BASE_REGISTRY
+ARG BASE_IMAGE
+ARG BASE_TAG
+
+# Should track the PYTHON_VERSION already baked into fleet-runner-python above, so
+# `uv venv`/`uv sync` reuse the already-installed managed CPython instead of fetching a
+# second interpreter build. Keep in sync with Containerfile.runner-python's PYTHON_VERSION.
+ARG PYTHON_VERSION=3.13.14
+# Documented, fixed venv path for the baked dependency set (distinct from
+# fleet-runner-python's own tool venv at /home/runner/.venv, so a repo's application
+# dependencies never mix with this image's own ruff/pytest tooling venv).
+ARG WARM_VENV=/home/runner/.venv-warm
+
+ENV UV_PROJECT_ENVIRONMENT=${WARM_VENV}
+
+USER runner
+WORKDIR /home/runner/warm-src
+
+# Manifests only — see header BUILD CONTEXT CONTRACT. Never the repo tree, never a secret.
+COPY --chown=runner:runner pyproject.toml ./pyproject.toml
+COPY --chown=runner:runner uv.lock ./uv.lock
+
+# --frozen: never re-resolve — see header WHY. Fails the build (as intended) if uv.lock is
+# missing or does not match pyproject.toml; a warm image with a silently-drifted lock is
+# worse than no warm image at all.
+RUN uv sync --frozen --python "${PYTHON_VERSION}"
+RUN "${WARM_VENV}/bin/python" -c "import sys; print(sys.version)"
+
+WORKDIR /opt/actions-runner

@@ -16,10 +16,19 @@ rocky-9 = "docker.io/library/rockylinux:9"
 # Runner-class labels (job label schema `[..., podman, <size>, <class>]`).
 # Built by packaging/Containerfile.runner-<class>; see docs/WORK_IMAGES.md.
 # Only base/shell/python are built today — rust/docs/gpu are not yet packaged.
-# Point these at wherever the class images are pushed once built (ghcr.io/<org>/…).
-base = "ghcr.io/example/fleet-runner-base:0.1.0"
-shell = "ghcr.io/example/fleet-runner-shell:0.1.0"
-python = "ghcr.io/example/fleet-runner-python:0.1.0"
+# Published by .github/workflows/publish-images.yml (no application secrets — see that
+# file's header) to ghcr.io/tzervas/fleet-runner-<class>:<semver>. This is a real,
+# copy-verbatim org (tzervas), even though this file stays an EXAMPLE overlay — a reader
+# still needs to point GHA_IMAGE_MAP at their own copy, and to keep <semver> in sync with
+# whatever the publish workflow last actually pushed.
+base = "ghcr.io/tzervas/fleet-runner-base:0.1.0"
+shell = "ghcr.io/tzervas/fleet-runner-shell:0.1.0"
+python = "ghcr.io/tzervas/fleet-runner-python:0.1.0"
+# Per-repo dependency WARM images (packaging/Containerfile.warm-python /
+# Containerfile.warm-rust) are NOT fleet-wide class labels — they are content-addressed
+# per-repo, per-lock-hash tags (fleet-warm-python:<repo>-<lock-hash>), so they do not get a
+# fixed entry in this map. See docs/WORK_IMAGES.md for how a consuming repo computes and
+# selects its own warm tag via GHA_IMAGE.
 
 [arches]
 # Optional platform overrides (defaults are built-in for known arch labels).

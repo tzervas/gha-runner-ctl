@@ -1,0 +1,134 @@
+# fleet-warm-rust — per-repo Cargo dependency WARM image: pre-fetches ONE consuming repo's
+# exact locked crates.io/git dependency set into the cargo registry cache baked into this
+# image, so job-time `cargo build --offline` is a zero-egress cache hit instead of a fetch.
+# COLD half of the cold/hot split (see docs/WORK_IMAGES.md "cold vs hot"): no application
+# secret, no repo source checkout — only the two manifest files the consuming repo
+# committed.
+#
+# WHY THIS EXISTS (not an optimization — required for correctness): same fact as
+# Containerfile.warm-python — fleet runners have no general egress (measured 2026-07-26).
+# `cargo fetch`/`cargo build` at job time inside a work container cannot reach
+# crates.io/index.crates.io/a git dependency host at all. Baking the fetched registry+git
+# cache at image-build time (on a builder that DOES have egress — the same assumption the
+# rustup RUN steps in packaging/Containerfile already depend on; see
+# .github/workflows/publish-images.yml's header for where that egress is expected to come
+# from) is how the dependency set is ever present when the job actually runs.
+#
+# NO `rust` CLASS IMAGE EXISTS YET. packaging/image-map.example.toml says plainly: "Only
+# base/shell/python are built today — rust/docs/gpu are not yet packaged." This file
+# therefore CANNOT `FROM fleet-runner-rust:<semver>` the way Containerfile.warm-python FROMs
+# fleet-runner-python — there is nothing to FROM. Rather than pretend that class exists,
+# this file FROMs packaging/Containerfile's own output image (the pre-existing, un-classed
+# "stock" image), which already carries a pinned rustup toolchain for UID 1001
+# (RUST_TOOLCHAIN=1.96, CARGO_HOME=/home/runner/.cargo — see that file's header). This is a
+# STATED, TEMPORARY DEPENDENCY on a stand-in, not a design claim that a rust class exists.
+# Re-point the FROM at `fleet-runner-rust:<semver>` (built from a future
+# Containerfile.runner-rust layered on fleet-runner-base, matching the shell/python
+# pattern) once that class is packaged, and delete this note.
+#
+# TAG TENSION — RESOLVED. This paragraph previously recorded that this file had to FROM
+# the 2.42 GB monolith (packaging/Containerfile), whose only documented tag is
+# `localhost/gha-runner-ctl:latest`, in direct tension with this repo's "NEVER :latest"
+# rule — because no `rust` CLASS image existed to layer on.
+#
+# One now does: packaging/Containerfile.runner-rust, a thin rust toolchain layer on the
+# digest-pinned debian base, tagged `fleet-runner-rust:<semver>`. So this file now FROMs
+# a properly-tagged class image and the :latest default is gone.
+#
+# This also changes the DISTRO under the warm layer: the monolith is built from an
+# unpinned `ubuntu:24.04`, while every class image is built from digest-pinned
+# `debian:bookworm-slim`. That is a real behavioural difference (package names, glibc),
+# not just a size reduction, and is worth knowing when comparing a warm image built
+# before and after this change.
+#
+# BUILD CONTEXT CONTRACT: exactly the consuming repo's Cargo manifests, nothing else:
+#   Cargo.toml
+#   Cargo.lock   (required — the frozen, committed, reviewed resolution)
+# Never the repo's source tree, never a secret (e.g. a private registry token or an SSH
+# deploy key for a git dependency — those belong to the HOT path). Example:
+#   mkdir -p /tmp/warm-ctx
+#   cp Cargo.toml Cargo.lock /tmp/warm-ctx/
+#   TAG="fleet-warm-rust:<repo>-$(sha256sum Cargo.lock | cut -c1-12)"
+#   podman build -f packaging/Containerfile.warm-rust -t "$TAG" /tmp/warm-ctx
+#
+# SINGLE-PACKAGE ONLY, flagged gap: this file stubs out src/main.rs + src/lib.rs (below) so
+# a bare Cargo.toml/Cargo.lock satisfies cargo's "must have a target" requirement without
+# shipping the real source tree — the same trick cargo-chef/Docker Rust-caching recipes use.
+# It does NOT handle a Cargo workspace with multiple member crates: `cargo fetch` on a
+# workspace root manifest needs to see every member's own Cargo.toml (to walk path
+# dependencies), and this file only copies the root manifest. A workspace repo would need
+# its BUILD CONTEXT CONTRACT extended to include each member's Cargo.toml (stubbed the same
+# way) — not implemented here; treat single-crate repos as the supported case for now.
+#
+# WHY `cargo fetch --locked` AND NOT plain `cargo fetch` / `cargo build`: `--locked`
+# refuses to touch Cargo.lock — if Cargo.toml and Cargo.lock disagree (e.g. a version
+# requirement moved since the lock was committed), the fetch fails loudly instead of
+# silently re-resolving and baking a dependency set that disagrees with the lock the repo
+# actually committed and reviewed. Same "generated artifact disagrees with its source"
+# failure mode this fleet keeps hitting (see Containerfile.warm-python's header / PR #64's
+# PyYAML story) — same fix: trust the committed lock or fail the build, never silently
+# regenerate it.
+#
+# CONTENT ADDRESSING (provable cache hit / impossible-to-mistake-for-fresh staleness):
+#   fleet-warm-rust:<repo>-<first 12 hex chars of `sha256sum Cargo.lock`>
+# Recompute with:
+#   sha256sum Cargo.lock | cut -c1-12
+#
+# Runs as non-root UID 1001 (inherited from packaging/Containerfile's `runner` user).
+# Style: one logical step per RUN (no && chains).
+#
+# NO APPLICATION SECRET may appear in this file, its build ARGs, or its build context (a
+# private crate registry token, an SSH key for a private git dependency). If a dependency
+# needs one, that resolution step belongs in the HOT path at container instantiation, not
+# baked here — say so rather than solving it with a secret in this file.
+#
+# COMPLEMENTARY CACHE (works today on podman 4.3.1, no Quadlet required — see
+# docs/WORK_IMAGES.md "Quadlet" note): a named `podman volume` holding
+# `$CARGO_HOME/registry` (e.g. `-v fleet-cargo-registry:/home/runner/.cargo/registry`) can
+# additionally be mounted into warm-image builds and job containers to speed up repeat
+# fetches across different repos/locks without depending on any baked layer. It is a
+# complement to this image, not a substitute: it degrades gracefully but gives no
+# content-addressed guarantee and no zero-egress guarantee on its own.
+
+# BASE_* ARGs parameterize the parent so class images can be mixed and matched:
+#   - publish/pull bases from a registry (a `localhost/` name cannot be pulled)
+#   - use `podman build --cache-from <registry-ref>` against a real cache parent
+#     (verified available on the target host: podman 4.3.1 has --cache-from/--cache-to)
+#   - compose on a different base or base version without editing this file
+# Defaults reproduce today's behaviour exactly, so existing local builds are unchanged.
+#   podman build --build-arg BASE_REGISTRY=ghcr.io/tzervas --build-arg BASE_TAG=0.2.0 ...
+#
+# CRITICAL podman/OCI gotcha: an ARG declared before FROM is consumed BY the FROM
+# instruction and is NOT in scope in the build stage afterwards. Re-declare it after
+# FROM if it is needed later. Forgetting yields an empty string at build time with no
+# error — a silent failure, which ranks worse here than a loud one.
+ARG BASE_REGISTRY=localhost
+ARG BASE_IMAGE=fleet-runner-rust
+ARG BASE_TAG=0.1.0
+FROM ${BASE_REGISTRY}/${BASE_IMAGE}:${BASE_TAG}
+
+# Re-declare: ARG-before-FROM values are not in scope after FROM (see gotcha above).
+ARG BASE_REGISTRY
+ARG BASE_IMAGE
+ARG BASE_TAG
+
+USER runner
+WORKDIR /home/runner/warm-src
+
+# Manifests only — see header BUILD CONTEXT CONTRACT. Never the repo tree, never a secret.
+COPY --chown=runner:runner Cargo.toml ./Cargo.toml
+COPY --chown=runner:runner Cargo.lock ./Cargo.lock
+
+# Stub source so cargo accepts the manifest without the real repo tree — see header
+# SINGLE-PACKAGE ONLY note. Discarded content; exists only to satisfy cargo during fetch.
+RUN mkdir -p src
+RUN sh -c 'printf "fn main() {}\n" > src/main.rs'
+RUN sh -c 'printf "" > src/lib.rs'
+
+# --locked: never re-resolve — see header WHY. Fails the build (as intended) if Cargo.lock
+# is missing or does not match Cargo.toml; a warm image with a silently-drifted lock is
+# worse than no warm image at all. Populates $CARGO_HOME/registry and $CARGO_HOME/git.
+RUN cargo fetch --locked
+RUN cargo --version
+
+WORKDIR /opt/actions-runner

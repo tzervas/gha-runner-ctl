@@ -1,0 +1,75 @@
+# fleet-runner-rust — Rust CI class: adds a rustup toolchain (rustc/cargo + rustfmt + clippy)
+# as a thin layer on fleet-runner-base.
+#
+# Why this class exists: fleet runner images had no Rust, so CI workflows fell back to
+# `curl … sh.rustup.rs` at job time. Runners have no general network egress, so that
+# fallback cannot work. Baking the toolchain into the image removes the fallback rather
+# than papering over it. The alternative today is a 2.42 GB monolith on an unpinned
+# ubuntu:24.04 base; every job launches it regardless of need.
+#
+# Tag as fleet-runner-rust:<semver>, starting 0.1.0. NEVER :latest.
+#
+# Build (context must be packaging/ so paths resolve; do not use repo root):
+#   podman build -f packaging/Containerfile.runner-rust -t fleet-runner-rust:0.1.0 packaging/
+#
+# BASE_* ARGs parameterize the parent so class images can be mixed and matched:
+#   - publish/pull bases from a registry (localhost/ names cannot be pulled)
+#   - use podman build --cache-from <registry-ref> against a real cache parent
+#   - compose this class on a different base or base version without editing the file
+# localhost/ remains the default so existing local builds are unchanged.
+# Example override:
+#   podman build --build-arg BASE_REGISTRY=ghcr.io/tzervas --build-arg BASE_TAG=0.2.0 ...
+#
+# CRITICAL podman/OCI gotcha: an ARG declared before FROM is consumed by the FROM
+# instruction and is NOT available in the build stage afterwards. If any of these
+# values are needed later (e.g. in a LABEL), the ARG must be re-declared after FROM.
+# Getting this wrong yields an empty string at build time with no error — a silent
+# failure, which is worse than a loud one.
+
+ARG BASE_REGISTRY=localhost
+ARG BASE_IMAGE=fleet-runner-base
+ARG BASE_TAG=0.1.0
+FROM ${BASE_REGISTRY}/${BASE_IMAGE}:${BASE_TAG}
+
+# Re-declare: ARG-before-FROM values are not in scope after FROM (see gotcha above).
+ARG BASE_REGISTRY
+ARG BASE_IMAGE
+ARG BASE_TAG
+
+# Overridable floor so a repo that needs a different toolchain can rebuild this class.
+ARG RUST_TOOLCHAIN=1.96
+
+# Install as the non-root runner (UID 1001) so toolchain ownership matches CI runtime.
+USER 1001
+
+# CI steps are non-login shells, so profile scripts never run — cargo must be on PATH via ENV.
+ENV CARGO_HOME=/home/runner/.cargo \
+    RUSTUP_HOME=/home/runner/.rustup \
+    PATH=/home/runner/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# rustup-init is fetched over HTTPS; rustup verifies its own component downloads.
+# No sha256 pin: same approach as the monolith (cannot invent a checksum offline).
+RUN curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o /tmp/rustup-init.sh
+
+# minimal profile keeps the layer thin; components added next for fmt/clippy CI gates.
+RUN sh /tmp/rustup-init.sh -y --default-toolchain "${RUST_TOOLCHAIN}" --profile minimal
+
+RUN rm -f /tmp/rustup-init.sh
+
+# Fleet CI runs `cargo fmt --check` and `clippy -D warnings`; missing components only
+# moves those failures from build time to job time.
+RUN rustup component add rustfmt
+
+RUN rustup component add clippy
+
+# Fail the image build if any required tool is missing or broken.
+RUN rustc --version
+
+RUN cargo --version
+
+RUN rustfmt --version
+
+RUN cargo clippy --version
+
+# Drop rustup's download cache only; keep toolchains and cargo bin for runtime use.
+RUN rm -rf /home/runner/.rustup/downloads
