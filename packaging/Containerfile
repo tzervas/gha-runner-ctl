@@ -27,21 +27,25 @@ ARG RUNNER_UID=1001
 ARG GITLEAKS_VERSION=8.30.1
 ARG GITLEAKS_SHA256=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
 # gh (GitHub CLI) pin — TODO(checksum): UNRESOLVED, do not build with this value.
-# Why unresolved: this ARG block was authored by an agent with no network egress, so it
-# cannot download the release asset to compute its sha256. This fleet's rule (see the
-# gitleaks pin above, and uv/ruff/shellcheck/shfmt/bats in the runner-* Containerfiles) is
-# that every pinned-binary checksum is recomputed by hand from a fresh download by whoever
-# actually can reach the asset — never invented or copied from an untrusted source. A party
-# with egress must resolve this before the image builds:
-#   1. Pick the gh release to pin, e.g. https://github.com/cli/cli/releases/tag/v<X>
-#   2. Run: curl -fsSL \
-#        https://github.com/cli/cli/releases/download/v<X>/gh_<X>_linux_amd64.tar.gz \
-#        | sha256sum
-#   3. Set GH_VERSION=<X> and GH_SHA256=<the resulting hex digest> below.
-# Until then GH_SHA256 is a deliberately invalid placeholder so `sha256sum -c` in the RUN
-# block below fails loudly instead of silently trusting an unverified download.
-ARG GH_VERSION=2.63.2
-ARG GH_SHA256=TODO_CHECKSUM_UNRESOLVED_NO_EGRESS_SEE_HEADER_COMMENT_ABOVE
+# gh pin: https://github.com/cli/cli/releases/tag/v2.96.0
+# RESOLVED 2026-07-27. The placeholder that stood here was authored by an agent with no
+# network egress, which cannot compute a checksum, so it was left deliberately INVALID to
+# make `sha256sum -c` fail loudly rather than silently trust an unverified download.
+#
+# Resolved the way this fleet requires (same as the gitleaks pin above, and
+# uv/ruff/shellcheck/shfmt/bats in the runner-* files): downloaded the asset fresh and
+# hashed it, then checked that digest against the checksums file cli/cli publishes
+# alongside the release. Both agree exactly:
+#
+#   curl -sL https://github.com/cli/cli/releases/download/v2.96.0/gh_2.96.0_linux_amd64.tar.gz | sha256sum
+#     -> 83d5c2ccad5498f58bf6368acb1ab32588cf43ab3a4b1c301bf36328b1c8bd60
+#   curl -sL .../gh_2.96.0_checksums.txt | grep linux_amd64.tar.gz
+#     -> 83d5c2ccad5498f58bf6368acb1ab32588cf43ab3a4b1c301bf36328b1c8bd60
+#
+# An independently-computed digest matching the publisher's own sidecar is the check that
+# matters; either alone would only prove the download was self-consistent.
+ARG GH_VERSION=2.96.0
+ARG GH_SHA256=83d5c2ccad5498f58bf6368acb1ab32588cf43ab3a4b1c301bf36328b1c8bd60
 # MSRV / rust-toolchain.toml channel
 ARG RUST_TOOLCHAIN=1.96
 
