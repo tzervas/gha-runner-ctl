@@ -892,28 +892,6 @@ pub fn is_safe_image(s: &str) -> bool {
     if s.is_empty() || s.len() > 384 || s.contains("..") {
         return false;
     }
-    // No whitespace or shell metacharacters.
-    if s.chars().any(|c| {
-        c.is_ascii_whitespace()
-            || matches!(
-                c,
-                ';' | '|'
-                    | '&'
-                    | '$'
-                    | '`'
-                    | '('
-                    | ')'
-                    | '<'
-                    | '>'
-                    | '\''
-                    | '"'
-                    | '\\'
-                    | '\n'
-                    | '\r'
-            )
-    }) {
-        return false;
-    }
     s.chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | '@'))
 }
@@ -993,14 +971,14 @@ pub fn pull_policy_arg(p: &PullPolicy) -> &'static str {
 }
 
 pub fn is_safe_labels(s: &str) -> bool {
-    let parts: Vec<&str> = s
-        .split(',')
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .collect();
-    !parts.is_empty()
-        && parts.len() <= 16
-        && parts.iter().all(|p| is_safe_ident(p) && p.len() <= 64)
+    let mut count = 0;
+    for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        count += 1;
+        if count > 16 || !is_safe_ident(part) || part.len() > 64 {
+            return false;
+        }
+    }
+    count > 0
 }
 
 pub fn is_safe_cpus(s: &str) -> bool {
