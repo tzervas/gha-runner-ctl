@@ -82,7 +82,27 @@
 # substitute — it degrades gracefully (a cold volume just means a slower first resolve) but
 # provides no content-addressed guarantee and no zero-egress guarantee on its own.
 
-FROM localhost/fleet-runner-python:0.1.0
+# BASE_* ARGs parameterize the parent so class images can be mixed and matched:
+#   - publish/pull bases from a registry (a `localhost/` name cannot be pulled)
+#   - use `podman build --cache-from <registry-ref>` against a real cache parent
+#     (verified available on the target host: podman 4.3.1 has --cache-from/--cache-to)
+#   - compose on a different base or base version without editing this file
+# Defaults reproduce today's behaviour exactly, so existing local builds are unchanged.
+#   podman build --build-arg BASE_REGISTRY=ghcr.io/tzervas --build-arg BASE_TAG=0.2.0 ...
+#
+# CRITICAL podman/OCI gotcha: an ARG declared before FROM is consumed BY the FROM
+# instruction and is NOT in scope in the build stage afterwards. Re-declare it after
+# FROM if it is needed later. Forgetting yields an empty string at build time with no
+# error — a silent failure, which ranks worse here than a loud one.
+ARG BASE_REGISTRY=localhost
+ARG BASE_IMAGE=fleet-runner-python
+ARG BASE_TAG=0.1.0
+FROM ${BASE_REGISTRY}/${BASE_IMAGE}:${BASE_TAG}
+
+# Re-declare: ARG-before-FROM values are not in scope after FROM (see gotcha above).
+ARG BASE_REGISTRY
+ARG BASE_IMAGE
+ARG BASE_TAG
 
 # Should track the PYTHON_VERSION already baked into fleet-runner-python above, so
 # `uv venv`/`uv sync` reuse the already-installed managed CPython instead of fetching a

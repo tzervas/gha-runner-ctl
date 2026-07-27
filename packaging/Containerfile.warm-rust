@@ -26,16 +26,20 @@
 # Containerfile.runner-rust layered on fleet-runner-base, matching the shell/python
 # pattern) once that class is packaged, and delete this note.
 #
-# TAG TENSION, flagged rather than papered over: this repo's style rule is
-# "tag <name>:<semver>, NEVER :latest" (see packaging/Containerfile.runner-python etc.),
-# but packaging/Containerfile — the image this file FROMs — has no semver tag defined
-# anywhere in this repo; its only documented tag is `localhost/gha-runner-ctl:latest`
-# (src/lib.rs DEFAULT_IMAGE, docs/WORK_IMAGES.md, docs/QUICKSTART.md all agree on this).
-# Inventing a semver this repo does not actually use for that image would be worse than
-# stating the gap, so BASE_TAG is an explicit ARG the builder must set to whatever tag of
-# packaging/Containerfile it has locally; the default below matches what ships today.
-# Update this default (and drop this paragraph) once packaging/Containerfile itself adopts
-# semver tagging.
+# TAG TENSION — RESOLVED. This paragraph previously recorded that this file had to FROM
+# the 2.42 GB monolith (packaging/Containerfile), whose only documented tag is
+# `localhost/gha-runner-ctl:latest`, in direct tension with this repo's "NEVER :latest"
+# rule — because no `rust` CLASS image existed to layer on.
+#
+# One now does: packaging/Containerfile.runner-rust, a thin rust toolchain layer on the
+# digest-pinned debian base, tagged `fleet-runner-rust:<semver>`. So this file now FROMs
+# a properly-tagged class image and the :latest default is gone.
+#
+# This also changes the DISTRO under the warm layer: the monolith is built from an
+# unpinned `ubuntu:24.04`, while every class image is built from digest-pinned
+# `debian:bookworm-slim`. That is a real behavioural difference (package names, glibc),
+# not just a size reduction, and is worth knowing when comparing a warm image built
+# before and after this change.
 #
 # BUILD CONTEXT CONTRACT: exactly the consuming repo's Cargo manifests, nothing else:
 #   Cargo.toml
@@ -86,8 +90,27 @@
 # complement to this image, not a substitute: it degrades gracefully but gives no
 # content-addressed guarantee and no zero-egress guarantee on its own.
 
-ARG BASE_TAG=latest
-FROM localhost/gha-runner-ctl:${BASE_TAG}
+# BASE_* ARGs parameterize the parent so class images can be mixed and matched:
+#   - publish/pull bases from a registry (a `localhost/` name cannot be pulled)
+#   - use `podman build --cache-from <registry-ref>` against a real cache parent
+#     (verified available on the target host: podman 4.3.1 has --cache-from/--cache-to)
+#   - compose on a different base or base version without editing this file
+# Defaults reproduce today's behaviour exactly, so existing local builds are unchanged.
+#   podman build --build-arg BASE_REGISTRY=ghcr.io/tzervas --build-arg BASE_TAG=0.2.0 ...
+#
+# CRITICAL podman/OCI gotcha: an ARG declared before FROM is consumed BY the FROM
+# instruction and is NOT in scope in the build stage afterwards. Re-declare it after
+# FROM if it is needed later. Forgetting yields an empty string at build time with no
+# error — a silent failure, which ranks worse here than a loud one.
+ARG BASE_REGISTRY=localhost
+ARG BASE_IMAGE=fleet-runner-rust
+ARG BASE_TAG=0.1.0
+FROM ${BASE_REGISTRY}/${BASE_IMAGE}:${BASE_TAG}
+
+# Re-declare: ARG-before-FROM values are not in scope after FROM (see gotcha above).
+ARG BASE_REGISTRY
+ARG BASE_IMAGE
+ARG BASE_TAG
 
 USER runner
 WORKDIR /home/runner/warm-src
