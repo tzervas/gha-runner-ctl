@@ -1,0 +1,157 @@
+# Publish fleet-runner-* images to GHCR — the COLD, no-application-secret image pipeline.
+# See docs/WORK_IMAGES.md "cold vs hot" for the split this implements.
+#
+# NO APPLICATION SECRET is used anywhere in this workflow. The only credential is the
+# automatic, per-run `GITHUB_TOKEN` (scoped down to `packages: write` below, `contents:
+# read` otherwise) — GitHub mints and revokes it per run, it is not a fleet/application
+# secret, and it is exactly what makes it safe for these images to be public/cacheable in
+# GHCR: nothing this workflow can bake into a layer is capable of leaking an application
+# credential, because none is ever present in this job.
+#
+# ARCHITECTURE FLAG — read before relying on this in production: docs/WORK_IMAGES.md's
+# "build" mode shows packaging/Containerfile is normally built with `podman build` run
+# directly on the fleet HOST by the `gha-runner-ctl prepare` CLI, not inside a spawned work
+# container — and that same doc states plainly that spawned work containers must NOT nest
+# podman/docker (the cited failure: mycelium-lang's `draw-in-container.sh` erroring "need
+# podman or docker"). This workflow instead runs `podman build`/`podman push` as ordinary
+# job steps on the self-hosted runner labels below. That only works if the runner pool
+# behind those labels has real host-level podman access — the same access `gha-runner-ctl
+# prepare` already assumes — and NOT a plain nested work container with no engine. This is
+# ASSUMED here, not verified: there was no way to inspect this repo's live runner-pool
+# topology while writing this file. If these labels actually resolve to a no-engine work
+# container, this workflow will fail with the same "need podman or docker" error
+# WORK_IMAGES.md already documents for the analogous case. Confirm the runner pool backing
+# `[..., podman, medium, base]` genuinely has podman before depending on this.
+#
+# QUADLET — deliberately NOT used. Measured on the target host: Debian 12 (bookworm),
+# podman 4.3.1+ds1-8+deb12u1+b3, no backports configured, and `find /usr /opt -name
+# 'quadlet*'` empty. Quadlet (`.build`/`.image` units under
+# ~/.config/containers/systemd/) requires podman >= 4.4 — writing one today would silently
+# generate nothing on this host, which is this fleet's worst failure shape. Every
+# build/push step below is plain `podman build` / `podman push` / `podman pull` /
+# `podman inspect`, all present in 4.3.1. See docs/WORK_IMAGES.md for the fleet's stated
+# future direction once the host's podman is upgraded to 4.4+.
+#
+# BUILD FLAGS — only flags confirmed to exist in podman 4.3.1 are used (`build -f -t
+# --label --build-arg`, `push`, `pull`, `login`, `inspect --format`). No
+# `--cache-from`/`--cache-to`: those could not be verified against 4.3.1 without network
+# access while writing this file, so they are not used rather than silently assumed;
+# revisit once confirmed available on the actual runner pool.
+#
+# BUILD CONTEXT — each build uses `packaging/` (not the repo root) as its context, even
+# though packaging/Containerfile.runner-base's own header comment shows `... -t
+# fleet-runner-base:0.1.0 .` (repo root). That documented command cannot actually satisfy
+# its own `COPY entrypoint.sh /entrypoint.sh` step, because entrypoint.sh lives at
+# packaging/entrypoint.sh, not at the repo root — confirmed by `find . -iname
+# entrypoint.sh` returning exactly one match, under packaging/. This workflow uses the
+# context that actually works; the stale header comment in that file is a separate,
+# pre-existing inconsistency this change does not otherwise touch.
+#
+# DEPENDENCY ORDER — fleet-runner-shell and fleet-runner-python both `FROM
+# localhost/fleet-runner-base:<tag>` (a LOCAL tag, not a registry pull — see those
+# Containerfiles' own headers). That means base MUST be built into this job's local podman
+# storage before shell/python are built, and all three MUST run in the same job (shared
+# local storage) — splitting them across jobs on possibly-different runners would break
+# the `FROM localhost/...` reference. Warm images (Containerfile.warm-python,
+# Containerfile.warm-rust) are per-consumer-repo artifacts, not part of this fleet-image
+# set, and are intentionally NOT built here; adding them later (or a future
+# fleet-runner-rust class) is a new call to the same `build_and_maybe_push` helper below,
+# not a restructuring of this file.
+#
+# SKIP-IF-UNCHANGED — each image is built with the OCI label
+# `fleet.source-sha256=<hash>`, where `<hash>` is the sha256 of the exact Containerfile
+# (plus entrypoint.sh for base) that produced it. Before building, the workflow tries to
+# pull the CURRENT `ghcr.io/tzervas/<image>:<semver>` tag and inspect that label; if it
+# already equals the freshly computed hash of the current source, the build AND the push
+# are both skipped — the registry already holds the exact content this run would produce.
+# Any source edit changes the hash, so a stale image can never be mistaken for a fresh one.
+name: publish-images
+
+on:
+  workflow_dispatch:
+    inputs:
+      semver:
+        description: 'Tag to publish fleet-runner-* images as (e.g. 0.1.0)'
+        required: true
+        default: '0.1.0'
+  push:
+    branches: [main, dev]
+    paths:
+      - 'packaging/**'
+
+concurrency:
+  group: publish-images-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  ORG: tzervas
+  SEMVER: ${{ github.event.inputs.semver || '0.1.0' }}
+
+jobs:
+  publish:
+    name: build + publish fleet-runner-base/shell/python (cold, no secrets)
+    runs-on: [self-hosted, linux, x64, podman, medium, base]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Log in to GHCR (GITHUB_TOKEN only — no application secret)
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "${GHCR_TOKEN}" | podman login "${REGISTRY}" \
+            -u "${{ github.actor }}" --password-stdin
+
+      - name: Write build_and_maybe_push helper
+        run: |
+          set -euo pipefail
+          cat > /tmp/build_and_maybe_push.sh <<'HELPER_EOF'
+          #!/usr/bin/env bash
+          # Usage: build_and_maybe_push.sh <image-name> <containerfile> [extra hash inputs...]
+          set -euo pipefail
+          name="$1"
+          file="$2"
+          shift 2
+          extra_files=("$@")
+          local_tag="localhost/${name}:${SEMVER}"
+          remote_tag="${REGISTRY}/${ORG}/${name}:${SEMVER}"
+          src_hash="$(sha256sum "$file" "${extra_files[@]}" 2>/dev/null | sha256sum | cut -d' ' -f1)"
+          echo "computed source hash for ${name}: ${src_hash}"
+          remote_hash=""
+          if podman pull "$remote_tag" >/tmp/pull.log 2>&1; then
+              remote_hash="$(podman inspect --format '{{ index .Config.Labels "fleet.source-sha256" }}' "$remote_tag" 2>/dev/null || true)"
+          else
+              echo "no existing ${remote_tag} in registry (or pull failed) — will build"
+              cat /tmp/pull.log || true
+          fi
+          if [ -n "$remote_hash" ] && [ "$remote_hash" = "$src_hash" ]; then
+              echo "SKIP: ${remote_tag} already matches source hash ${src_hash} — no rebuild/repush"
+              podman tag "$remote_tag" "$local_tag"
+              exit 0
+          fi
+          echo "BUILD: ${name} (hash ${src_hash})"
+          podman build -f "$file" -t "$local_tag" \
+            --label "fleet.source-sha256=${src_hash}" \
+            packaging/
+          podman tag "$local_tag" "$remote_tag"
+          podman push "$remote_tag"
+          HELPER_EOF
+          chmod +x /tmp/build_and_maybe_push.sh
+
+      - name: base — build + publish
+        run: /tmp/build_and_maybe_push.sh fleet-runner-base packaging/Containerfile.runner-base packaging/entrypoint.sh
+
+      - name: shell — build + publish (needs base, same job/local-store)
+        run: /tmp/build_and_maybe_push.sh fleet-runner-shell packaging/Containerfile.runner-shell
+
+      - name: python — build + publish (needs base, same job/local-store)
+        run: /tmp/build_and_maybe_push.sh fleet-runner-python packaging/Containerfile.runner-python
+
+      - name: Log out of GHCR
+        if: always()
+        run: podman logout "${REGISTRY}" || true

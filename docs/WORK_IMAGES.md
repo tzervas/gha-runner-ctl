@@ -6,6 +6,101 @@ the image; the fleet agent injects the runner kit and entrypoint when needed.
 Nothing is locked to `localhost/gha-runner-ctl` except the **default** convenience
 tag used by `image-mode=auto`.
 
+## Cold vs hot
+
+Fleet runners have **no general egress** (measured 2026-07-26: gha-runner-ctl#51's
+standards gate failed at "Ensure PyYAML" because the image lacked it and the job could not
+fetch it; `tzervas/fleet-ops`'s render-backlog workflow cannot succeed on any self-hosted
+runner today because `gh` is on no runner image either). That single fact drives a hard
+split between what may be baked into an image and what must never be:
+
+| | COLD | HOT |
+|---|---|---|
+| **What** | Tooling + pre-resolved dependencies (uv, uv-managed CPython, ruff, pytest, gitleaks, gh, and — via the warm-image pattern below — a repo's exact locked Python/Rust dependency set) | Application secrets, and the repo checkout itself |
+| **Built with** | **No application secret**, ever | Injected at container **instantiation**, via the fleet's `secret exec` wrapper |
+| **Where it lives** | Baked into an image layer, published to GHCR, content-addressed | Never in a layer — mounted/exported into the running container only |
+| **Files** | `packaging/Containerfile`, `packaging/Containerfile.runner-{base,shell,python}`, `packaging/Containerfile.warm-{python,rust}` | `entrypoint.sh` (registration token), the fleet's secret-injection path, `actions/checkout` |
+
+**Why this is mandatory, not an optimization:** with no egress at job time, a job-time `uv
+sync` or `cargo fetch`/`build` cannot resolve or download a single package — it will fail
+every time, not just run slowly. Pre-resolving dependencies at image-build time (where
+egress does exist, the same assumption every pinned-binary `RUN curl ...` step in these
+Containerfiles already depends on) is the only way the dependency set can ever be present
+when the job actually executes. Caching is a side effect of this split, not its purpose.
+
+**Content addressing (warm images):** `packaging/Containerfile.warm-python` and
+`Containerfile.warm-rust` bake ONE consuming repo's exact locked dependency set
+(`uv sync --frozen` / `cargo fetch --locked` — frozen/locked so the image can never
+silently drift from the lock the repo actually committed). Because the tag is derived from
+the lock's own hash, a cache hit is provable and a stale image can never be mistaken for a
+fresh one:
+
+```bash
+# Python
+TAG="fleet-warm-python:<repo>-$(sha256sum uv.lock | cut -c1-12)"
+# Rust
+TAG="fleet-warm-rust:<repo>-$(sha256sum Cargo.lock | cut -c1-12)"
+```
+
+### Operator runbook — warm images
+
+**Rebuild a warm image after a lock changes:**
+
+```bash
+# Python — build context is ONLY the two manifest files, never the repo tree/secrets
+mkdir -p /tmp/warm-ctx && cp pyproject.toml uv.lock /tmp/warm-ctx/
+TAG="fleet-warm-python:<repo>-$(sha256sum uv.lock | cut -c1-12)"
+podman build -f packaging/Containerfile.warm-python -t "$TAG" /tmp/warm-ctx
+podman tag "$TAG" "ghcr.io/tzervas/$TAG"
+podman push "ghcr.io/tzervas/$TAG"
+
+# Rust — same idea, Cargo.toml + Cargo.lock only
+mkdir -p /tmp/warm-ctx && cp Cargo.toml Cargo.lock /tmp/warm-ctx/
+TAG="fleet-warm-rust:<repo>-$(sha256sum Cargo.lock | cut -c1-12)"
+podman build -f packaging/Containerfile.warm-rust -t "$TAG" /tmp/warm-ctx
+```
+
+A repo whose lock hasn't changed never needs a rebuild: the tag it already points at
+(`GHA_IMAGE=ghcr.io/tzervas/fleet-warm-python:<repo>-<hash>`) is still exactly right,
+because the hash is the lock.
+
+**Verify a cache hit (i.e. that the job actually used the baked venv/registry and did not
+silently fall back to a live resolve):**
+
+```bash
+# Python — job-time `uv sync --frozen` inside the warm image should report 0 to
+# install/resolve; anything else means the venv wasn't actually pre-populated.
+uv sync --frozen --python 3.13.14  # inside the running container
+# Rust — job-time build should succeed fully offline:
+cargo build --offline
+```
+
+If either command needs network access to complete, the warm image is stale, was built
+from a different lock than the one now committed, or was never built at all — check the
+tag's lock-hash suffix against `sha256sum uv.lock`/`sha256sum Cargo.lock` in the repo the
+job actually checked out.
+
+### Quadlet — not used, and why
+
+Podman >= 4.4 ships Quadlet (`.container`/`.image`/`.build`/`.volume`/`.kube` units under
+`~/.config/containers/systemd/`), which would be a natural fit for declaring these image
+builds and their target volumes declaratively. It is **deliberately not used anywhere in
+this pipeline**: the target host is measured as Debian GNU/Linux 12 (bookworm) running
+podman `4.3.1+ds1-8+deb12u1+b3`, with no backports repository configured (apt candidate is
+still 4.3.1) and no Quadlet generator present anywhere (`find /usr /opt -name 'quadlet*'`
+is empty). A Quadlet unit written today would be silently inert on this host — no error,
+no unit, nothing — which is this fleet's single worst failure shape (see Honest CI,
+`docs/HONEST_CI.md`). Every build/push mechanism in this pipeline (`packaging/Containerfile.warm-*`,
+`.github/workflows/publish-images.yml`) therefore uses plain `podman build` / `podman
+push` / `podman pull`, all confirmed present in 4.3.1. Revisit Quadlet once the host's
+podman is upgraded to >= 4.4.
+
+As a complementary, degrade-gracefully cache that DOES work on 4.3.1 today: a named
+`podman volume` (e.g. `fleet-uv-cache`, `fleet-cargo-registry`) mounted into warm-image
+builds and job containers (`-v fleet-uv-cache:/home/runner/.cache/uv`) speeds up repeat
+resolves across different repos/locks without depending on any baked layer — it just has
+no content-addressing or zero-egress guarantee of its own, unlike the warm images above.
+
 ## Workflow-selectable image + arch (issue #28)
 
 Fleet runners are Podman containers with **no in-container engine**. Jobs must

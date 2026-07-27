@@ -4,6 +4,12 @@
 #
 # Fleet work tools (baked in so jobs need not per-install):
 #   - gitleaks (pinned binary → /usr/local/bin)
+#   - gh / GitHub CLI (pinned binary → /usr/local/bin) — see the GH_SHA256
+#     TODO(checksum) note below; jobs that shell out to `gh api ...` (e.g.
+#     tzervas/fleet-ops's render-backlog workflow) cannot succeed on any runner
+#     that lacks this, since runners have no general egress to fetch it at job
+#     time (measured 2026-07-26: `grep -riE 'github-cli|cli/cli'` over this
+#     file was empty before this change).
 #   - Rust 1.96 via rustup for UID 1001 (/home/runner/.cargo)
 #   - FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true (JS actions on bundled node24)
 #
@@ -20,6 +26,22 @@ ARG RUNNER_UID=1001
 # gitleaks pin: https://github.com/gitleaks/gitleaks/releases/tag/v8.30.1
 ARG GITLEAKS_VERSION=8.30.1
 ARG GITLEAKS_SHA256=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+# gh (GitHub CLI) pin — TODO(checksum): UNRESOLVED, do not build with this value.
+# Why unresolved: this ARG block was authored by an agent with no network egress, so it
+# cannot download the release asset to compute its sha256. This fleet's rule (see the
+# gitleaks pin above, and uv/ruff/shellcheck/shfmt/bats in the runner-* Containerfiles) is
+# that every pinned-binary checksum is recomputed by hand from a fresh download by whoever
+# actually can reach the asset — never invented or copied from an untrusted source. A party
+# with egress must resolve this before the image builds:
+#   1. Pick the gh release to pin, e.g. https://github.com/cli/cli/releases/tag/v<X>
+#   2. Run: curl -fsSL \
+#        https://github.com/cli/cli/releases/download/v<X>/gh_<X>_linux_amd64.tar.gz \
+#        | sha256sum
+#   3. Set GH_VERSION=<X> and GH_SHA256=<the resulting hex digest> below.
+# Until then GH_SHA256 is a deliberately invalid placeholder so `sha256sum -c` in the RUN
+# block below fails loudly instead of silently trusting an unverified download.
+ARG GH_VERSION=2.63.2
+ARG GH_SHA256=TODO_CHECKSUM_UNRESOLVED_NO_EGRESS_SEE_HEADER_COMMENT_ABOVE
 # MSRV / rust-toolchain.toml channel
 ARG RUST_TOOLCHAIN=1.96
 
@@ -89,6 +111,17 @@ RUN tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
 RUN install -m 755 /tmp/gitleaks /usr/local/bin/gitleaks
 RUN rm -f /tmp/gitleaks /tmp/gitleaks.tar.gz
 RUN gitleaks version
+
+# gh (GitHub CLI) pinned binary → /usr/local/bin — see the GH_SHA256
+# TODO(checksum) ARG comment above: this build will fail sha256sum -c until
+# that value is filled in by a party with network egress.
+RUN curl -fsSL -o /tmp/gh.tar.gz \
+      "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz"
+RUN echo "${GH_SHA256}  /tmp/gh.tar.gz" | sha256sum -c -
+RUN tar -xzf /tmp/gh.tar.gz -C /tmp
+RUN install -m 755 "/tmp/gh_${GH_VERSION}_linux_amd64/bin/gh" /usr/local/bin/gh
+RUN rm -rf /tmp/gh.tar.gz "/tmp/gh_${GH_VERSION}_linux_amd64"
+RUN gh --version
 
 # Rust via rustup for runner (UID 1001): cargo/rustc on default PATH for non-login shells.
 # Matches package rust-version / rust-toolchain.toml (1.96) + rustfmt/clippy.
