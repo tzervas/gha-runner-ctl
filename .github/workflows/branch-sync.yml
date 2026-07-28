@@ -52,6 +52,50 @@ jobs:
           # separate PAT. We never push --force to main/dev/sec.
           persist-credentials: true
 
+      - name: Ensure GitHub CLI (gh)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if command -v gh >/dev/null 2>&1; then
+            gh --version
+            exit 0
+          fi
+          # NO sudo (rootless podman + no_new_privs). Prefer image-baked gh
+          # (ghcr.io/tzervas/ap-workflows/runner-base); else checksum-verified tarball.
+          case "$(uname -m)" in
+            x86_64|amd64)  ARCH=amd64 ;;
+            aarch64|arm64) ARCH=arm64 ;;
+            *) echo "::error::unsupported architecture $(uname -m)"; exit 1 ;;
+          esac
+          VER="$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                   https://api.github.com/repos/cli/cli/releases/latest \
+                 | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p' | head -1)"
+          if [ -z "$VER" ]; then
+            echo "::error::could not resolve a gh release version — bake gh into the runner image"
+            exit 1
+          fi
+          TB="gh_${VER}_linux_${ARCH}.tar.gz"
+          BASE="https://github.com/cli/cli/releases/download/v${VER}"
+          TMP="$(mktemp -d)"
+          curl -fsSL -o "$TMP/$TB" "$BASE/$TB"
+          curl -fsSL -o "$TMP/sums" "$BASE/gh_${VER}_checksums.txt"
+          ( cd "$TMP" && grep " $TB$" sums | sha256sum -c - ) || {
+            echo "::error::gh tarball checksum mismatch — refusing to install" >&2
+            exit 1
+          }
+          tar -xzf "$TMP/$TB" -C "$TMP"
+          mkdir -p "$RUNNER_TEMP/bin"
+          install -m 0755 "$TMP/gh_${VER}_linux_${ARCH}/bin/gh" "$RUNNER_TEMP/bin/gh"
+          rm -rf "$TMP"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          export PATH="$RUNNER_TEMP/bin:$PATH"
+          command -v gh >/dev/null 2>&1 || {
+            echo "::error::gh not available after install — fail" >&2
+            exit 1
+          }
+          gh --version
+
       - name: Reconcile ${{ matrix.branch }} with main
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

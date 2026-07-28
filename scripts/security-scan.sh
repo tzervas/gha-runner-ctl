@@ -60,18 +60,19 @@ else
 fi
 
 note "trivy fs (vuln + secret + misconfig)"
-if command -v trivy >/dev/null
+# Prefer preinstalled trivy from runner image (ap-workflows runner-base).
+# Missing tool must be RED — never silent green / optional skip.
+if ! command -v trivy >/dev/null
 then
-  if ! trivy fs --scanners vuln,secret,misconfig \
-    --severity HIGH,CRITICAL \
-    --skip-dirs dist,target \
-    --exit-code 1 \
-    .
-  then
-    FAIL=1
-  fi
-else
-  echo "trivy unavailable (optional)"
+  echo "trivy missing from runner image" >&2
+  FAIL=1
+elif ! trivy fs --scanners vuln,secret,misconfig \
+  --severity HIGH,CRITICAL \
+  --skip-dirs dist,target \
+  --exit-code 1 \
+  .
+then
+  FAIL=1
 fi
 
 if (( FAIL != 0 ))
