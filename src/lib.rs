@@ -329,7 +329,12 @@ pub struct Cli {
 
     /// Seconds a repo may go unpolled before it is promoted to the front of the demand poll
     /// order. Fairness is on last-polled, not last-served. `0` disables promotion (legacy order).
-    #[arg(long, env = "GHA_STARVATION_SECS", default_value_t = 300, global = true)]
+    #[arg(
+        long,
+        env = "GHA_STARVATION_SECS",
+        default_value_t = 300,
+        global = true
+    )]
     starvation_secs: u64,
 
     /// Max number of starvation-promoted repos inserted ahead of the hot/RR set per demand tick.
@@ -4373,7 +4378,9 @@ fn repo_last_polled_state_path(container: &str) -> PathBuf {
         })
         .collect();
     let user_suffix = current_username();
-    dir.join(format!("gha-runner-ctl-last-polled-{safe}-{user_suffix}.txt"))
+    dir.join(format!(
+        "gha-runner-ctl-last-polled-{safe}-{user_suffix}.txt"
+    ))
 }
 
 /// Load `owner/repo=unix_secs` lines. Missing file, unreadable file, or garbage → empty map.
@@ -4405,10 +4412,7 @@ fn load_repo_last_polled(path: &std::path::Path) -> std::collections::HashMap<St
 
 /// Persist last-polled map. On failure, log once (caller may call every return path;
 /// we always log the write error so an operator can see a stuck filesystem).
-fn save_repo_last_polled(
-    path: &std::path::Path,
-    map: &std::collections::HashMap<String, u64>,
-) {
+fn save_repo_last_polled(path: &std::path::Path, map: &std::collections::HashMap<String, u64>) {
     let mut lines: Vec<String> = map
         .iter()
         .map(|(repo, ts)| format!("{repo}={ts}"))
@@ -4446,9 +4450,7 @@ fn warn_priority_repo_not_in_allowlist(name: &str) {
         Err(p) => p.into_inner(),
     };
     if guard.insert(name.to_string()) {
-        eprintln!(
-            "listen: WARNING priority repo {name} not in prefer allowlist — ignored"
-        );
+        eprintln!("listen: WARNING priority repo {name} not in prefer allowlist — ignored");
     }
 }
 
@@ -6461,7 +6463,7 @@ mod robust_queue_tests {
         let priority: Vec<String> = vec![];
         let now = 5_000u64;
         let last = map_of(&[("old/a", 1u64)]); // polled long ago, still starved
-        // new/b absent from map → never polled
+                                               // new/b absent from map → never polled
         let rr: Vec<String> = vec![];
         let order = build_poll_order(&repos, &priority, &last, now, 300, 2, &rr);
         assert_eq!(order, repo_list(&["new/b", "old/a"]));
