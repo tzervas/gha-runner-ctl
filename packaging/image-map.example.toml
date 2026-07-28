@@ -21,9 +21,9 @@ rocky-9 = "docker.io/library/rockylinux:9"
 # copy-verbatim org (tzervas), even though this file stays an EXAMPLE overlay — a reader
 # still needs to point GHA_IMAGE_MAP at their own copy, and to keep <semver> in sync with
 # whatever the publish workflow last actually pushed.
-base = "ghcr.io/tzervas/fleet-runner-base:0.1.0"
-shell = "ghcr.io/tzervas/fleet-runner-shell:0.1.0"
-python = "ghcr.io/tzervas/fleet-runner-python:0.1.0"
+base = "ghcr.io/tzervas/fleet-runner-base:0.1.1"
+shell = "ghcr.io/tzervas/fleet-runner-shell:0.1.1"
+python = "ghcr.io/tzervas/fleet-runner-python:0.1.1"
 # Per-repo dependency WARM images (packaging/Containerfile.warm-python /
 # Containerfile.warm-rust) are NOT fleet-wide class labels — they are content-addressed
 # per-repo, per-lock-hash tags (fleet-warm-python:<repo>-<lock-hash>), so they do not get a
