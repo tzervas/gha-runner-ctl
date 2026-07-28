@@ -1,7 +1,7 @@
 # The development-standards gate
 
 `.github/workflows/standards.yml` is a thin caller for
-[`tzervas/ap-workflows/.github/workflows/reusable-policy-contract.yml@v0.1.0`](https://github.com/tzervas/ap-workflows/blob/v0.1.0/.github/workflows/reusable-policy-contract.yml).
+[`tzervas/ap-workflows/.github/workflows/reusable-policy-contract.yml@v0.1`](https://github.com/tzervas/ap-workflows/blob/v0.1/.github/workflows/reusable-policy-contract.yml).
 All policy lives centrally; this repo carries only its overrides. Full rule reference, the
 operator commands, and the known limits are in
 [`ap-workflows/docs/STANDARDS.md`](https://github.com/tzervas/ap-workflows/blob/main/docs/STANDARDS.md).
