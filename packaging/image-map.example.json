@@ -8,9 +8,9 @@
     "fedora-40": "docker.io/library/fedora:40",
     "alpine-3.20": "docker.io/library/alpine:3.20",
     "custom-ci": "ghcr.io/example/ci-base:2026.07",
-    "base": "ghcr.io/tzervas/fleet-runner-base:0.1.1",
-    "shell": "ghcr.io/tzervas/fleet-runner-shell:0.1.1",
-    "python": "ghcr.io/tzervas/fleet-runner-python:0.1.1"
+    "base": "ghcr.io/tzervas/fleet-runner-base:0.1.2",
+    "shell": "ghcr.io/tzervas/fleet-runner-shell:0.1.2",
+    "python": "ghcr.io/tzervas/fleet-runner-python:0.1.2"
   },
   "arches": {
     "arm64": "linux/arm64",

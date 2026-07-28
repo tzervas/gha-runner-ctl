@@ -26,14 +26,17 @@
 #   docker.io/library/debian:bookworm-slim -> sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
 #
 # Carries (per the frozen class table): runner agent, git, curl, jq, tar, gzip, gitleaks,
-# python3 + PyYAML.
+# python3 + PyYAML, ripgrep, fd.
 # Runner tarball pin: actions/runner v2.336.0 (latest as of 2026-07-28); linux-x64
 # SHA-256 re-verified (sha256sum) against a fresh download on 2026-07-28.
 # gitleaks pin: still v8.30.1 (latest; no newer release as of 2026-07-28).
-#   Upstream release binary is Go 1.24.11 (stdlib CVE-2025-68121 FixedVersion
-#   1.24.13). We rebuild gitleaks from the v8.30.1 tag with golang:1.24-bookworm
-#   (Go 1.24.13) until upstream publishes a newer asset — see SECURITY-CVE.md.
-# Residual CRITICAL CVEs with no Debian FixedVersion: see packaging/SECURITY-CVE.md.
+#   Rebuild from tag v8.30.1 with golang:1.26-bookworm (Go 1.26.5 — latest stable)
+#   and golang.org/x/crypto@v0.54.0 so CRITICAL/HIGH stdlib + x/crypto clear.
+# .NET HIGH: runner still embeds Microsoft.NETCore.App 8.0.28; overlay official
+#   Microsoft runtime 8.0.29 (same bits as packages.microsoft.com dotnet-runtime-8.0).
+# Node policy (rust-first HIGH): do NOT expand npm. Drop unused node20 trees under
+#   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24; only one-line tarball bumps on retained node24.
+# Residual unfixed CVEs: packaging/SECURITY-CVE.md.
 #
 # python3 + PyYAML addendum (2026-07-26): NOT a language-class toolchain — this is the same
 # shape as gitleaks above it. The fleet's development-standards gate
@@ -65,21 +68,29 @@
 #
 # Runs as non-root UID 1001 (trivy DS-0002), same convention as packaging/Containerfile.
 # Style: one logical step per RUN (no && chains) — matches packaging/Containerfile.
-# After edit: `podman build -f packaging/Containerfile.runner-base -t fleet-runner-base:0.1.1 .`
-# Security patch tag: fleet-runner-base:sec-20260728 (also :0.1.1, :dev).
+# After edit: `podman build -f packaging/Containerfile.runner-base -t fleet-runner-base:0.1.2 .`
+# Security patch tags: fleet-runner-base:sec-20260728-high (also :0.1.2, :dev).
+# Previous rollback tag: :0.1.1 / :sec-20260728 (CRITICAL-only harden).
 
 # ---------------------------------------------------------------------------
-# Stage: rebuild gitleaks with patched Go stdlib (CVE-2025-68121)
-# Upstream release asset is still v8.30.1 / Go 1.24.11; FixedVersion requires
-# Go 1.24.13+. Pin golang image by digest (Go 1.24.13 as of 2026-07-28).
+# Stage: rebuild gitleaks with latest stable Go + refreshed x/crypto
+# Upstream release asset is still v8.30.1 (Go 1.24.11). CRITICAL gate needed
+# Go 1.24.13+; HIGH gate needs stdlib FixedVersions up through 1.26.5 and
+# golang.org/x/crypto >= 0.52 (we pin latest stable 0.54.0). Build with
+# golang:1.26-bookworm (Go 1.26.5 as of 2026-07-28).
 # ---------------------------------------------------------------------------
-FROM docker.io/library/golang:1.24-bookworm@sha256:1a6d4452c65dea36aac2e2d606b01b4a029ec90cc1ae53890540ce6173ea77ac AS gitleaks-build
+FROM docker.io/library/golang:1.26-bookworm@sha256:1ecb7edf62a0408027bd5729dfd6b1b8766e578e8df93995b225dfd0944eb651 AS gitleaks-build
 
 ARG GITLEAKS_VERSION=8.30.1
+# Latest stable x/crypto as of 2026-07-28 (fixes HIGH CVE-2026-3982x / 4659x family).
+ARG X_CRYPTO_VERSION=v0.54.0
 ENV CGO_ENABLED=0
 RUN git clone --depth 1 --branch "v${GITLEAKS_VERSION}" \
       https://github.com/gitleaks/gitleaks.git /src
 WORKDIR /src
+# Bump vulnerable indirect modules before build (go.mod still pins x/crypto v0.35.0).
+RUN go get "golang.org/x/crypto@${X_CRYPTO_VERSION}"
+RUN go mod tidy
 RUN go build -trimpath \
       -ldflags="-s -w -X=github.com/zricethezav/gitleaks/v8/version.Version=${GITLEAKS_VERSION}" \
       -o /gitleaks .
@@ -102,16 +113,30 @@ ARG RUNNER_SHA256=04cf0be1aff4c3ec3554466c39124ca250e3effd8873bb7e8d68535aa9505d
 ARG RUNNER_UID=1001
 # gitleaks version tag (source rebuilt in gitleaks-build stage; no release-asset SHA).
 ARG GITLEAKS_VERSION=8.30.1
-# node-tar patch (CVE-2026-59873): runner 2.336.0 still ships tar 6.2.1 / 7.5.15.
+# .NET runtime overlay (HIGH): actions/runner 2.336.0 is still latest but ships
+# self-contained Microsoft.NETCore.App 8.0.28 (FixedVersion 8.0.29). Official
+# Microsoft linux-x64 runtime tarball — same bits as packages.microsoft.com
+# dotnet-runtime-8.0 8.0.29-1 — overlaid onto the runner bin (no npm).
+ARG DOTNET_RUNTIME_VERSION=8.0.29
+ARG DOTNET_RUNTIME_SHA256=dba346c5c4357e1befebf14de8c8ee7f09313cc12c7c0015a4cdd4dfd0efba81
+# node-tar patch (CVE-2026-59873): only retained node24 tree (node20 dropped).
 # FixedVersion is 7.5.19. Pin npm registry tarball by sha256 (fetched 2026-07-28).
 ARG NODE_TAR_VERSION=7.5.19
 ARG NODE_TAR_SHA256=191644f88c7dbd61121f913231ab328d1fc621f058e8ca334451b17cad85dfae
-# tar@7 peer deps needed when replacing node20's tar@6.x (same versions node24 already uses).
 ARG NODE_CHOWNR_SHA256=4c24f5daa630142252da89de655f7df090ea479450a8825897751d78321b1360
 ARG NODE_YALLIST_SHA256=7c9d43dbab7cab3b3133b0e6a5af14014482285316b39ec9f508efadd9ebce95
 ARG NODE_MINIPASS_SHA256=548f561a19434971254f09f21484c6bf9d1b9d037cdac62310616b351c44d516
 ARG NODE_MINIZLIB_SHA256=99bf2e29618172dd71f0654737490c68f71bc7e2379d473e38f9fef2dbece2e3
 ARG NODE_FS_MINIPASS_SHA256=1a81ff9c48fcad6f13824d71496f67f0a17a8bb79ec36abbafbba945ea9d4621
+# Minimal node24 HIGH one-line version bumps only (no npm install, no tree expansion).
+# brace-expansion 5.0.6→5.0.8, undici 6.26.0→6.27.0. Legacy node20 is deleted.
+ARG NODE_BRACE_EXPANSION_50_SHA256=a03b06e66d862d0278b1ff45b66427f245f99c665800dc9bd790c0c13d2247fe
+ARG NODE_UNDICI_SHA256=cb4ecdf54572260fbbbd0fb03929ff04ca1be8b3d3bb41e60e8b4a72fc2b1036
+# Rust static fleet utilities (checksum-pinned GitHub release assets).
+ARG RIPGREP_VERSION=15.2.0
+ARG RIPGREP_SHA256=33e15bcf1624b25cdd2a55813a47a2f95dbe126268203e76aa6a585d1e7b149c
+ARG FD_VERSION=10.4.2
+ARG FD_SHA256=e3257d48e29a6be965187dbd24ce9af564e0fe67b3e73c9bdcd180f4ec11bdde
 
 ENV DEBIAN_FRONTEND=noninteractive \
     RUNNER_HOME=/opt/actions-runner \
@@ -119,10 +144,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true
 
-# Node runtime for JavaScript actions: the runner tarball bundles node20 and node24.
-# Actions declaring `using: node20` are upgraded to the bundled node24 when this env is
-# set (GitHub's documented transition knob). Node 24 is the platform default as of
-# 2026-06-16; this env keeps the fleet on node24 even if the server flag rolls back.
+# Node runtime for JavaScript actions: upstream ships node20 + node24.
+# FORCE_JAVASCRIPT_ACTIONS_TO_NODE24 (GitHub transition knob; Node 24 platform
+# default since 2026-06-16) redirects node20 actions to node24. We drop the
+# unused node20 trees after extract so HIGH findings there do not require an
+# npm-patch maintenance surface (rust-first HIGH policy).
 
 # Install HTTPS transport and CA certificates first to support secure updates.
 RUN apt-get update \
@@ -167,6 +193,26 @@ COPY --from=gitleaks-build /gitleaks /usr/local/bin/gitleaks
 RUN chmod 755 /usr/local/bin/gitleaks
 RUN gitleaks version
 
+# Rust-first fleet utilities: ripgrep + fd (musl static release binaries).
+RUN curl -fsSL -o /tmp/ripgrep.tgz \
+      "https://github.com/BurntSushi/ripgrep/releases/download/${RIPGREP_VERSION}/ripgrep-${RIPGREP_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+RUN echo "${RIPGREP_SHA256}  /tmp/ripgrep.tgz" | sha256sum -c -
+RUN tar xzf /tmp/ripgrep.tgz -C /tmp \
+      "ripgrep-${RIPGREP_VERSION}-x86_64-unknown-linux-musl/rg" \
+      --strip-components=1
+RUN install -m 755 /tmp/rg /usr/local/bin/rg
+RUN rm -f /tmp/ripgrep.tgz /tmp/rg
+RUN rg --version
+RUN curl -fsSL -o /tmp/fd.tgz \
+      "https://github.com/sharkdp/fd/releases/download/v${FD_VERSION}/fd-v${FD_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+RUN echo "${FD_SHA256}  /tmp/fd.tgz" | sha256sum -c -
+RUN tar xzf /tmp/fd.tgz -C /tmp \
+      "fd-v${FD_VERSION}-x86_64-unknown-linux-musl/fd" \
+      --strip-components=1
+RUN install -m 755 /tmp/fd /usr/local/bin/fd
+RUN rm -f /tmp/fd.tgz /tmp/fd
+RUN fd --version
+
 # Seed dir holds extracted runner; snapshot volume mounts over RUNNER_HOME at runtime.
 RUN mkdir -p /opt/actions-runner-seed "${RUNNER_HOME}"
 WORKDIR /opt/actions-runner-seed
@@ -177,10 +223,68 @@ RUN echo "${RUNNER_SHA256}  actions-runner.tar.gz" \
 RUN tar xzf actions-runner.tar.gz
 RUN rm actions-runner.tar.gz
 
-# SECURITY: patch bundled npm node-tar (CVE-2026-59873) in node20 + node24.
-# actions/runner 2.336.0 still ships tar 6.2.1 (node20) and 7.5.15 (node24);
-# FixedVersion is 7.5.19. npm-registry tarballs are checksum-verified. Remove
-# this block once an upstream runner release ships tar >= 7.5.19 in both trees.
+# Drop legacy node20 trees: FORCE_JAVASCRIPT_ACTIONS_TO_NODE24 makes them unused
+# for JS actions, and they carry the bulk of fixable HIGH npm findings. Prefer
+# deletion over expanding npm/node_modules (rust-first HIGH policy).
+RUN rm -rf /opt/actions-runner-seed/externals/node20 \
+      /opt/actions-runner-seed/externals/node20_alpine
+
+# SECURITY: overlay Microsoft.NETCore.App 8.0.28 → 8.0.29 (HIGH gate).
+# actions/runner 2.336.0 is a self-contained net8.0 publish with runtime DLLs
+# in bin/ and deps.json pins at 8.0.28. FixedVersion for the HIGH cluster is
+# 8.0.29. Overlay official Microsoft runtime assemblies + hostfxr, then rewrite
+# only the Microsoft.NETCore.App.Runtime.linux-x64 version tokens and the
+# included framework version in *.runtimeconfig.json (do NOT blind-replace
+# "8.0.28" — assembly fileVersion strings like "8.0.2826.…" must stay intact
+# until the runtime pack's own fileVersions are applied via the DLL overlay).
+RUN curl -fsSL -o /tmp/dotnet-runtime.tar.gz \
+      "https://builds.dotnet.microsoft.com/dotnet/Runtime/${DOTNET_RUNTIME_VERSION}/dotnet-runtime-${DOTNET_RUNTIME_VERSION}-linux-x64.tar.gz"
+RUN echo "${DOTNET_RUNTIME_SHA256}  /tmp/dotnet-runtime.tar.gz" | sha256sum -c -
+RUN mkdir -p /tmp/dotnet-runtime \
+      && tar xzf /tmp/dotnet-runtime.tar.gz -C /tmp/dotnet-runtime
+RUN cp -a "/tmp/dotnet-runtime/shared/Microsoft.NETCore.App/${DOTNET_RUNTIME_VERSION}/." \
+      /opt/actions-runner-seed/bin/
+RUN cp -a "/tmp/dotnet-runtime/host/fxr/${DOTNET_RUNTIME_VERSION}/libhostfxr.so" \
+      /opt/actions-runner-seed/bin/libhostfxr.so
+# Version is argv[1] so ARG expands in the shell (not trapped inside single quotes).
+RUN printf '%s\n' \
+      'import json, pathlib, sys' \
+      'bin_dir = pathlib.Path("/opt/actions-runner-seed/bin")' \
+      'ver = sys.argv[1]' \
+      'old = "8.0.28"' \
+      'for path in bin_dir.glob("*.runtimeconfig.json"):' \
+      '    data = json.loads(path.read_text())' \
+      '    changed = False' \
+      '    for fw in data.get("runtimeOptions", {}).get("includedFrameworks", []):' \
+      '        if fw.get("name") == "Microsoft.NETCore.App" and fw.get("version") == old:' \
+      '            fw["version"] = ver' \
+      '            changed = True' \
+      '    if changed:' \
+      '        path.write_text(json.dumps(data, indent=2) + "\n")' \
+      '        print("runtimeconfig", path.name, ver)' \
+      'for path in bin_dir.glob("*.deps.json"):' \
+      '    text = path.read_text()' \
+      '    pin_old = chr(34) + "Microsoft.NETCore.App.Runtime.linux-x64" + chr(34) + ": " + chr(34) + old + chr(34)' \
+      '    pin_new = chr(34) + "Microsoft.NETCore.App.Runtime.linux-x64" + chr(34) + ": " + chr(34) + ver + chr(34)' \
+      '    key_old = "Microsoft.NETCore.App.Runtime.linux-x64/" + old' \
+      '    key_new = "Microsoft.NETCore.App.Runtime.linux-x64/" + ver' \
+      '    text2 = text.replace(pin_old, pin_new).replace(key_old, key_new)' \
+      '    if text2 != text:' \
+      '        path.write_text(text2)' \
+      '        print("deps", path.name, ver)' \
+      'rc = json.loads((bin_dir / "Runner.Listener.runtimeconfig.json").read_text())' \
+      'got = rc["runtimeOptions"]["includedFrameworks"][0]["version"]' \
+      'assert got == ver, (got, ver)' \
+      'print("dotnet overlay ok", ver)' \
+      > /tmp/patch-dotnet-version.py
+RUN python3 /tmp/patch-dotnet-version.py "${DOTNET_RUNTIME_VERSION}"
+RUN rm -f /tmp/patch-dotnet-version.py
+RUN rm -rf /tmp/dotnet-runtime /tmp/dotnet-runtime.tar.gz
+
+# SECURITY: patch bundled npm on retained node24 only (no npm install).
+# CRITICAL: node-tar (CVE-2026-59873) → 7.5.19 + tar@7 peer deps.
+# HIGH: brace-expansion 5.0.6→5.0.8, undici 6.26.0→6.27.0 (one-line tarball bumps).
+# Remove once upstream actions/runner ships fixed trees.
 RUN curl -fsSL -o /tmp/node-tar.tgz \
       "https://registry.npmjs.org/tar/-/tar-${NODE_TAR_VERSION}.tgz"
 RUN echo "${NODE_TAR_SHA256}  /tmp/node-tar.tgz" | sha256sum -c -
@@ -199,26 +303,33 @@ RUN echo "${NODE_MINIZLIB_SHA256}  /tmp/minizlib.tgz" | sha256sum -c -
 RUN curl -fsSL -o /tmp/fs-minipass.tgz \
       "https://registry.npmjs.org/@isaacs/fs-minipass/-/fs-minipass-4.0.0.tgz"
 RUN echo "${NODE_FS_MINIPASS_SHA256}  /tmp/fs-minipass.tgz" | sha256sum -c -
-RUN for node in node20 node24; do \
-      nm="/opt/actions-runner-seed/externals/${node}/lib/node_modules/npm/node_modules"; \
-      for pair in \
+RUN curl -fsSL -o /tmp/brace-expansion-5.0.8.tgz \
+      "https://registry.npmjs.org/brace-expansion/-/brace-expansion-5.0.8.tgz"
+RUN echo "${NODE_BRACE_EXPANSION_50_SHA256}  /tmp/brace-expansion-5.0.8.tgz" | sha256sum -c -
+RUN curl -fsSL -o /tmp/undici.tgz \
+      "https://registry.npmjs.org/undici/-/undici-6.27.0.tgz"
+RUN echo "${NODE_UNDICI_SHA256}  /tmp/undici.tgz" | sha256sum -c -
+RUN nm="/opt/actions-runner-seed/externals/node24/lib/node_modules/npm/node_modules" \
+      && for pair in \
         "tar:/tmp/node-tar.tgz" \
         "chownr:/tmp/chownr.tgz" \
         "yallist:/tmp/yallist.tgz" \
         "minipass:/tmp/minipass.tgz" \
-        "minizlib:/tmp/minizlib.tgz"; do \
+        "minizlib:/tmp/minizlib.tgz" \
+        "brace-expansion:/tmp/brace-expansion-5.0.8.tgz" \
+        "undici:/tmp/undici.tgz"; do \
         name="${pair%%:*}"; tgz="${pair##*:}"; \
         dest="${nm}/${name}"; \
         rm -rf "${dest}"; mkdir -p "${dest}"; \
         tar xzf "${tgz}" -C "${dest}" --strip-components=1; \
-      done; \
-      dest="${nm}/@isaacs/fs-minipass"; \
-      rm -rf "${dest}"; mkdir -p "${dest}"; \
-      tar xzf /tmp/fs-minipass.tgz -C "${dest}" --strip-components=1; \
-      python3 -c "import json; print('${node} tar', json.load(open('${nm}/tar/package.json'))['version'])"; \
-    done
+        python3 -c "import json; print('node24', '${name}', json.load(open('${dest}/package.json'))['version'])"; \
+      done \
+      && dest="${nm}/@isaacs/fs-minipass" \
+      && rm -rf "${dest}" && mkdir -p "${dest}" \
+      && tar xzf /tmp/fs-minipass.tgz -C "${dest}" --strip-components=1
 RUN rm -f /tmp/node-tar.tgz /tmp/chownr.tgz /tmp/yallist.tgz \
-      /tmp/minipass.tgz /tmp/minizlib.tgz /tmp/fs-minipass.tgz
+      /tmp/minipass.tgz /tmp/minizlib.tgz /tmp/fs-minipass.tgz \
+      /tmp/brace-expansion-5.0.8.tgz /tmp/undici.tgz
 
 RUN ./bin/installdependencies.sh
 RUN rm -rf /var/lib/apt/lists/*
