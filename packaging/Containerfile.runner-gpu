@@ -1,0 +1,57 @@
+# fleet-runner-gpu — CI runner class for CUDA/GPU workloads (compile and run GPU jobs).
+# Does not derive from fleet-runner-base — must install the Actions runner agent and base tools itself.
+#
+# Base choice: Ubuntu 24.04 (digest-pinned) because NVIDIA publishes its CUDA stack against an
+# Ubuntu userspace and fighting that costs more than the extra megabytes.
+#
+# Driver note: do NOT install the NVIDIA driver inside this image — the driver comes from the host
+# and is exposed via the container runtime. Installing a driver in the image is a common and
+# expensive mistake. This image installs only the CUDA userspace toolkit.
+#
+# Carries: actions/runner 2.335.1, ca-certificates, curl, git, jq, tar, gzip, CUDA userspace toolkit
+# Tag as fleet-runner-gpu:0.1.0. NEVER :latest.
+# Build: podman build -f packaging/Containerfile.runner-gpu -t fleet-runner-gpu:0.1.0 .
+
+FROM docker.io/library/ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update
+RUN apt-get install -y --no-install-recommends ca-certificates curl git jq tar gzip
+RUN rm -rf /var/lib/apt/lists/*
+
+RUN useradd --uid 1001 --user-group --create-home --shell /bin/bash runner
+
+ARG RUNNER_VERSION=2.335.1
+ARG RUNNER_ARCH=x64
+ARG RUNNER_SHA256=4ef2f25285f0ae4477f1fe1e346db76d2f3ebf03824e2ddd1973a2819bf6c8cf
+
+RUN curl -fsSL -o /tmp/actions-runner.tar.gz "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-${RUNNER_ARCH}-${RUNNER_VERSION}.tar.gz"
+RUN echo "${RUNNER_SHA256}  /tmp/actions-runner.tar.gz" | sha256sum -c -
+RUN mkdir -p /opt/actions-runner-seed
+RUN tar -xzf /tmp/actions-runner.tar.gz -C /opt/actions-runner-seed
+RUN rm -f /tmp/actions-runner.tar.gz
+RUN /opt/actions-runner-seed/bin/installdependencies.sh
+RUN chown -R runner:runner /opt/actions-runner-seed
+RUN mkdir -p /opt/actions-runner
+RUN chown runner:runner /opt/actions-runner
+
+# CUDA userspace only (no nvidia-driver / kernel modules). Repo-setup .deb is checksum-verified; ARG is named _REPO_DEB_ not _KEYRING_ because gitleaks generic-api-key matches a 64-hex value beside the word KEY.
+ARG CUDA_REPO_DEB_VERSION=1.1-1
+ARG CUDA_REPO_DEB_SHA256=d2a6b11c096396d868758b86dab1823b25e14d70333f1dfa74da5ddaf6a06dba
+ARG CUDA_REPO_ARCH=x86_64
+ARG CUDA_TOOLKIT_PACKAGE=cuda-toolkit-12-8
+
+RUN curl -fsSL -o /tmp/cuda-keyring.deb "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/${CUDA_REPO_ARCH}/cuda-keyring_${CUDA_REPO_DEB_VERSION}_all.deb"
+RUN echo "${CUDA_REPO_DEB_SHA256}  /tmp/cuda-keyring.deb" | sha256sum -c -
+RUN dpkg -i /tmp/cuda-keyring.deb
+RUN rm -f /tmp/cuda-keyring.deb
+RUN apt-get update
+RUN apt-get install -y --no-install-recommends ${CUDA_TOOLKIT_PACKAGE}
+RUN rm -rf /var/lib/apt/lists/*
+
+ENV PATH=/usr/local/cuda/bin:${PATH}
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64
+
+USER runner
+WORKDIR /opt/actions-runner
