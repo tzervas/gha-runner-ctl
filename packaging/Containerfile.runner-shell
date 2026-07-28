@@ -17,30 +17,40 @@
 # carries shellcheck. This class is what the `shell` job-label token
 # (`runs-on: [..., podman, <size>, shell]`) should resolve to.
 #
-# Every tool below is a vendor-published, self-contained Linux binary release,
-# downloaded and verified against a pinned upstream sha256 (recomputed by hand on
-# 2026-07-26 from a fresh download of each asset — all matched), matching the
-# gitleaks pattern already established in packaging/Containerfile.
+# shellcheck / bats: vendor-published release assets, checksum-pinned.
+# shfmt: upstream linux-amd64 release is Go 1.26.1 (HIGH stdlib FixedVersion needs
+# 1.26.5). Rebuild from tag v3.13.1 with golang:1.26-bookworm (Go 1.26.5) — same
+# pattern as gitleaks in Containerfile.runner-base. See packaging/SECURITY-CVE.md.
 #
 # Runs as non-root UID 1001 (inherited from fleet-runner-base).
 # Style: one logical step per RUN (no && chains) — matches packaging/Containerfile.
-# After edit: `podman build -f packaging/Containerfile.runner-shell -t fleet-runner-shell:0.1.0 .`
+# After edit: `podman build -f packaging/Containerfile.runner-shell -t fleet-runner-shell:0.1.2 .`
 
-# BASE_* ARGs parameterize the parent so class images can be mixed and matched:
-#   - publish/pull bases from a registry (a `localhost/` name cannot be pulled)
-#   - use `podman build --cache-from <registry-ref>` against a real cache parent
-#     (verified available on the target host: podman 4.3.1 has --cache-from/--cache-to)
-#   - compose on a different base or base version without editing this file
-# Defaults reproduce today's behaviour exactly, so existing local builds are unchanged.
+# BASE_* ARGs must appear before the first FROM so they are global and usable by
+# the class FROM below (multi-stage gotcha: ARG after a FROM is stage-scoped).
 #   podman build --build-arg BASE_REGISTRY=ghcr.io/tzervas --build-arg BASE_TAG=0.2.0 ...
-#
-# CRITICAL podman/OCI gotcha: an ARG declared before FROM is consumed BY the FROM
-# instruction and is NOT in scope in the build stage afterwards. Re-declare it after
-# FROM if it is needed later. Forgetting yields an empty string at build time with no
-# error — a silent failure, which ranks worse here than a loud one.
 ARG BASE_REGISTRY=localhost
 ARG BASE_IMAGE=fleet-runner-base
-ARG BASE_TAG=0.1.1
+ARG BASE_TAG=0.1.2
+
+# ---------------------------------------------------------------------------
+# Stage: rebuild shfmt with latest stable Go (HIGH stdlib gate)
+# ---------------------------------------------------------------------------
+FROM docker.io/library/golang:1.26-bookworm@sha256:1ecb7edf62a0408027bd5729dfd6b1b8766e578e8df93995b225dfd0944eb651 AS shfmt-build
+
+ARG SHFMT_VERSION=3.13.1
+ENV CGO_ENABLED=0
+RUN git clone --depth 1 --branch "v${SHFMT_VERSION}" \
+      https://github.com/mvdan/sh.git /src
+WORKDIR /src
+RUN go build -trimpath \
+      -ldflags="-s -w -X main.version=v${SHFMT_VERSION}" \
+      -o /shfmt ./cmd/shfmt
+
+# Class runtime stage: FROM fleet-runner-base (parameterized).
+# CRITICAL podman/OCI gotcha: an ARG declared before FROM is consumed BY the FROM
+# instruction and is NOT in scope in the build stage afterwards. Re-declare it after
+# FROM if it is needed later.
 FROM ${BASE_REGISTRY}/${BASE_IMAGE}:${BASE_TAG}
 
 # Re-declare: ARG-before-FROM values are not in scope after FROM (see gotcha above).
@@ -51,9 +61,8 @@ ARG BASE_TAG
 # shellcheck pin: https://github.com/koalaman/shellcheck/releases/tag/v0.11.0
 ARG SHELLCHECK_VERSION=0.11.0
 ARG SHELLCHECK_SHA256=b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6
-# shfmt pin: https://github.com/mvdan/sh/releases/tag/v3.13.1
+# shfmt: source rebuilt in shfmt-build stage (no release-asset SHA).
 ARG SHFMT_VERSION=3.13.1
-ARG SHFMT_SHA256=fb096c5d1ac6beabbdbaa2874d025badb03ee07929f0c9ff67563ce8c75398b1
 # bats-core pin (GitHub source archive, no compiled binary exists for a shell-script
 # project): https://github.com/bats-core/bats-core/releases/tag/v1.14.0
 ARG BATS_VERSION=1.14.0
@@ -71,12 +80,9 @@ RUN install -m 755 "/tmp/shellcheck-v${SHELLCHECK_VERSION}/shellcheck" /usr/loca
 RUN rm -rf /tmp/shellcheck.tar.gz "/tmp/shellcheck-v${SHELLCHECK_VERSION}"
 RUN shellcheck --version
 
-# shfmt pinned binary → /usr/local/bin (single static Go binary, no archive)
-RUN curl -fsSL -o /tmp/shfmt \
-      "https://github.com/mvdan/sh/releases/download/v${SHFMT_VERSION}/shfmt_v${SHFMT_VERSION}_linux_amd64"
-RUN echo "${SHFMT_SHA256}  /tmp/shfmt" | sha256sum -c -
-RUN install -m 755 /tmp/shfmt /usr/local/bin/shfmt
-RUN rm -f /tmp/shfmt
+# shfmt rebuilt from source (shfmt-build) → /usr/local/bin
+COPY --from=shfmt-build /shfmt /usr/local/bin/shfmt
+RUN chmod 755 /usr/local/bin/shfmt
 RUN shfmt --version
 
 # bats-core pinned source tarball, installed via its own install.sh → /usr/local
