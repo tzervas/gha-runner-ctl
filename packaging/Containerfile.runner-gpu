@@ -8,9 +8,9 @@
 # and is exposed via the container runtime. Installing a driver in the image is a common and
 # expensive mistake. This image installs only the CUDA userspace toolkit.
 #
-# Carries: actions/runner 2.335.1, ca-certificates, curl, git, jq, tar, gzip, CUDA userspace toolkit
-# Tag as fleet-runner-gpu:0.1.0. NEVER :latest.
-# Build: podman build -f packaging/Containerfile.runner-gpu -t fleet-runner-gpu:0.1.0 .
+# Carries: actions/runner 2.336.0, ca-certificates, curl, git, jq, tar, gzip, CUDA userspace toolkit
+# Tag as fleet-runner-gpu:0.1.2. NEVER :latest.
+# Build: podman build -f packaging/Containerfile.runner-gpu -t fleet-runner-gpu:0.1.2 packaging/
 
 FROM docker.io/library/ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90
 
@@ -22,9 +22,10 @@ RUN rm -rf /var/lib/apt/lists/*
 
 RUN useradd --uid 1001 --user-group --create-home --shell /bin/bash runner
 
-ARG RUNNER_VERSION=2.335.1
+# Latest stable runner (same pin as fleet-runner-base security train).
+ARG RUNNER_VERSION=2.336.0
 ARG RUNNER_ARCH=x64
-ARG RUNNER_SHA256=4ef2f25285f0ae4477f1fe1e346db76d2f3ebf03824e2ddd1973a2819bf6c8cf
+ARG RUNNER_SHA256=04cf0be1aff4c3ec3554466c39124ca250e3effd8873bb7e8d68535aa9505d5d
 
 RUN curl -fsSL -o /tmp/actions-runner.tar.gz "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-${RUNNER_ARCH}-${RUNNER_VERSION}.tar.gz"
 RUN echo "${RUNNER_SHA256}  /tmp/actions-runner.tar.gz" | sha256sum -c -
