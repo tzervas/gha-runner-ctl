@@ -1,0 +1,62 @@
+# fleet-runner-docs — CI runner class for documentation prose lint and link checking.
+# FROM fleet-runner-base — inherits runner agent, git, curl, jq, tar, gzip, gitleaks, UID 1001.
+#
+# Base choice: thin layer on fleet-runner-base so the Actions runner agent and shared SCM/security
+# tooling stay common; this class only adds docs-checking CLIs, not a language build toolchain.
+#
+# Tooling choice: lychee is installed from its GitHub-released static musl binary (checksum-verified).
+# markdownlint-cli2 is a Node package and the base has no Node, so a pinned official Node.js linux-x64
+# binary tarball is installed (runtime only — no apt compilers or full build toolchain) solely to
+# run markdownlint-cli2 globally via npm. That keeps the requested linter rather than substituting a
+# different single-binary markdown tool with different rules/CLI semantics.
+#
+# Carries: node (pinned binary runtime), npm, markdownlint-cli2, lychee
+# Tag as fleet-runner-docs:<semver>, starting 0.1.0. NEVER :latest.
+# Build (context packaging/ so paths resolve):
+#   podman build -f packaging/Containerfile.runner-docs -t fleet-runner-docs:0.1.0 packaging/
+#
+# BASE_* ARGs parameterize the parent (same pattern as shell/python/rust on dev).
+# CRITICAL: ARG before FROM is consumed by FROM and not in scope afterwards — redeclare if needed.
+ARG BASE_REGISTRY=localhost
+ARG BASE_IMAGE=fleet-runner-base
+ARG BASE_TAG=0.1.2
+FROM ${BASE_REGISTRY}/${BASE_IMAGE}:${BASE_TAG}
+
+ARG BASE_REGISTRY
+ARG BASE_IMAGE
+ARG BASE_TAG
+
+USER root
+
+# Node.js official binary distribution — SHA256 must be resolved before merge.
+ARG NODE_VERSION=22.14.0
+ARG NODE_SHA256=9d942932535988091034dc94cc5f42b6dc8784d6366df3a36c4c9ccb3996f0c2
+ARG NODE_ARCH=x64
+
+RUN curl -fsSL -o /tmp/node.tar.gz "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.gz"
+RUN echo "${NODE_SHA256}  /tmp/node.tar.gz" | sha256sum -c -
+RUN tar -xzf /tmp/node.tar.gz -C /usr/local --strip-components=1
+RUN rm -f /tmp/node.tar.gz
+RUN node --version
+RUN npm --version
+
+ARG MARKDOWNLINT_CLI2_VERSION=0.17.2
+
+RUN npm install -g "markdownlint-cli2@${MARKDOWNLINT_CLI2_VERSION}"
+RUN npm cache clean --force
+RUN markdownlint-cli2 --version
+
+# lychee static musl binary — SHA256 must be resolved before merge.
+ARG LYCHEE_VERSION=0.18.1
+ARG LYCHEE_SHA256=2f70dcdee64ac19d17b9c501492202305b04ab24606737a5e3ce6c7294c1f8d6
+ARG LYCHEE_TARGET=x86_64-unknown-linux-musl
+
+RUN curl -fsSL -o /tmp/lychee.tar.gz "https://github.com/lycheeverse/lychee/releases/download/lychee-v${LYCHEE_VERSION}/lychee-${LYCHEE_TARGET}.tar.gz"
+RUN echo "${LYCHEE_SHA256}  /tmp/lychee.tar.gz" | sha256sum -c -
+RUN tar -xzf /tmp/lychee.tar.gz -C /tmp lychee
+RUN install -m 755 /tmp/lychee /usr/local/bin/lychee
+RUN rm -f /tmp/lychee /tmp/lychee.tar.gz
+RUN lychee --version
+
+USER runner
+WORKDIR /opt/actions-runner
