@@ -6525,16 +6525,17 @@ mod robust_queue_tests {
         let max_per_tick = 2u32;
         let n = repos.len();
         // Upper bound from the brief: ceil(n / max_per_tick) + 1
-        let max_ticks = (n + max_per_tick as usize - 1) / max_per_tick as usize + 1;
+        let max_ticks = n.div_ceil(max_per_tick as usize) + 1;
 
         let mut last = std::collections::HashMap::new();
         let mut ever_polled: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         // Start past the starvation horizon for everyone except we use empty map
         // (all never-polled) so the first ticks promote immediately.
-        let mut now = 10_000u64;
-
-        for _tick in 0..max_ticks {
+        // `now` is derived from the tick index (not a manual counter) so clippy
+        // does not flag explicit_counter_loop under -D warnings.
+        for tick in 0..max_ticks {
+            let now = 10_000u64 + tick as u64;
             // RR slice: non-priority rest in stable allowlist order (cursor not under test).
             let rest: Vec<String> = repos
                 .iter()
@@ -6561,9 +6562,6 @@ mod robust_queue_tests {
                 }
                 // Non-hot: no demand → continue.
             }
-
-            // Advance time less than starvation_secs so only truly unpolled/old stay starved.
-            now += 1;
         }
 
         for r in &repos {
