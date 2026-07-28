@@ -22,6 +22,13 @@ prefer-list cleanup is called done.
 | `fleet-security.yml` | push/PR + weekly | same |
 | `close-issues-on-main.yml` | PR closed→main | same |
 | `reopen-issues-closed-off-main.yml` | PR merged off-main with Closes | same |
+| `standards.yml` | push/PR to main\|dev\|sec | same |
+
+`standards.yml` calls the central development-standards gate and reports one context,
+`standards / standards`. It enforces the branch/release contract mechanically — most
+importantly that a `dev` → `main` promote lands as a **merge commit**, because squashing it
+leaves the two trunks with identical trees and disjoint histories. See
+**[STANDARDS_GATE.md](./STANDARDS_GATE.md)**.
 
 ## Issue close policy
 
