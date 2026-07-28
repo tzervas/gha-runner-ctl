@@ -130,7 +130,58 @@ jobs:
           echo "Unknown is not the same as not-published. Refusing to tag before a publish that may fail."
           exit 1
 
-      # ── build ──────────────────────────────────────────────────────────────────────────
+      # ── bump: rewrite the lockstep version files in the working tree (no commit yet) ───
+      # Runs before build so the packaged binary — and its UA literal — are compiled from
+      # the version that is about to ship, not the pre-bump one. Committing is a separate,
+      # dry-run-gated step below; this one only touches the runner's local checkout.
+      - name: Bump version files (working tree)
+        if: ${{ inputs.bump != 'none' }}
+        env:
+          NEW: ${{ steps.ver.outputs.new }}
+          CUR: ${{ steps.ver.outputs.current }}
+        run: |
+          set -euo pipefail
+          [ "$NEW" = "$CUR" ] && { echo "already at $NEW — nothing to bump"; exit 0; }
+          # Lockstep set per docs/RELEASE.md: VERSION, Cargo.toml, src/lib.rs (UA),
+          # CHANGELOG.md. CHANGELOG.md is maintained by hand in the PRs that land the
+          # release content — it is asserted below, not generated here.
+          printf '%s\n' "$NEW" > VERSION
+          sed -i "0,/^version = \"$CUR\"/s//version = \"$NEW\"/" Cargo.toml
+          [ -f .cz.toml ] && sed -i "s/^version = \"$CUR\"/version = \"$NEW\"/" .cz.toml || true
+          sed -i "0,/^const UA: \&str = \"gha-runner-ctl\/$CUR\";/s//const UA: \&str = \"gha-runner-ctl\/$NEW\";/" src/lib.rs
+          cargo update -p gha-runner-ctl --precise "$NEW" 2>/dev/null || cargo check --quiet
+
+      - name: Assert version lockstep
+        env:
+          NEW: ${{ steps.ver.outputs.new }}
+        run: |
+          set -euo pipefail
+          fail=0
+
+          v_version=$(tr -d '[:space:]' < VERSION)
+          [ "$v_version" = "$NEW" ] || { echo "::error::VERSION is '$v_version', expected '$NEW'"; fail=1; }
+
+          v_cargo=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          [ "$v_cargo" = "$NEW" ] || { echo "::error::Cargo.toml version is '$v_cargo', expected '$NEW'"; fail=1; }
+
+          if [ -f .cz.toml ]; then
+            v_cz=$(grep -m1 '^version' .cz.toml | cut -d'"' -f2)
+            [ "$v_cz" = "$NEW" ] || { echo "::error::.cz.toml version is '$v_cz', expected '$NEW'"; fail=1; }
+          fi
+
+          v_ua=$(grep -m1 '^const UA: &str = "gha-runner-ctl/' src/lib.rs | cut -d'"' -f2 | cut -d/ -f2)
+          [ "$v_ua" = "$NEW" ] || { echo "::error::src/lib.rs UA is '$v_ua', expected '$NEW'"; fail=1; }
+
+          head=$(grep -m1 '^## ' CHANGELOG.md || true)
+          case "$head" in
+            "## v$NEW"*|"## $NEW"*) ;;
+            *) echo "::error::CHANGELOG.md's top entry ('$head') is not for $NEW — add it by hand before releasing."; fail=1 ;;
+          esac
+
+          [ "$fail" -eq 0 ] || { echo "::error::Version lockstep broken — VERSION, Cargo.toml, .cz.toml, src/lib.rs (UA) and CHANGELOG.md must all agree on $NEW."; exit 1; }
+          echo "lockstep OK: VERSION, Cargo.toml, .cz.toml, UA and CHANGELOG.md all agree on $NEW"
+
+      # ── build (on the bumped tree, if any) ──────────────────────────────────────────────
       - name: Build and test
         run: |
           set -euo pipefail
@@ -167,14 +218,14 @@ jobs:
         run: |
           set -euo pipefail
           [ "$NEW" = "$CUR" ] && { echo "already at $NEW — nothing to bump"; exit 0; }
-          sed -i "0,/^version = \"$CUR\"/s//version = \"$NEW\"/" Cargo.toml
-          [ -f .cz.toml ] && sed -i "s/^version = \"$CUR\"/version = \"$NEW\"/" .cz.toml || true
-          cargo update -p gha-runner-ctl --precise "$NEW" 2>/dev/null || cargo check --quiet
-          # Identity is required for a commit AND for an annotated tag. Self-hosted runners
-          # have none; hosted ones do not either. Set it locally, never --global.
+          # Files were already rewritten by "Bump version files (working tree)" above (and
+          # built against, and lockstep-asserted) — this step only commits what is already
+          # on disk. Identity is required for a commit AND for an annotated tag. Self-hosted
+          # runners have none; hosted ones do not either. Set it locally, never --global.
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock .cz.toml 2>/dev/null || git add Cargo.toml Cargo.lock
+          git add VERSION Cargo.toml Cargo.lock src/lib.rs
+          [ -f .cz.toml ] && git add .cz.toml || true
           git commit -m "release: v$NEW"
           git push "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" HEAD:main
 
