@@ -15,15 +15,15 @@ rocky-9 = "docker.io/library/rockylinux:9"
 
 # Runner-class labels (job label schema `[..., podman, <size>, <class>]`).
 # Built by packaging/Containerfile.runner-<class>; see docs/WORK_IMAGES.md.
-# Only base/shell/python are built today — rust/docs/gpu are not yet packaged.
 # Published by .github/workflows/publish-images.yml (no application secrets — see that
-# file's header) to ghcr.io/tzervas/fleet-runner-<class>:<semver>. This is a real,
-# copy-verbatim org (tzervas), even though this file stays an EXAMPLE overlay — a reader
-# still needs to point GHA_IMAGE_MAP at their own copy, and to keep <semver> in sync with
-# whatever the publish workflow last actually pushed.
+# file's header) to ghcr.io/tzervas/fleet-runner-<class>:<semver>. Keep <semver> in sync
+# with whatever the publish workflow last actually pushed (security train: 0.1.2).
 base = "ghcr.io/tzervas/fleet-runner-base:0.1.2"
 shell = "ghcr.io/tzervas/fleet-runner-shell:0.1.2"
 python = "ghcr.io/tzervas/fleet-runner-python:0.1.2"
+rust = "ghcr.io/tzervas/fleet-runner-rust:0.1.2"
+docs = "ghcr.io/tzervas/fleet-runner-docs:0.1.2"
+gpu = "ghcr.io/tzervas/fleet-runner-gpu:0.1.2"
 # Per-repo dependency WARM images (packaging/Containerfile.warm-python /
 # Containerfile.warm-rust) are NOT fleet-wide class labels — they are content-addressed
 # per-repo, per-lock-hash tags (fleet-warm-python:<repo>-<lock-hash>), so they do not get a

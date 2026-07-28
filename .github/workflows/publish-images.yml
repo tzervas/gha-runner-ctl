@@ -71,9 +71,9 @@ on:
   workflow_dispatch:
     inputs:
       semver:
-        description: 'Tag to publish fleet-runner-* images as (e.g. 0.1.0)'
+        description: 'Tag to publish fleet-runner-* images as (e.g. 0.1.2)'
         required: true
-        default: '0.1.0'
+        default: '0.1.2'
   push:
     branches: [main, dev]
     paths:
@@ -90,11 +90,11 @@ permissions:
 env:
   REGISTRY: ghcr.io
   ORG: tzervas
-  SEMVER: ${{ github.event.inputs.semver || '0.1.0' }}
+  SEMVER: ${{ github.event.inputs.semver || '0.1.2' }}
 
 jobs:
   publish:
-    name: build + publish fleet-runner-base/shell/python (cold, no secrets)
+    name: build + publish fleet-runner classes (cold, no secrets)
     runs-on: [self-hosted, linux, x64, podman, medium, base]
     steps:
       - uses: actions/checkout@v7
@@ -151,6 +151,18 @@ jobs:
 
       - name: python — build + publish (needs base, same job/local-store)
         run: /tmp/build_and_maybe_push.sh fleet-runner-python packaging/Containerfile.runner-python
+
+      # docs FROM localhost/fleet-runner-base:<semver> — same job/local-store as base
+      - name: docs — build + publish (needs base, same job/local-store)
+        run: /tmp/build_and_maybe_push.sh fleet-runner-docs packaging/Containerfile.runner-docs
+
+      # rust FROM localhost/fleet-runner-base when present
+      - name: rust — build + publish (needs base, same job/local-store)
+        run: /tmp/build_and_maybe_push.sh fleet-runner-rust packaging/Containerfile.runner-rust
+
+      # gpu is independent (Ubuntu+CUDA userspace); still same job for one GHCR login
+      - name: gpu — build + publish (standalone FROM ubuntu)
+        run: /tmp/build_and_maybe_push.sh fleet-runner-gpu packaging/Containerfile.runner-gpu
 
       - name: Log out of GHCR
         if: always()
