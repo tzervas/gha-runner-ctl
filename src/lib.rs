@@ -327,6 +327,25 @@ pub struct Cli {
     #[arg(long, env = "GHA_REPOS_PER_TICK", default_value_t = DEFAULT_REPOS_PER_TICK, global = true)]
     repos_per_tick: u32,
 
+    /// Seconds a repo may go unpolled before it is promoted to the front of the demand poll
+    /// order. Fairness is on last-polled, not last-served. `0` disables promotion (legacy order).
+    #[arg(
+        long,
+        env = "GHA_STARVATION_SECS",
+        default_value_t = 300,
+        global = true
+    )]
+    starvation_secs: u64,
+
+    /// Max number of starvation-promoted repos inserted ahead of the hot/RR set per demand tick.
+    #[arg(
+        long,
+        env = "GHA_STARVATION_MAX_PER_TICK",
+        default_value_t = 2,
+        global = true
+    )]
+    starvation_max_per_tick: u32,
+
     /// Min seconds between registration-token POSTs (host-wide file lock). Default 5.
     #[arg(long, env = "GHA_REG_MIN_GAP_SECS", default_value_t = DEFAULT_REG_MIN_GAP_SECS, global = true)]
     reg_min_gap_secs: u64,
@@ -4339,6 +4358,190 @@ fn repos_round_robin_state_path(container: &str) -> PathBuf {
     dir.join(format!("gha-runner-ctl-rr-{safe}-{user_suffix}.txt"))
 }
 
+/// Same directory/container/user scheme as `repos_round_robin_state_path`, different file.
+/// NOTE: deliberately re-derives the full file name (not `repos_round_robin_state_path(..).set_file_name(..)`)
+/// — the RR path embeds a per-container `safe` name and `user_suffix` so multiple containers/users
+/// sharing the same XDG_RUNTIME_DIR/tmp don't collide; a bare `set_file_name("repo_last_polled")`
+/// would drop both and let unrelated listen processes clobber each other's starvation state.
+fn repo_last_polled_state_path(container: &str) -> PathBuf {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let safe: String = container
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let user_suffix = current_username();
+    dir.join(format!(
+        "gha-runner-ctl-last-polled-{safe}-{user_suffix}.txt"
+    ))
+}
+
+/// Load `owner/repo=unix_secs` lines. Missing file, unreadable file, or garbage → empty map.
+/// Never errors: this file is an optimisation, not a correctness input.
+fn load_repo_last_polled(path: &std::path::Path) -> std::collections::HashMap<String, u64> {
+    let mut map = std::collections::HashMap::new();
+    let Ok(text) = fs::read_to_string(path) else {
+        return map;
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((repo, ts_str)) = line.split_once('=') else {
+            // Corrupt line — ignore entry, keep going.
+            continue;
+        };
+        let repo = repo.trim();
+        let Ok(ts) = ts_str.trim().parse::<u64>() else {
+            continue;
+        };
+        if !repo.is_empty() {
+            map.insert(repo.to_string(), ts);
+        }
+    }
+    map
+}
+
+/// Persist last-polled map. On failure, log once (caller may call every return path;
+/// we always log the write error so an operator can see a stuck filesystem).
+fn save_repo_last_polled(path: &std::path::Path, map: &std::collections::HashMap<String, u64>) {
+    let mut lines: Vec<String> = map
+        .iter()
+        .map(|(repo, ts)| format!("{repo}={ts}"))
+        .collect();
+    // Stable write order for easier debugging / smaller diffs in tests that inspect files.
+    lines.sort();
+    let body = lines.join("\n");
+    let body = if body.is_empty() {
+        body
+    } else {
+        format!("{body}\n")
+    };
+    if let Err(e) = fs::write(path, body) {
+        eprintln!(
+            "listen: WARNING failed to write repo last-polled state {}: {e}",
+            path.display()
+        );
+    }
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn warn_priority_repo_not_in_allowlist(name: &str) {
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let set = WARNED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    // Poisoned mutex: still try to warn rather than panic the listen loop.
+    let mut guard = match set.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if guard.insert(name.to_string()) {
+        eprintln!("listen: WARNING priority repo {name} not in prefer allowlist — ignored");
+    }
+}
+
+/// Repos in `repos` that have not been polled within `starvation_secs`.
+/// Sorted oldest-polled first; never-polled before any polled; ties by index in `repos`.
+/// Truncated to `max_per_tick`. Empty if `starvation_secs == 0` or `max_per_tick == 0`.
+fn compute_starved_repos(
+    repos: &[String],
+    last_polled: &std::collections::HashMap<String, u64>,
+    now: u64,
+    starvation_secs: u64,
+    max_per_tick: u32,
+) -> Vec<String> {
+    if starvation_secs == 0 || max_per_tick == 0 {
+        return Vec::new();
+    }
+
+    struct Cand {
+        idx: usize,
+        name: String,
+        /// `None` = never polled.
+        last: Option<u64>,
+    }
+
+    let mut cands: Vec<Cand> = Vec::new();
+    for (idx, name) in repos.iter().enumerate() {
+        let last = last_polled.get(name).copied();
+        let starved = match last {
+            None => true,
+            Some(t) => now.saturating_sub(t) >= starvation_secs,
+        };
+        if starved {
+            cands.push(Cand {
+                idx,
+                name: name.clone(),
+                last,
+            });
+        }
+    }
+
+    cands.sort_by(|a, b| {
+        match (a.last, b.last) {
+            // Never-polled sorts before any polled repo.
+            (None, Some(_)) => std::cmp::Ordering::Less,
+            (Some(_), None) => std::cmp::Ordering::Greater,
+            (None, None) => a.idx.cmp(&b.idx),
+            (Some(ta), Some(tb)) => ta.cmp(&tb).then_with(|| a.idx.cmp(&b.idx)),
+        }
+    });
+
+    cands
+        .into_iter()
+        .take(max_per_tick as usize)
+        .map(|c| c.name)
+        .collect()
+}
+
+/// Build poll order: `starved ++ hot ++ rr_slice`, deduplicated (first occurrence wins).
+///
+/// - `repos`: full prefer allowlist for this tick (used for starvation membership + tie index).
+/// - `priority`: raw priority list (may include names absent from `repos`; those are skipped for `hot`).
+/// - `rr_slice`: already-selected round-robin subset of the non-priority rest (from `select_repos_for_tick`).
+///
+/// Does **not** apply the `if order.is_empty() { select_repos_for_tick(repos) }` fallback;
+/// the caller does that so RR cursor semantics stay in one place.
+fn build_poll_order(
+    repos: &[String],
+    priority: &[String],
+    last_polled: &std::collections::HashMap<String, u64>,
+    now: u64,
+    starvation_secs: u64,
+    max_per_tick: u32,
+    rr_slice: &[String],
+) -> Vec<String> {
+    let starved = compute_starved_repos(repos, last_polled, now, starvation_secs, max_per_tick);
+
+    let hot: Vec<String> = priority
+        .iter()
+        .filter(|p| repos.iter().any(|r| r == *p))
+        .cloned()
+        .collect();
+
+    let mut order: Vec<String> = Vec::new();
+    for name in starved.iter().chain(hot.iter()).chain(rr_slice.iter()) {
+        if !order.contains(name) {
+            order.push(name.clone());
+        }
+    }
+    order
+}
+
 /// Subset of allowlisted repos for this demand tick (`repos_per_tick`; 0 = all).
 fn select_repos_for_tick(cli: &Cli, repos: &[String]) -> Vec<String> {
     if repos.is_empty() {
@@ -4371,38 +4574,86 @@ fn poll_allowlist_repos(
     pacer: &mut ApiPacer,
     repos: &[String],
 ) -> Result<(bool, Option<String>), String> {
+    let now = unix_now_secs();
+    let state_path = repo_last_polled_state_path(&cli.container);
+    let mut last_polled = load_repo_last_polled(&state_path);
+
     // Priority repos every tick, then RR subset of the rest.
+    // Warn once per process for priority entries missing from the prefer allowlist.
     let priority = priority_repos_list(cli);
-    let mut order: Vec<String> = priority
-        .iter()
-        .filter(|p| repos.iter().any(|r| r == *p))
-        .cloned()
-        .collect();
+    for p in &priority {
+        if !repos.iter().any(|r| r == p) {
+            warn_priority_repo_not_in_allowlist(p);
+        }
+    }
+
     let rest: Vec<String> = repos
         .iter()
         .filter(|r| !priority.iter().any(|p| p == *r))
         .cloned()
         .collect();
-    for name in select_repos_for_tick(cli, &rest) {
-        if !order.contains(&name) {
-            order.push(name);
-        }
+    let rr_slice = select_repos_for_tick(cli, &rest);
+
+    let starved = compute_starved_repos(
+        repos,
+        &last_polled,
+        now,
+        cli.starvation_secs,
+        cli.starvation_max_per_tick,
+    );
+    if !starved.is_empty() {
+        let parts: Vec<String> = starved
+            .iter()
+            .map(|name| match last_polled.get(name) {
+                None => format!("{name}(never)"),
+                Some(t) => format!("{name}({}s)", now.saturating_sub(*t)),
+            })
+            .collect();
+        eprintln!("listen: starvation promote: {}", parts.join(", "));
     }
+
+    let mut order = build_poll_order(
+        repos,
+        &priority,
+        &last_polled,
+        now,
+        cli.starvation_secs,
+        cli.starvation_max_per_tick,
+        &rr_slice,
+    );
     if order.is_empty() {
         order = select_repos_for_tick(cli, repos);
     }
+
+    let mut polled_any = false;
     for name in order {
+        // Record immediately before the poll so only repos actually reached get a timestamp.
+        // Early-return leaves later repos unrecorded → they stay starved and promote next tick.
+        last_polled.insert(name.clone(), now);
+        polled_any = true;
+
         match repo_needs_runner(cli, &name, api, pacer) {
-            Ok(true) => return Ok((true, Some(name))),
+            Ok(true) => {
+                save_repo_last_polled(&state_path, &last_polled);
+                return Ok((true, Some(name)));
+            }
             Ok(false) => {}
             Err(e) if is_soft_api_err(&e) => {
                 eprintln!("listen: allowlist skip {name}: {}", redact(&e));
                 if e.contains("rate limited") || e.contains("budget exhausted") {
+                    save_repo_last_polled(&state_path, &last_polled);
                     return Err(e);
                 }
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                save_repo_last_polled(&state_path, &last_polled);
+                return Err(e);
+            }
         }
+    }
+
+    if polled_any {
+        save_repo_last_polled(&state_path, &last_polled);
     }
     Ok((false, None))
 }
@@ -5295,7 +5546,7 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
     let prio_n = priority_repos_list(cli).len();
     let tick_path = tick_log_path(cli);
     eprintln!(
-        "listen: scope={:?} poll={interval}s (floor={floor}) idle={idle_secs}s mode={:?} api_gap={}ms max_per_poll={} pool={} ({:.0}c/{}MiB max_workers={}) prefer={prefer_n} priority={prio_n} scan/tick={} reap_stale={}s",
+        "listen: scope={:?} poll={interval}s (floor={floor}) idle={idle_secs}s mode={:?} api_gap={}ms max_per_poll={} pool={} ({:.0}c/{}MiB max_workers={}) prefer={prefer_n} priority={prio_n} scan/tick={} reap_stale={}s starve={}s/{}",
         cli.scope,
         cli.mode,
         cli.api_min_gap_ms,
@@ -5306,6 +5557,8 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
         pool.max_workers.min(cli.pool_max_workers),
         cli.pool_scan_per_tick,
         cli.reap_stale_secs,
+        cli.starvation_secs,
+        cli.starvation_max_per_tick,
     );
     if matches!(cli.scope, Scope::User) && prefer_n == 0 {
         eprintln!(
@@ -5729,6 +5982,8 @@ impl Cli {
             api_max_per_poll: self.api_max_per_poll,
             api_backoff_secs: self.api_backoff_secs,
             repos_per_tick: self.repos_per_tick,
+            starvation_secs: self.starvation_secs,
+            starvation_max_per_tick: self.starvation_max_per_tick,
             reg_min_gap_secs: self.reg_min_gap_secs,
             reg_max_per_hour: self.reg_max_per_hour,
             pool_cpus: self.pool_cpus.clone(),
@@ -5787,6 +6042,8 @@ struct CliSnap {
     api_max_per_poll: u32,
     api_backoff_secs: u64,
     repos_per_tick: u32,
+    starvation_secs: u64,
+    starvation_max_per_tick: u32,
     reg_min_gap_secs: u64,
     reg_max_per_hour: u32,
     pool_cpus: String,
@@ -5843,6 +6100,8 @@ fn cli_snapshot(cli: &Cli) -> CliSnap {
         api_max_per_poll: cli.api_max_per_poll,
         api_backoff_secs: cli.api_backoff_secs,
         repos_per_tick: cli.repos_per_tick,
+        starvation_secs: cli.starvation_secs,
+        starvation_max_per_tick: cli.starvation_max_per_tick,
         reg_min_gap_secs: cli.reg_min_gap_secs,
         reg_max_per_hour: cli.reg_max_per_hour,
         pool_cpus: cli.pool_cpus.clone(),
@@ -5901,6 +6160,8 @@ fn snap_to_cli(s: &CliSnap) -> Cli {
         api_max_per_poll: s.api_max_per_poll,
         api_backoff_secs: s.api_backoff_secs,
         repos_per_tick: s.repos_per_tick,
+        starvation_secs: s.starvation_secs,
+        starvation_max_per_tick: s.starvation_max_per_tick,
         reg_min_gap_secs: s.reg_min_gap_secs,
         reg_max_per_hour: s.reg_max_per_hour,
         pool_cpus: s.pool_cpus.clone(),
@@ -6128,5 +6389,237 @@ mod robust_queue_tests {
     fn normalize_podman_started_at_iso() {
         let raw = "2026-07-21T19:52:33.909118621Z";
         assert_eq!(normalize_podman_started_at(raw), "2026-07-21 19:52:33 UTC");
+    }
+
+    // ----- anti-starvation poll order -----
+
+    fn repo_list(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| (*n).to_string()).collect()
+    }
+
+    fn map_of(pairs: &[(&str, u64)]) -> std::collections::HashMap<String, u64> {
+        pairs.iter().map(|(k, v)| ((*k).to_string(), *v)).collect()
+    }
+
+    #[test]
+    fn poll_order_no_starvation_matches_hot_plus_rr() {
+        let repos = repo_list(&["hot/a", "other/b", "other/c"]);
+        let priority = repo_list(&["hot/a"]);
+        let now = 1_000_000u64;
+        let last = map_of(&[
+            ("hot/a", now - 10),
+            ("other/b", now - 10),
+            ("other/c", now - 10),
+        ]);
+        let rr = repo_list(&["other/b", "other/c"]);
+        let order = build_poll_order(&repos, &priority, &last, now, 300, 2, &rr);
+        // All recent → starved empty → hot ++ rr (deduped).
+        assert_eq!(order, repo_list(&["hot/a", "other/b", "other/c"]));
+    }
+
+    #[test]
+    fn poll_order_starved_repo_promoted_first() {
+        let repos = repo_list(&["hot/a", "cold/b", "other/c"]);
+        let priority = repo_list(&["hot/a"]);
+        let now = 1_000_000u64;
+        let last = map_of(&[
+            ("hot/a", now - 10),
+            ("cold/b", now - 1_000), // starved
+            ("other/c", now - 10),
+        ]);
+        let rr = repo_list(&["other/c"]);
+        let order = build_poll_order(&repos, &priority, &last, now, 300, 2, &rr);
+        assert_eq!(order.first().map(String::as_str), Some("cold/b"));
+        assert!(order.iter().any(|r| r == "hot/a"));
+        // Starved ahead of hot.
+        let i_cold = order.iter().position(|r| r == "cold/b").unwrap();
+        let i_hot = order.iter().position(|r| r == "hot/a").unwrap();
+        assert!(i_cold < i_hot);
+    }
+
+    #[test]
+    fn poll_order_starvation_cap_holds_oldest_first() {
+        let repos = repo_list(&["r/0", "r/1", "r/2", "r/3", "r/4"]);
+        let priority: Vec<String> = vec![];
+        let now = 10_000u64;
+        // All starved; distinct ages — oldest last_polled first.
+        let last = map_of(&[
+            ("r/0", now - 500),
+            ("r/1", now - 900),
+            ("r/2", now - 700),
+            ("r/3", now - 800),
+            ("r/4", now - 600),
+        ]);
+        let rr = repo_list(&["r/0", "r/1", "r/2", "r/3", "r/4"]);
+        let order = build_poll_order(&repos, &priority, &last, now, 300, 2, &rr);
+        // Promoted exactly 2, oldest first: r/1 (900s), r/3 (800s), then rest via rr dedup.
+        assert_eq!(&order[..2], &repo_list(&["r/1", "r/3"])[..]);
+        assert_eq!(order.len(), 5);
+    }
+
+    #[test]
+    fn poll_order_never_polled_sorts_before_old_polled() {
+        let repos = repo_list(&["old/a", "new/b"]);
+        let priority: Vec<String> = vec![];
+        let now = 5_000u64;
+        let last = map_of(&[("old/a", 1u64)]); // polled long ago, still starved
+                                               // new/b absent from map → never polled
+        let rr: Vec<String> = vec![];
+        let order = build_poll_order(&repos, &priority, &last, now, 300, 2, &rr);
+        assert_eq!(order, repo_list(&["new/b", "old/a"]));
+    }
+
+    #[test]
+    fn poll_order_starvation_secs_zero_disables() {
+        let repos = repo_list(&["hot/a", "cold/b"]);
+        let priority = repo_list(&["hot/a"]);
+        let now = 1_000_000u64;
+        let last = map_of(&[("hot/a", now - 10)]); // cold/b never polled
+        let rr = repo_list(&["cold/b"]);
+        let with = build_poll_order(&repos, &priority, &last, now, 300, 2, &rr);
+        let disabled = build_poll_order(&repos, &priority, &last, now, 0, 2, &rr);
+        // Disabled ≡ hot ++ rr only (today's shape).
+        assert_eq!(disabled, repo_list(&["hot/a", "cold/b"]));
+        // Enabled would promote cold first.
+        assert_eq!(with.first().map(String::as_str), Some("cold/b"));
+        assert_ne!(with, disabled);
+    }
+
+    #[test]
+    fn poll_order_determinism() {
+        let repos = repo_list(&["a/1", "b/2", "c/3", "d/4"]);
+        let priority = repo_list(&["a/1"]);
+        let now = 42_000u64;
+        let last = map_of(&[("a/1", now - 10), ("b/2", now - 500), ("c/3", now - 400)]);
+        // d/4 never polled
+        let rr = repo_list(&["b/2", "c/3", "d/4"]);
+        let o1 = build_poll_order(&repos, &priority, &last, now, 300, 2, &rr);
+        let o2 = build_poll_order(&repos, &priority, &last, now, 300, 2, &rr);
+        let o3 = build_poll_order(&repos, &priority, &last, now, 300, 2, &rr);
+        assert_eq!(o1, o2);
+        assert_eq!(o2, o3);
+    }
+
+    #[test]
+    fn poll_order_dedup_starved_and_hot() {
+        let repos = repo_list(&["hot/a", "other/b"]);
+        let priority = repo_list(&["hot/a"]);
+        let now = 1_000_000u64;
+        // hot/a itself is starved (never polled) and is also priority.
+        let last = std::collections::HashMap::new();
+        let rr = repo_list(&["other/b"]);
+        let order = build_poll_order(&repos, &priority, &last, now, 300, 2, &rr);
+        let count_hot = order.iter().filter(|r| *r == "hot/a").count();
+        assert_eq!(count_hot, 1);
+        // Appears once; still first among never-polled by repos index.
+        assert_eq!(order, repo_list(&["hot/a", "other/b"]));
+    }
+
+    #[test]
+    fn starvation_cycle_eventually_polls_every_repo() {
+        // Hot repo always has demand → early return when it is reached.
+        // Starvation promotion must still walk the rest of the allowlist.
+        let repos = repo_list(&["hot/prio", "a/1", "a/2", "a/3", "a/4"]);
+        let priority = repo_list(&["hot/prio"]);
+        let starvation_secs = 300u64;
+        let max_per_tick = 2u32;
+        let n = repos.len();
+        // Upper bound from the brief: ceil(n / max_per_tick) + 1
+        let max_ticks = n.div_ceil(max_per_tick as usize) + 1;
+
+        let mut last = std::collections::HashMap::new();
+        let mut ever_polled: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Start past the starvation horizon for everyone except we use empty map
+        // (all never-polled) so the first ticks promote immediately.
+        // `now` is derived from the tick index (not a manual counter) so clippy
+        // does not flag explicit_counter_loop under -D warnings.
+        for tick in 0..max_ticks {
+            let now = 10_000u64 + tick as u64;
+            // RR slice: non-priority rest in stable allowlist order (cursor not under test).
+            let rest: Vec<String> = repos
+                .iter()
+                .filter(|r| !priority.iter().any(|p| p == *r))
+                .cloned()
+                .collect();
+            let order = build_poll_order(
+                &repos,
+                &priority,
+                &last,
+                now,
+                starvation_secs,
+                max_per_tick,
+                &rest,
+            );
+
+            // Simulate poll_allowlist_repos: record last_polled before each probe;
+            // early-return when hot has demand.
+            for name in &order {
+                last.insert(name.clone(), now);
+                ever_polled.insert(name.clone());
+                if name == "hot/prio" {
+                    break;
+                }
+                // Non-hot: no demand → continue.
+            }
+        }
+
+        for r in &repos {
+            assert!(
+                ever_polled.contains(r),
+                "repo {r} was never polled within {max_ticks} ticks; ever_polled={ever_polled:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn load_repo_last_polled_garbage_is_empty_not_panic() {
+        let dir = std::env::temp_dir().join(format!(
+            "gha-runner-ctl-last-polled-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("repo_last_polled");
+
+        // Missing file
+        let _ = fs::remove_file(&path);
+        let m = load_repo_last_polled(&path);
+        assert!(m.is_empty());
+
+        // Garbage content
+        fs::write(&path, "this is not valid{{{{\n###\n=only\nbad=ts\n").unwrap();
+        let m = load_repo_last_polled(&path);
+        assert!(m.is_empty());
+
+        // Mixed: one good line among junk
+        fs::write(&path, "nope\nowner/repo=12345\nalso=bad\n\n# comment\n").unwrap();
+        let m = load_repo_last_polled(&path);
+        assert_eq!(m.get("owner/repo").copied(), Some(12345));
+        assert_eq!(m.len(), 1);
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn save_and_load_repo_last_polled_roundtrip() {
+        let dir = std::env::temp_dir().join(format!(
+            "gha-runner-ctl-last-polled-rt-{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("repo_last_polled");
+
+        let mut map = std::collections::HashMap::new();
+        map.insert("o/a".into(), 100u64);
+        map.insert("o/b".into(), 200u64);
+        save_repo_last_polled(&path, &map);
+        let loaded = load_repo_last_polled(&path);
+        assert_eq!(loaded.get("o/a").copied(), Some(100));
+        assert_eq!(loaded.get("o/b").copied(), Some(200));
+        assert_eq!(loaded.len(), 2);
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
     }
 }
