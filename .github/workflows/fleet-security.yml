@@ -108,10 +108,10 @@ jobs:
       - name: Trivy fs (vuln+secret+license)
         run: |
           set -euo pipefail
-          if ! command -v trivy >/dev/null 2>&1; then
-            echo "trivy not available after install — FAIL (honest security gate)" >&2
+          command -v trivy >/dev/null 2>&1 || {
+            echo "trivy missing from runner image" >&2
             exit 1
-          fi
+          }
           trivy fs --scanners vuln,secret,license \
             --severity HIGH,CRITICAL \
             --skip-dirs .git --skip-dirs target --skip-dirs node_modules --skip-dirs .venv \

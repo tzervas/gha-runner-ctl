@@ -263,6 +263,23 @@ export GHA_IMAGE=registry.internal:5000/team/builder@sha256:…
 gha-runner-ctl prepare --skip-host-update
 ```
 
+### Fleet runner-base (ap-workflows) — preferred once published
+
+Shared CI rootfs with rootless-friendly tools (`gh`, `trivy`, `gitleaks`, …) built from
+`ap-workflows` as `ghcr.io/tzervas/ap-workflows/runner-base` (tags: `latest` and
+`<git-sha>`). After that image is pushed to GHCR, fleet hosts / seed units should set:
+
+```bash
+export GHA_IMAGE=ghcr.io/tzervas/ap-workflows/runner-base:latest
+export GHA_IMAGE_MODE=external
+# optional: pin a digest after first pull for reproducibility
+gha-runner-ctl prepare --skip-host-update
+```
+
+Until publish, workflows must not assume these tools exist via `sudo apt-get` (rootless
+podman + `no_new_privs` cannot escalate). Prefer `command -v` short-circuit, then a
+checksum-verified user-writable install into `$RUNNER_TEMP/bin`, else fail loudly.
+
 ### Pin runner kit (not hard-coded forever)
 
 Defaults match `packaging/Containerfile` but are overridable:
