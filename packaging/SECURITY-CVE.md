@@ -98,46 +98,60 @@ floating `dev`. Prior CRITICAL-only tag: `sec-20260728` / `0.1.1`.
 These are accepted residual risk until Debian (or a base-image refresh that drops
 the package) publishes a fix. They are **not** treated as gate failures.
 
+**Re-scan evidence (2026-07-28):** `trivy image ghcr.io/tzervas/fleet-runner-base:sec-20260728-high --severity CRITICAL --format json` → **18** CRITICAL, all FixedVersion empty, **0** fixable. Full investigation: [`docs/sec-unfixed-critical.md`](../docs/sec-unfixed-critical.md) (branch `sec/unfixed-perl-bookworm`, issue #74).
+
 ### perl family (bookworm)
 
-No Debian fixed version as of 2026-07-28. Trivy reports the same CVEs on each
-perl-related package:
+| Packages | Installed | CVEs |
+| --- | --- | --- |
+| `perl`, `perl-base`, `perl-modules-5.36`, `libperl5.36` | `5.36.0-7+deb12u3` | CVE-2026-13221, CVE-2026-42496, CVE-2026-57433, CVE-2026-8376 (×4 pkgs = 16 rows) |
 
-| Packages | CVEs |
+| Path | Result (2026-07-28) |
 | --- | --- |
-| `perl`, `perl-base`, `perl-modules-5.36`, `libperl5.36` | CVE-2026-13221, CVE-2026-42496, CVE-2026-57433, CVE-2026-8376 |
+| bookworm-security newer? | **No** — security suite only has older `…+deb12u2` |
+| trixie fixed? | **No** for these CVEs (`5.40.1-6` still vulnerable; some fixes only forky/sid; CVE-2026-13221 unfixed even on sid) |
+| removable? | **No** — `perl-base` is Essential; bookworm `git` Depends: perl; dry-run remove drops git |
 
-**Why present:** `git` and other bookworm packages pull perl as a dependency of
-the runner base. Removing perl would break `git` packaging on Debian.
+**Why present:** `git` (hard dep) + Essential `perl-base`. `installdependencies.sh` does **not** require perl, but the fleet base requires git.
 
-**Mitigation:** keep `apt-get upgrade -y`; re-scan on each rebuild; track Debian
-security tracker for bookworm perl updates.
+**Mitigation:** keep `apt-get upgrade -y`; re-scan on each rebuild; track Debian security tracker. **Do not** mixed-suite pin trixie/sid perl onto bookworm.
 
 ### zlib
 
-| Package | CVE | Notes |
-| --- | --- | --- |
-| `zlib1g` | CVE-2023-45853 | FixedVersion empty on bookworm; widely flagged residual |
+| Package | Installed | CVE | Trivy status |
+| --- | --- | --- | --- |
+| `zlib1g` | `1:1.2.13.dfsg-1` | CVE-2023-45853 | `will_not_fix` on bookworm |
 
-**Mitigation:** same as perl — upgrade-at-build + re-scan. No local backport in
-this image set.
+| Path | Result |
+| --- | --- |
+| bookworm-security newer? | **No** |
+| trixie fixed? | **Yes** (`1:1.3.dfsg+really1.3.1-1`) — Debian fixed on trixie; bookworm ignored (minizip not shipped from src:zlib) |
+| removable? | **No** — required by `installdependencies.sh` (`libkrb5-3 zlib1g`) and dpkg/curl/git/python |
 
 ### sqlite (bookworm)
 
-| Package | CVE | Notes |
-| --- | --- | --- |
-| `libsqlite3-0` | CVE-2025-7458 | FixedVersion empty on bookworm as of 2026-07-28 |
+| Package | Installed | CVE | Notes |
+| --- | --- | --- | --- |
+| `libsqlite3-0` | `3.40.1-2+deb12u2` | CVE-2025-7458 | bookworm `<no-dsa>`; FixedVersion empty |
 
-**Why present:** pulled as a dependency of the runner base stack (python3/git
-ecosystem). No Debian fixed version yet.
+| Path | Result |
+| --- | --- |
+| bookworm-security newer? | **No** |
+| trixie fixed? | **Yes** (`3.46.1-7+deb13u1`) |
+| removable? | **No** without dropping `libpython3.11-stdlib` / standards-gate `python3-yaml` stack |
 
-**Mitigation:** keep `apt-get upgrade -y`; re-scan on rebuild.
+### Recommendation (issue #74)
+
+**Stay on bookworm residual.** A trixie base probe cleared zlib+sqlite but left the **16-row perl CRITICAL cluster** and introduced **openssh-client** CRITICAL (net ~17 residual). Suite move is not justified solely by these residuals until perl is fixed on the target suite. No safe apt pin or package removal lands on this train.
 
 ## Residual HIGH — FixedVersion empty
 
 Document any HIGH with empty FixedVersion discovered after the harden pass in
 the scan log for the `sec-20260728-high` image. As of the harden build, the
-`--ignore-unfixed` HIGH gate is expected to be **clean** (0 fixable).
+`--ignore-unfixed` HIGH gate is expected to be **clean** (0 fixable). Sample
+unfixed HIGH families (curl, expat, util-linux, …) are tracked on issue #74 for
+a separate `sec/unfixed-curl-bookworm` investigation — not cleared by this
+CRITICAL residual write-up.
 
 ## Gate commands
 
@@ -165,4 +179,5 @@ trivy image --scanners secret --exit-code 1 \
   patched with `npm install`.
 - Class images (`shell`, `python`) inherit base residuals; additional class
   toolchains may add their own findings and must be scanned independently.
-'''
+- We do **not** mix Debian suites or strip Essential packages to paper over
+  FixedVersion-empty findings (see `docs/sec-unfixed-critical.md`).
