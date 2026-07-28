@@ -1006,8 +1006,14 @@ mod tests {
 
     #[test]
     fn crate_redact_covers_minted_ghs_tokens() {
-        let line = format!("boom: {}", "ghs_16CharsOfTokenMaterial00");
-        assert!(!crate::redact(&line).contains("16CharsOfTokenMaterial00"));
+        // Real GitHub installation tokens are ghs_ + ≥36 body chars. The crate
+        // redact contract (GH_PREFIX_MIN_BODY) deliberately does not scrub shorter
+        // prose; use a classic-length body so this asserts the live integration.
+        let body = "A".repeat(36);
+        let line = format!("boom: ghs_{body}");
+        let out = crate::redact(&line);
+        assert!(!out.contains(&body), "{out}");
+        assert!(out.contains("ghs_***REDACTED***"), "{out}");
     }
 
     // --- expiry handling ---
@@ -1366,8 +1372,7 @@ mod tests {
             return;
         }
 
-        let dir =
-            std::env::temp_dir().join(format!("gha-appauth-argvtest-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("gha-appauth-argvtest-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let priv_pem_path = dir.join("key.pem");
