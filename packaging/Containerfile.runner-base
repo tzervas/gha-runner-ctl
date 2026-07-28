@@ -27,9 +27,38 @@
 # body — both matched exactly):
 #   docker.io/library/debian:bookworm-slim -> sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
 #
-# Carries (per the frozen class table): runner agent, git, curl, jq, tar, gzip, gitleaks.
+# Carries (per the frozen class table): runner agent, git, curl, jq, tar, gzip, gitleaks,
+# python3 + PyYAML.
 # Runner tarball + gitleaks pins below were copied from packaging/Containerfile and
 # re-verified (sha256sum) against a fresh download on 2026-07-26 — both matched.
+#
+# python3 + PyYAML addendum (2026-07-26): NOT a language-class toolchain — this is the same
+# shape as gitleaks above it. The fleet's development-standards gate
+# (ap-workflows reusable-policy-contract.yml, scripts/standards_check.py) runs on EVERY repo
+# regardless of language, on the plain [self-hosted, linux, x64, podman] label set with no
+# class token (verified live: `GET /repos/tzervas/gha-runner-ctl/actions/runners` returns
+# exactly those four labels and nothing else — no worker anywhere advertises a class token
+# today). That script needs `python3 -c 'import yaml'` to parse workflow files before it can
+# evaluate a single rule, and it fails loudly by design when PyYAML is unavailable rather
+# than report a green gate that measured nothing (see its own bootstrap step's error text:
+# "Fix: install python3-yaml on the runner image").
+#
+# It does NOT belong on the `python` class instead: that would force every non-Python repo
+# (rust-only, docs-only, ...) adopting the gate to also request the `python` class label just
+# to satisfy a governance check unrelated to their own language — the wrong dimension per
+# IMAGE-AND-WORKFLOW-STANDARD.md §3.1 (class describes what a job's OWN code needs; this need
+# belongs to fleet infrastructure, same as gitleaks). And no worker advertises `python` today
+# either, so requesting it would make the gate queue forever with nothing red instead of
+# failing loudly — strictly worse than the current failure.
+#
+# Installed via apt (`python3-yaml`, which pulls in a minimal python3 as a dependency), not
+# vendored as a PyPI wheel: apt-get already runs against trusted HTTPS Debian mirrors at BUILD
+# time in this same file (see the RUN block below) — this adds one more package to that
+# already-accepted build-time network surface, it does not open a new one, and it needs no
+# runtime egress. This does NOT contradict fleet-runner-python's "intentionally not apt
+# python3" choice: that decision is about the *language runtime CI jobs execute user code
+# with* (reproducibility via uv-managed CPython); this system python3 exists purely to run the
+# standards checker, the same infrastructure role gitleaks plays, not to run anyone's tests.
 #
 # Runs as non-root UID 1001 (trivy DS-0002), same convention as packaging/Containerfile.
 # Style: one logical step per RUN (no && chains) — matches packaging/Containerfile.
@@ -89,8 +118,10 @@ RUN apt-get update \
       gzip \
       coreutils \
       bash \
-      sudo
+      sudo \
+      python3-yaml
 RUN rm -rf /var/lib/apt/lists/*
+RUN python3 -c 'import sys, yaml; print("python", sys.version.split()[0], "/ pyyaml", yaml.__version__)'
 RUN useradd -m -u "${RUNNER_UID}" -s /bin/bash "${RUNNER_USER}"
 
 # gitleaks pinned binary → /usr/local/bin (fleet-security / secret scan jobs)
