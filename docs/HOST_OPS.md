@@ -105,6 +105,22 @@ GHA_IMAGE=docker.io/library/ubuntu:24.04 gha-runner-ctl prepare --skip-host-upda
 GHA_IMAGE=ghcr.io/my-org/ci:latest GHA_PULL_POLICY=always gha-runner-ctl prepare --skip-host-update
 ```
 
+### Private GHCR (or other registry)
+
+Authenticate **before** `prepare`/`up` as the same OS user that runs rootless Podman.
+Do **not** put a packages PAT into the listen unit's `GH_TOKEN` (that env is for
+minting registration tokens only). Host-side login:
+
+```bash
+# durable authfile; packages-only token via secret exec (fleet convention)
+secret exec GHCR_TOKEN=runner/read-packages-tok -- \
+  bash -c 'printf %s "$GHCR_TOKEN" | podman login \
+    --authfile "$HOME/.config/containers/auth.json" \
+    ghcr.io -u x-access-token --password-stdin'
+```
+
+Details and anti-patterns: [WORK_IMAGES.md § Private registries](WORK_IMAGES.md#private-registries-ghcr--host-login-not-job-env).
+
 Host package upgrades require privileges and operator intent. Do not automate
 unattended host `apt`/`dnf` upgrade without an explicit human decision for that host.
 

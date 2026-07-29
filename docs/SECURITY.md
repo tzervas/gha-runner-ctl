@@ -66,6 +66,7 @@ staying outside the org. See README.
 ## Operator checklist
 
 - [ ] `gh auth` / `GH_TOKEN` with least privilege for registration only  
+- [ ] Packages / GHCR pull uses a **separate** `read:packages` credential via host `podman login` — never as listen `GH_TOKEN` and never in job container env ([WORK_IMAGES](WORK_IMAGES.md#private-registries-ghcr--host-login-not-job-env))  
 - [ ] Runner groups in org UI limited to intended repos  
 - [ ] Prefer private repos on self-hosted compute  
 - [ ] Do not commit registration tokens or `GHA_WAKE_TOKEN`  
