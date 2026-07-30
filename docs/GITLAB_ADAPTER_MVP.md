@@ -52,7 +52,8 @@ GitHub registration tokens expire in ~1 hour. GitLab `glrt-` tokens **do not exp
 | In | Out |
 |---|---|
 | Design doc (this file) | Full `listen` loop for GitLab |
-| Spike script: mint / get / delete against live CE | Spawning `gitlab-runner` workers |
+| Spike script: mint / get / delete against live CE | Full `listen` loop |
+| Worker script: capped podman `gitlab-runner` register/run + always DELETE | Warm multi-worker pool |
 | Secret key name: `gitlab/api-token` via `secret exec` | Gitea/Forgejo |
 | Redaction / argv guards for GL token shapes | Renaming crate to `ap-runner-ctl` |
 | `run_untagged=false` default (documented) | Instance-wide demand polling (CE unsupported) |
@@ -166,3 +167,16 @@ See script header for tunnel + proof steps. It mints one runner, prints **only**
 - fleet-config design: `DESIGN-runner-ctl-forges.md` (Forge + RunnerAgent traits, `run_untagged`, CE demand honesty)
 - fleet-ops GitLab unit + supplemental posture (`gitlab/` on server lanes)
 - Do **not** break existing GH `gha-runner-ctl@cpu`
+
+
+## Worker script (phase 1b)
+
+`scripts/gitlab-ce-worker.sh`:
+
+1. `secret exec` + `POST /user/runners` → `glrt` (0600 temp)
+2. SSH to forge host → `podman run` **resource-capped** `gitlab/gitlab-runner` (no docker.sock)
+3. `register --non-interactive --executor shell --run-untagged=false`
+4. `run --max-builds 1` until online (or timeout)
+5. Stop container; trap always `DELETE /runners/:id`
+
+Env: `HOMELAB_SSH`, `HOMELAB_SSH_KEY`, `GHA_GITLAB_URL`, `GITLAB_WORKER_MEMORY` (default 512m), `GITLAB_WORKER_CPUS` (default 1).

@@ -1,0 +1,11 @@
+# Example only — additive to GH @cpu. Do NOT enable until smoke is green.
+# Install under gha-agent user systemd when ready.
+#
+# [Service]
+# Environment=GHA_FORGE=gitlab
+# Environment=GHA_GITLAB_URL=https://git.vectorweight.com
+# Environment=GITLAB_RUNNER_IMAGE=docker.io/gitlab/gitlab-runner:alpine-v17.5.3
+# ExecStart=/usr/local/bin/secret exec GITLAB_TOKEN=gitlab/api-token -- \
+#   /home/gha-agent/.local/bin/gha-runner-ctl listen --forge gitlab ...
+#
+# Today use scripts/gitlab-ce-worker.sh for the capped one-shot cycle.
