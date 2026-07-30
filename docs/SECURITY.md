@@ -63,6 +63,31 @@ Organization runners only serve repositories in that org. Personal
 `user/repo` workflows cannot use `vectorweighttechnologies` runners while
 staying outside the org. See README.
 
+## Credential matrix (do not conflate)
+
+Three different secrets appear in runner ops. Using the wrong one fails registration or over-scopes the host.
+
+| Credential | Env / surface | What it is | Who consumes it |
+|---|---|---|---|
+| **API mint credential** | `GH_TOKEN` / `GITHUB_TOKEN` (or App installation token — see issue #41) | Long-lived classic PAT/OAuth (`ghp_`/`gho_`), fine-grained PAT (`github_pat_`), or short-lived App installation token (`ghs_`) that can **create** runner registration tokens | **Fleet agent only** — `POST /repos/{owner}/{repo}/actions/runners/registration-token` (or org equivalent), plus demand polling |
+| **One-shot registration token** | `RUNNER_TOKEN` inside the work container (minted per `up`; not stored long-term) | Opaque ~1h token returned by that POST (or GitHub UI "New self-hosted runner") | **`config.sh` only** — consumed at register time; runner then writes its own credentials. Special value `REUSE` skips mint when retain mode has a valid `.runner` on the volume |
+| **Packages / GHCR pull** | Host pull path (e.g. `podman login` / authfile); **not** `GH_TOKEN` for listen | Classic PAT with `read:packages` (and write only if you publish) | Image pull on the **host** agent user — never substitute for registration mint |
+
+### Common mistakes
+
+- Putting a **one-shot registration token** in `GH_TOKEN` — the agent needs a general GitHub API credential that *mints* reg tokens; a one-shot token is not that.
+- Passing a **PAT** (`ghp_` / `gho_` / `github_pat_`) to `config.sh --token` — that flag expects a registration token, not a PAT.
+- Using a **packages-only** PAT as `GH_TOKEN` for `listen`/`up` — will 403 on runner list/mint endpoints.
+- Storing vault secrets named `*-reg-token` that are actually long-lived PATs — rename/document them as API credentials (ops concern; the binary only sees env values).
+
+Host wiring pattern (SOPS/age stores are out of band): inject the mint credential at process start, never argv:
+
+```bash
+secret exec GH_TOKEN=runner/gh-token -- gha-runner-ctl listen …
+```
+
+Registration POSTs are paced host-wide (`GHA_REG_MIN_GAP_SECS`, `GHA_REG_MAX_PER_HOUR`). See [ctl/reg-api-budget](interfaces/ctl-reg-api-budget.md).
+
 ## Operator checklist
 
 - [ ] `gh auth` / `GH_TOKEN` with least privilege for registration only  
@@ -71,7 +96,7 @@ staying outside the org. See README.
 - [ ] Do not commit registration tokens or `GHA_WAKE_TOKEN`  
 - [ ] Keep `gha-runner-ctl` and the work image pin current (runner sha256 in Containerfile)  
 - [ ] Prefer host binary as `gha-agent` for full `listen`/`warm`/`up`; micro-agent has no Podman socket and cannot spawn work containers
-- [ ] Always set `GHA_PREFER_REPOS` allowlist for personal multi-repo  
+- [ ] Always set `GHA_ALLOWLIST_REPOS` (formerly `GHA_PREFER_REPOS`) allowlist for personal multi-repo  
 - [ ] Run `bash scripts/security-scan.sh` before each release  
 
 ## Hardening follow-ons

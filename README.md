@@ -134,10 +134,11 @@ Full matrix, systemd, containers/VMs for testing: **[docs/HOST_PLATFORMS.md](doc
 
 - A **Unix-like host** with **Podman** (Linux native preferred; see [HOST_PLATFORMS](docs/HOST_PLATFORMS.md))
 - Rust 1.96+ only if building from source
-- Token that can create runner registration tokens:
+- **API mint credential** (`GH_TOKEN` / `GITHUB_TOKEN`) that can create runner registration tokens — **not** a one-shot `config.sh` registration token, and **not** a packages-only PAT:
   - Repo: admin on that repository  
   - Org: org owner / runner admin  
   - User batch: ability to register runners on each owned personal repo that will run jobs  
+  - The agent mints short-lived registration tokens itself and passes them to work containers as `RUNNER_TOKEN` (see [SECURITY — Credential matrix](docs/SECURITY.md#credential-matrix-do-not-conflate))
 
 Personal GitHub user accounts only get repo-scoped runners. For one registration across many repos under an org, use `--scope org`.
 
