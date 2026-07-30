@@ -541,7 +541,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      - name: Download scan artifacts
+      - name: Download scan artifacts (advisory)
         uses: actions/download-artifact@v4
         with:
           path: _scan_artifacts
