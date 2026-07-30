@@ -180,3 +180,13 @@ See script header for tunnel + proof steps. It mints one runner, prints **only**
 5. Stop container; trap always `DELETE /runners/:id`
 
 Env: `HOMELAB_SSH`, `HOMELAB_SSH_KEY`, `GHA_GITLAB_URL`, `GITLAB_WORKER_MEMORY` (default 512m), `GITLAB_WORKER_CPUS` (default 1).
+
+
+## Register CLI (glrt / new creation workflow)
+
+When minting with `POST /user/runners`, the returned `glrt-` token already carries
+tags / `run_untagged` / locked / timeout from the API body. **`gitlab-runner register`
+must not pass** `--tag-list`, `--run-untagged`, `--locked`, `--maximum-timeout`,
+`--access-level`, or `--paused` — GitLab 16+ returns FATAL otherwise.
+
+Allowed at register: `--url`, `--token`, `--executor`, `--description` (and executor-specific flags).

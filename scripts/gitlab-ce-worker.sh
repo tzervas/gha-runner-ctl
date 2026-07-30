@@ -5,6 +5,7 @@
 #   - PAT only via secret exec (gitlab/api-token)
 #   - glrt never printed; shredded after inject
 #   - no docker.sock; shell executor inside worker
+#   - glrt register: only --url/--token/--executor/--description (tags set at mint)
 #   - resource caps; run_untagged=false tags
 #   - DELETE runner on every exit path
 #
@@ -212,14 +213,12 @@ sudo -n podman run --rm \
   --name gl-ctl-register \
   --memory "\$MEM" --cpus "\$CPUS" \
   -v "\$CFG:/etc/gitlab-runner:Z" \
+  # New glrt workflow: tags/run_untagged/locked are set at POST /user/runners only.
   "\$IMG" register --non-interactive \
     --url "\$URL" \
     --token "\$(sudo -n cat \$CFG/token)" \
     --executor shell \
-    --description "gha-runner-ctl-shell" \
-    --tag-list "${TAGS}" \
-    --run-untagged=false \
-    --locked=false
+    --description "gha-runner-ctl-shell"
 # shred token file after register (config.toml holds auth)
 sudo -n shred -u "\$CFG/token" 2>/dev/null || sudo -n rm -f "\$CFG/token"
 # run in background briefly so agent contacts GitLab
