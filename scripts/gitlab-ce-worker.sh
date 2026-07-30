@@ -213,8 +213,8 @@ sudo -n podman run --rm \
   --name gl-ctl-register \
   --memory "\$MEM" --cpus "\$CPUS" \
   -v "\$CFG:/etc/gitlab-runner:Z" \
-# New glrt workflow: tags set at POST /user/runners only (not on register CLI).
-  "\$IMG" register --non-interactive \
+  "\$IMG" \
+  register --non-interactive \
     --url "\$URL" \
     --token "\$(sudo -n cat \$CFG/token)" \
     --executor shell \
@@ -228,7 +228,8 @@ sudo -n podman run -d \
   --memory "\$MEM" --cpus "\$CPUS" \
   --restart=no \
   -v "\$CFG:/etc/gitlab-runner:Z" \
-  "\$IMG" run --max-builds 1 --working-directory /home/gitlab-runner
+  "\$IMG" \
+  run --max-builds 1 --working-directory /home/gitlab-runner
 echo "worker_started"
 REMOTE
 
