@@ -209,24 +209,27 @@ MEM="${MEMORY}"
 CPUS="${CPUS}"
 # pull if missing
 sudo -n podman pull "\$IMG" >/dev/null
-# register non-interactive
-sudo -n podman run --rm \
-  --name gl-ctl-register \
-  --network=host \
-  --memory "\$MEM" --cpus "\$CPUS" \
-  -v "\$CFG:/etc/gitlab-runner:Z" \
-  "\$IMG" \
-  register --non-interactive \
-    --url "\$URL" \
-    --token "\$(sudo -n cat \$CFG/token)" \
-    --executor shell \
-    --description "gha-runner-ctl-shell"
-# Lab wildcard is CN-only (no SAN); Go x509 rejects it without skip or proper CA.
-# Prefer reissuing cert with SANs later; for CE lab integration:
-if ! sudo -n grep -q 'tls-skip-verify' "\$CFG/config.toml" 2>/dev/null; then
-  sudo -n sed -i '/^  url = /a\  tls-skip-verify = true' "\$CFG/config.toml"
-fi
-# shred token file after register (config.toml holds auth)
+# Write config.toml ourselves (glrt already minted). Avoid register CLI verify
+# before tls-skip-verify can be set. Lab cert is CN-only without SANs.
+TOK=\$(sudo -n cat "\$CFG/token")
+sudo -n tee "\$CFG/config.toml" >/dev/null <<TOML
+concurrent = 1
+check_interval = 3
+log_level = "info"
+
+[[runners]]
+  name = "gha-runner-ctl-shell"
+  url = "\$URL"
+  id = 0
+  token = "\$TOK"
+  token_obtained_at = 0001-01-01T00:00:00Z
+  token_expires_at = 0001-01-01T00:00:00Z
+  executor = "shell"
+  shell = "bash"
+  tls-skip-verify = true
+TOML
+sudo -n chmod 600 "\$CFG/config.toml"
+# Never leave glrt as separate file
 sudo -n shred -u "\$CFG/token" 2>/dev/null || sudo -n rm -f "\$CFG/token"
 # run in background briefly so agent contacts GitLab
 sudo -n podman rm -f gl-ctl-worker 2>/dev/null || true
@@ -238,6 +241,7 @@ sudo -n podman run -d \
   -v "\$CFG:/etc/gitlab-runner:Z" \
   "\$IMG" \
   run --max-builds 1 --working-directory /home/gitlab-runner
+echo "worker_started"
 echo "worker_started"
 REMOTE
 
