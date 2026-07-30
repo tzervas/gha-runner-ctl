@@ -190,3 +190,9 @@ must not pass** `--tag-list`, `--run-untagged`, `--locked`, `--maximum-timeout`,
 `--access-level`, or `--paused` — GitLab 16+ returns FATAL otherwise.
 
 Allowed at register: `--url`, `--token`, `--executor`, `--description` (and executor-specific flags).
+
+### Networking note (same host as Caddy)
+
+Worker containers use `--network=host` so `git.vectorweight.com` resolves via the host
+resolver and hits Caddy on :443. Bridge-network DNS to public LAN names timed out
+(`read udp … → 192.168.1.1:53`). No docker.sock; still no privileged docker executor.

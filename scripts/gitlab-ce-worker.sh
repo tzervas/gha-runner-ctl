@@ -5,6 +5,7 @@
 #   - PAT only via secret exec (gitlab/api-token)
 #   - glrt never printed; shredded after inject
 #   - no docker.sock; shell executor inside worker
+#   - --network=host so runner can resolve/reach forge URL on LAN Caddy
 #   - glrt register: only --url/--token/--executor/--description (tags set at mint)
 #   - resource caps; run_untagged=false tags
 #   - DELETE runner on every exit path
@@ -211,6 +212,7 @@ sudo -n podman pull "\$IMG" >/dev/null
 # register non-interactive
 sudo -n podman run --rm \
   --name gl-ctl-register \
+  --network=host \
   --memory "\$MEM" --cpus "\$CPUS" \
   -v "\$CFG:/etc/gitlab-runner:Z" \
   "\$IMG" \
@@ -225,6 +227,7 @@ sudo -n shred -u "\$CFG/token" 2>/dev/null || sudo -n rm -f "\$CFG/token"
 sudo -n podman rm -f gl-ctl-worker 2>/dev/null || true
 sudo -n podman run -d \
   --name gl-ctl-worker \
+  --network=host \
   --memory "\$MEM" --cpus "\$CPUS" \
   --restart=no \
   -v "\$CFG:/etc/gitlab-runner:Z" \
