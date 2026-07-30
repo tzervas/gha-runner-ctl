@@ -346,12 +346,54 @@ they are still Linux ABI-compatible rootfs images (or you pre-seed a custom runn
 that matches the image ABI). True FreeBSD/OpenBSD kernels are outside Podman-on-Linux;
 bring your own seed volume (`run.sh` already present → prepare skips re-download).
 
+## Private registries (GHCR) — host login, not job env
+
+`gha-runner-ctl` pulls work images with plain `podman pull` / `podman run --pull=…`.
+It does **not** take a packages PAT on the CLI or inject registry credentials into the
+work container. Authenticate the **host** rootless Podman user (`gha-agent`) first.
+
+### Preferred pattern (fleet)
+
+```bash
+# As gha-agent (XDG_RUNTIME_DIR set). Token from sops vault via secret(1) only.
+# Use a packages-only credential — never the registration/API token.
+secret exec GHCR_TOKEN=runner/read-packages-tok -- \
+  bash -c 'mkdir -p "$HOME/.config/containers"
+    printf %s "$GHCR_TOKEN" | podman login \
+      --authfile "$HOME/.config/containers/auth.json" \
+      ghcr.io -u x-access-token --password-stdin'
+```
+
+| Do | Don't |
+|----|--------|
+| Host `podman login` + durable authfile | Put packages PAT in `GH_TOKEN` for `listen` |
+| Separate vault key (`read:packages` only) | Pass packages PAT into the job container env |
+| `GHA_IMAGE=ghcr.io/…` + `image-mode=external` | Expect the binary to mint GHCR auth for you today |
+
+Notes:
+
+- Default write path for `podman login` is `$XDG_RUNTIME_DIR/containers/auth.json`
+  (lost on reboot). Prefer `--authfile $HOME/.config/containers/auth.json`.
+- Work container env-file carries `RUNNER_TOKEN` (one-shot registration) only — not
+  `GH_TOKEN` / packages PAT (`write_env_file` in the agent).
+- There is **no** first-class `GHA_REGISTRY_*` env yet; host authfile is the supported
+  path. Feature request: issue tracker “registry-auth helpers”.
+
+Example instance env after host login:
+
+```bash
+GHA_IMAGE=ghcr.io/my-org/fleet-runner-base:sec-20260728-high
+GHA_IMAGE_MODE=external
+GHA_PULL_POLICY=missing
+```
+
 ## Security notes
 
 - Image refs are validated (no shell metacharacters; length/charset limits).
 - External mode still uses `no-new-privileges`, `--cap-drop ALL`, and configurable `--user`.
 - Prefer digests (`@sha256:…`) or immutable tags for production images.
 - `--pull=never` remains the safe hot-path default for **build** mode after prepare.
+- Private registry auth stays on the **host agent plane**; never in the work endpoint.
 
 ## Related
 
