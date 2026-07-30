@@ -623,13 +623,23 @@ fn effective_uid_is_root() -> bool {
 /// Checks for raw token patterns in CLI arguments. If found, prints an error message and exits.
 /// This prevents users from leaking secrets in shell history, process listings, or logs.
 pub fn prevent_raw_token_args() {
-    let token_prefixes = ["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"];
+    // GitHub classic/fine-grained + GitLab PAT / runner auth (glrt is durable — never argv).
+    let token_prefixes = [
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
+        "github_pat_",
+        "glpat-",
+        "glrt-",
+    ];
     for arg in std::env::args() {
         for prefix in token_prefixes {
             if arg.contains(prefix) {
-                eprintln!("gha-runner-ctl ERROR: Raw GitHub token/PAT pattern detected in command line arguments!");
+                eprintln!("gha-runner-ctl ERROR: Raw forge token/PAT pattern detected in command line arguments!");
                 eprintln!("We take an opinionated stance on security: we do NOT allow passing secrets directly via CLI arguments to prevent history or process logs exposure.");
-                eprintln!("Please run without token arguments. We will securely prompt you interactively, retrieve it via Git Credential Manager, or load it from config.");
+                eprintln!("Please run without token arguments. Load via secret exec / env file / interactive prompt — never argv.");
                 eprintln!("\nTo scrub this command from your shell history:");
                 eprintln!("  - In Bash: history -d $(history | tail -n 2 | head -n 1 | awk '{{print $1}}') (or edit ~/.bash_history)");
                 eprintln!("  - In Zsh:  fc -W && fc -R (or edit ~/.zsh_history)");
@@ -1036,30 +1046,37 @@ pub fn is_safe_memory(s: &str) -> bool {
 /// under-redacting a genuine token, whose body is always ≥ 36.
 const GH_PREFIX_MIN_BODY: usize = 36;
 
+/// GitLab personal-access / runner-auth bodies are shorter than GitHub classic
+/// PATs. Live CE 19.2 minted `glrt-` with total length 56 (prefix + body).
+/// `glpat-` bodies are commonly ~20+. Floor of 20 blocks bare prose prefixes
+/// while redacting real tokens.
+const GL_PREFIX_MIN_BODY: usize = 20;
+
 /// Minimum body length for a *contextual value marker* (`Bearer `,
-/// `RUNNER_TOKEN=`). Here the marker is not itself a token shape — it names a
-/// slot whose value is a secret regardless of length — so ANY non-empty value
-/// after it must be scrubbed. Registration/runner tokens minted by GitHub are
-/// short (~29 chars) and would slip past a 36-byte floor, so contextual markers
-/// deliberately use a floor of 1 (redact any non-empty body). An empty body
-/// (marker immediately followed by a non-body char, e.g. `RUNNER_TOKEN=""`) is
-/// still treated as prose and left untouched.
+/// `RUNNER_TOKEN=`, `PRIVATE-TOKEN: `). Here the marker is not itself a token
+/// shape — it names a slot whose value is a secret regardless of length — so
+/// ANY non-empty value after it must be scrubbed. Registration/runner tokens
+/// minted by GitHub are short (~29 chars) and would slip past a 36-byte floor,
+/// so contextual markers deliberately use a floor of 1 (redact any non-empty
+/// body). An empty body (marker immediately followed by a non-body char, e.g.
+/// `RUNNER_TOKEN=""`) is still treated as prose and left untouched.
 const CONTEXTUAL_MIN_BODY: usize = 1;
 
-/// GitHub token-type prefixes and contextual value markers that anchor secret
+/// Forge token-type prefixes and contextual value markers that anchor secret
 /// detection in [`redact`], each paired with the minimum body length that makes
-/// a match a real secret (see [`GH_PREFIX_MIN_BODY`] / [`CONTEXTUAL_MIN_BODY`]).
-/// Each entry's literal is the text that precedes a secret value; for the two
-/// contextual markers the delimiter ('` `' / '`=`') is part of the literal
-/// itself, so the run *after* the marker is the value that gets replaced.
+/// a match a real secret (see [`GH_PREFIX_MIN_BODY`] / [`GL_PREFIX_MIN_BODY`] /
+/// [`CONTEXTUAL_MIN_BODY`]).
+/// Each entry's literal is the text that precedes a secret value; for the
+/// contextual markers the delimiter ('` `' / '`=`' / '`: `') is part of the
+/// literal itself, so the run *after* the marker is the value that gets replaced.
 ///
 /// The literals are mutually exclusive at their discriminating byte (e.g.
-/// `ghp_` vs `gho_` vs `github_pat_` diverge by the 3rd/4th char), so at most
-/// one entry can match at any given scan position — order does not affect
-/// correctness. The split minimum (36 for the fixed token prefixes, 1 for the
-/// contextual markers) is the key correctness reconciliation: it prevents
-/// over-redacting short `ghp_`/`ghs_` prose while still fully redacting short
-/// `RUNNER_TOKEN=`/`Bearer ` values.
+/// `ghp_` vs `gho_` vs `github_pat_` diverge by the 3rd/4th char; `glpat-` /
+/// `glrt-` diverge by the 3rd), so at most one entry can match at any given
+/// scan position — order does not affect correctness. The split minimum (36 for
+/// GitHub fixed prefixes, 20 for GitLab, 1 for contextual markers) is the key
+/// correctness reconciliation: it prevents over-redacting short prose while
+/// still fully redacting short `RUNNER_TOKEN=`/`Bearer `/`PRIVATE-TOKEN: ` values.
 const TOKEN_ANCHORS: &[(&str, usize)] = &[
     ("ghp_", GH_PREFIX_MIN_BODY),
     ("gho_", GH_PREFIX_MIN_BODY),
@@ -1067,15 +1084,18 @@ const TOKEN_ANCHORS: &[(&str, usize)] = &[
     ("ghs_", GH_PREFIX_MIN_BODY),
     ("ghr_", GH_PREFIX_MIN_BODY),
     ("github_pat_", GH_PREFIX_MIN_BODY),
+    ("glpat-", GL_PREFIX_MIN_BODY),
+    ("glrt-", GL_PREFIX_MIN_BODY),
     ("Bearer ", CONTEXTUAL_MIN_BODY),
     ("RUNNER_TOKEN=", CONTEXTUAL_MIN_BODY),
+    ("PRIVATE-TOKEN: ", CONTEXTUAL_MIN_BODY),
 ];
 
-/// First bytes that can begin a [`TOKEN_ANCHORS`] entry: `g` (all six GitHub
-/// token prefixes), `B` (`Bearer `), `R` (`RUNNER_TOKEN=`).
+/// First bytes that can begin a [`TOKEN_ANCHORS`] entry: `g` (GitHub + GitLab
+/// prefixes), `B` (`Bearer `), `R` (`RUNNER_TOKEN=`), `P` (`PRIVATE-TOKEN: `).
 ///
 /// This is a pure prefilter for [`redact`]'s scan loop — a position whose first
-/// byte is not in this set cannot start an anchor, so the 8-way `starts_with`
+/// byte is not in this set cannot start an anchor, so the multi-way `starts_with`
 /// comparison can be skipped there. It never changes what is redacted, only how
 /// fast the loop reaches it.
 ///
@@ -1086,7 +1106,7 @@ const TOKEN_ANCHORS: &[(&str, usize)] = &[
 /// under-redaction.
 #[inline]
 fn could_start_anchor(b: u8) -> bool {
-    matches!(b, b'g' | b'B' | b'R')
+    matches!(b, b'g' | b'B' | b'R' | b'P')
 }
 
 /// The token-body character class: ASCII alphanumerics plus `_`, `-`, `.`.
@@ -1600,6 +1620,31 @@ mod redact_hardening_tests {
         );
     }
 
+    /// GitLab runner auth tokens (`glrt-`) are durable and must redact at the
+    /// GL floor (20). Synthetic bodies only — never real secrets in tests.
+    #[test]
+    fn gitlab_glrt_and_private_token_redacted() {
+        let body = "A".repeat(51); // measured live total len 56 = "glrt-" + 51
+        assert_eq!(
+            redact(&format!("minted glrt-{body} ok")),
+            "minted glrt-***REDACTED*** ok"
+        );
+        let pat_body = "B".repeat(20);
+        assert_eq!(redact(&format!("glpat-{pat_body}")), "glpat-***REDACTED***");
+        // bare prefix / short prose must not over-redact
+        assert_eq!(
+            redact("docs mention glrt- prefix"),
+            "docs mention glrt- prefix"
+        );
+        let short = "C".repeat(19);
+        assert_eq!(redact(&format!("glrt-{short}")), format!("glrt-{short}"));
+        // GitLab API header form
+        assert_eq!(
+            redact(&format!("PRIVATE-TOKEN: glpat-{pat_body}")),
+            "PRIVATE-TOKEN: ***REDACTED***"
+        );
+    }
+
     /// The classic 36-char body case: exactly at the floor, redacted.
     #[test]
     fn classic_36_char_ghs_token() {
@@ -1828,18 +1873,26 @@ mod redact_hardening_tests {
 
     // ---- prevent_raw_token_args prefix-list parity ----------------------
 
-    /// src/lib.rs:563's guard list must include every anchor prefix that
-    /// redact() knows about (minus the two contextual markers, which are
-    /// not standalone CLI-arg substrings), so a raw `ghr_...` token on the
-    /// command line is blocked exactly like the other five prefixes.
+    /// Guard list must include every forge token prefix that redact() knows
+    /// about (minus contextual markers, which are not standalone CLI-arg
+    /// substrings), so a raw `ghr_…` / `glrt-…` on the command line is blocked.
     #[test]
     fn prevent_raw_token_args_prefix_list_has_ghr() {
         // Mirrors the literal in prevent_raw_token_args(); kept as a
         // documentation-style regression so a future edit that drops a
         // prefix again is caught here rather than only in production.
-        let guarded = ["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"];
+        let guarded = [
+            "ghp_",
+            "gho_",
+            "ghu_",
+            "ghs_",
+            "ghr_",
+            "github_pat_",
+            "glpat-",
+            "glrt-",
+        ];
         for &(anchor, _min_body) in TOKEN_ANCHORS {
-            if anchor == "Bearer " || anchor == "RUNNER_TOKEN=" {
+            if matches!(anchor, "Bearer " | "RUNNER_TOKEN=" | "PRIVATE-TOKEN: ") {
                 continue;
             }
             assert!(
