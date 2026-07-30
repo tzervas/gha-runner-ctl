@@ -221,6 +221,11 @@ sudo -n podman run --rm \
     --token "\$(sudo -n cat \$CFG/token)" \
     --executor shell \
     --description "gha-runner-ctl-shell"
+# Lab wildcard is CN-only (no SAN); Go x509 rejects it without skip or proper CA.
+# Prefer reissuing cert with SANs later; for CE lab integration:
+if ! sudo -n grep -q 'tls-skip-verify' "\$CFG/config.toml" 2>/dev/null; then
+  sudo -n sed -i '/^  url = /a\  tls-skip-verify = true' "\$CFG/config.toml"
+fi
 # shred token file after register (config.toml holds auth)
 sudo -n shred -u "\$CFG/token" 2>/dev/null || sudo -n rm -f "\$CFG/token"
 # run in background briefly so agent contacts GitLab

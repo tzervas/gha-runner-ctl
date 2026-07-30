@@ -196,3 +196,11 @@ Allowed at register: `--url`, `--token`, `--executor`, `--description` (and exec
 Worker containers use `--network=host` so `git.vectorweight.com` resolves via the host
 resolver and hits Caddy on :443. Bridge-network DNS to public LAN names timed out
 (`read udp … → 192.168.1.1:53`). No docker.sock; still no privileged docker executor.
+
+### TLS note (lab wildcard)
+
+Host cert is self-signed **CN=`*.vectorweight.com` without SANs**. Modern Go
+(`gitlab-runner`) fails verify with `certificate relies on legacy Common Name field`.
+
+MVP worker sets `tls-skip-verify = true` in `config.toml` after register.
+Longer-term: reissue cert with DNS SANs + `install-lab-ca-trust.sh` (no skip).
