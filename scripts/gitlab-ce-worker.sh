@@ -213,7 +213,7 @@ sudo -n podman run --rm \
   --name gl-ctl-register \
   --memory "\$MEM" --cpus "\$CPUS" \
   -v "\$CFG:/etc/gitlab-runner:Z" \
-  # New glrt workflow: tags/run_untagged/locked are set at POST /user/runners only.
+# New glrt workflow: tags set at POST /user/runners only (not on register CLI).
   "\$IMG" register --non-interactive \
     --url "\$URL" \
     --token "\$(sudo -n cat \$CFG/token)" \
