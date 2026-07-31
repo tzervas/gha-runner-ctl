@@ -1,5 +1,19 @@
 ## Unreleased
 
+### Added — GitHub App installation-token authentication (opt-in, closes #41)
+
+`listen` re-scans every `GHA_PRIORITY_REPOS` repo every tick — measured on the homelab
+instance at ~4,800 GETs/hour against a classic PAT's 5,000/hour cap, which is why
+`listen: list_demand_jobs: budget exhausted mid-scan` fired on nearly every tick. Set
+`GHA_APP_ID` + `GHA_APP_INSTALLATION_ID` + `GHA_APP_PRIVATE_KEY` (a `file:`-style path,
+never inline key material) to mint short-lived installation tokens instead — 15,000
+requests/hour, 3x the PAT budget. Purely additive: absent or partially-set App env vars
+fall back to the existing `GH_TOKEN`/PAT discovery unchanged, so existing deployments
+need zero config change. RS256 JWT signing shells out to `openssl` (already required on
+the host) instead of adding a crate dependency. See `src/appauth.rs` and
+[docs/GITHUB_APP_AUTH.md](docs/GITHUB_APP_AUTH.md) for the owner setup steps (App
+permissions, installation target, key storage).
+
 ### Changed — pool tier resource grants sized for the actual homelab host, not a laptop
 
 Controller pool logs showed ~39 of 48 pool cores sitting idle immediately after

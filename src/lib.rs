@@ -10,6 +10,7 @@
 //! multiple ephemeral workers sized from job complexity within a host budget
 //! (default 8 CPU / 8 GiB shared across all managers).
 
+mod appauth;
 mod image_arch;
 mod pool;
 
@@ -1619,6 +1620,14 @@ fn prompt_token_interactively() -> Option<String> {
 }
 
 fn github_token() -> Result<String, String> {
+    // GitHub App auth (opt-in, additive): only engages when GHA_APP_ID,
+    // GHA_APP_INSTALLATION_ID, and GHA_APP_PRIVATE_KEY are all set. Once fully
+    // configured it is authoritative — a mint failure is a hard error, not a
+    // silent fall-through to the PAT path below. See src/appauth.rs.
+    if let Some(cfg) = appauth::app_auth_config_from_env() {
+        return appauth::installation_token(&cfg);
+    }
+
     // 1. Try env variables
     for key in ["GH_TOKEN", "GITHUB_TOKEN"] {
         if let Ok(t) = std::env::var(key) {
