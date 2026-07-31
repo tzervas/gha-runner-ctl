@@ -4276,12 +4276,17 @@ fn local_worker_snapshots(cli: &Cli, pool: &ResourcePool, max_local: u32) -> Vec
         if running || claimed {
             // Local job signal only; independent of list_demand_jobs RR sample.
             let busy = running && container_worker_busy(&container);
+            let repo = claims
+                .iter()
+                .find(|c| c.container == container || c.worker_id == worker_id)
+                .and_then(|c| c.repo.clone());
             out.push(WorkerSnapshot {
                 slot,
                 worker_id,
                 container,
                 running,
                 busy,
+                repo,
             });
         }
     }
@@ -4481,6 +4486,9 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
                 })
                 .collect();
 
+            // CTL-1 primary: dynamic pool is always ephemeral re-register → idle
+            // workers must exit (not warm-pin a repo). Flag off keeps preempt-only
+            // behavior for unit tests / experimental retain hybrids.
             let plan = plan_scale(&ScaleInput {
                 jobs: signals,
                 workers: workers.clone(),
@@ -4494,6 +4502,7 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
                 force_gpu: cli.gpu,
                 idle_expired,
                 max_spawn_per_tick: max_spawn,
+                ephemeral_post_job_exit: true,
             });
 
             eprintln!(

@@ -520,6 +520,9 @@ pub struct WorkerSnapshot {
     /// Scale-in must never target a busy worker even when the partial RR demand
     /// sample looks empty (busy job may live on an un-scanned prefer-repo).
     pub busy: bool,
+    /// Repo this worker is registered/claimed for (`owner/name`), when known.
+    /// Ephemeral user-batch workers only serve that one repo until retargeted.
+    pub repo: Option<String>,
 }
 
 /// True when the worker is known to be executing a job (not merely online/idle).
@@ -588,6 +591,11 @@ pub struct ScaleInput {
     pub idle_expired: bool,
     /// Anti-storm: max new spawns this tick.
     pub max_spawn_per_tick: u32,
+    /// CTL-1 primary (Claude): ephemeral workers must exit when idle after a job.
+    /// When true, every `running && !busy` worker is scale-in candidate — pinning
+    /// is fixed by construction (no warm idle retain). Wrong-repo preempt remains
+    /// the fallback when this flag is false.
+    pub ephemeral_post_job_exit: bool,
 }
 
 /// One planned worker spin-up.
@@ -630,6 +638,7 @@ impl Default for ScaleInput {
             force_gpu: false,
             idle_expired: false,
             max_spawn_per_tick: DEFAULT_MAX_SPAWN_PER_TICK,
+            ephemeral_post_job_exit: false,
         }
     }
 }
@@ -648,6 +657,13 @@ impl Default for ScaleInput {
 ///   **provably-idle** local pool workers (`running && !busy`). Busy workers
 ///   (local job signal) are never scaled in — demand emptiness alone is not
 ///   enough when the prefer-list is only partially scanned.
+/// * **Post-job exit (CTL-1 primary):** when `ephemeral_post_job_exit`, every idle
+///   worker is reclaimed immediately (with or without demand). Fixes pinning by
+///   construction — a worker that exits after one job cannot stick to a repo.
+/// * **Preempt (CTL-1 fallback):** when post-job exit is off and demand exists,
+///   idle workers claimed for a **different** repo cannot serve it under
+///   repo-scoped ephemeral registration. Reclaim them so the next tick can spawn
+///   onto the demand repo (avoids pool mem stuck on e.g. scribe-core).
 /// * **Storm bound:** at most `max_spawn_per_tick` spawns per call.
 ///
 /// Callers must set `idle_expired` only after a **full prefer-repo sweep** of
@@ -664,33 +680,42 @@ pub fn plan_scale(input: &ScaleInput) -> ScalePlan {
     let used_slots: std::collections::HashSet<u32> = input.workers.iter().map(|w| w.slot).collect();
     let occupied_local = used_slots.len() as u32;
 
-    // --- Idle scale-IN: no demand, idle timer fired → tear down *idle* pool workers ---
+    // All provably-idle running workers (busy never included).
+    let idle_workers: Vec<String> = input
+        .workers
+        .iter()
+        .filter(|w| w.running && !is_busy(w))
+        .map(|w| w.worker_id.clone())
+        .collect();
+
+    // --- Idle scale-IN: no demand ---
     if input.jobs.is_empty() {
-        if input.idle_expired && running_local > 0 {
-            // Never down a busy worker — even when the (partial) demand sample is empty.
-            let scale_in: Vec<String> = input
-                .workers
-                .iter()
-                .filter(|w| w.running && !is_busy(w))
-                .map(|w| w.worker_id.clone())
-                .collect();
-            if scale_in.is_empty() {
-                return ScalePlan {
-                    spawns: Vec::new(),
-                    scale_in: Vec::new(),
-                    desired_count: 0,
-                    notes: format!(
-                        "hold: no demand, {busy_local} busy worker(s) protected (not scale-in)"
-                    ),
-                };
-            }
-            let n = scale_in.len();
+        // Post-job exit: reclaim idle immediately (do not wait for idle_expired).
+        let should_reclaim_idle =
+            input.ephemeral_post_job_exit || (input.idle_expired && running_local > 0);
+        if should_reclaim_idle && !idle_workers.is_empty() {
+            let n = idle_workers.len();
+            let why = if input.ephemeral_post_job_exit {
+                "post-job-exit"
+            } else {
+                "idle"
+            };
             return ScalePlan {
                 spawns: Vec::new(),
-                scale_in,
+                scale_in: idle_workers,
                 desired_count: 0,
                 notes: format!(
-                    "scale-in: idle, tearing down {n} idle worker(s) (held {busy_local} busy)"
+                    "scale-in: {why}, tearing down {n} idle worker(s) (held {busy_local} busy)"
+                ),
+            };
+        }
+        if (input.idle_expired || input.ephemeral_post_job_exit) && running_local > 0 {
+            return ScalePlan {
+                spawns: Vec::new(),
+                scale_in: Vec::new(),
+                desired_count: 0,
+                notes: format!(
+                    "hold: no demand, {busy_local} busy worker(s) protected (not scale-in)"
                 ),
             };
         }
@@ -709,19 +734,99 @@ pub fn plan_scale(input: &ScaleInput) -> ScalePlan {
     }
 
     // --- Scale-OUT from queue pressure ---
+    let demand_repos: std::collections::HashSet<&str> =
+        input.jobs.iter().map(|j| j.repo.as_str()).collect();
+
+    // Idle wrong-repo (fallback when post-job exit is off).
+    let preempt_idle_wrong_repo: Vec<String> = input
+        .workers
+        .iter()
+        .filter(|w| w.running && !is_busy(w))
+        .filter(|w| match w.repo.as_deref() {
+            Some(r) => !demand_repos.contains(r),
+            None => false,
+        })
+        .map(|w| w.worker_id.clone())
+        .collect();
+
+    // Capacity that can serve current demand:
+    // - post-job exit: only **busy** workers cover (idle will exit this tick)
+    // - otherwise: known claim on a demand repo (busy or idle), or unknown claim
+    // Busy workers on a *known wrong* repo do not cover but stay protected.
+    let covering_local = input
+        .workers
+        .iter()
+        .filter(|w| {
+            if input.ephemeral_post_job_exit {
+                // Idle exits; only active jobs cover. Claimed-not-running mid-spawn
+                // still covers so we do not double-spawn into the same claim.
+                if is_busy(w) {
+                    return match w.repo.as_deref() {
+                        Some(r) => demand_repos.contains(r),
+                        None => true,
+                    };
+                }
+                if !w.running {
+                    return match w.repo.as_deref() {
+                        Some(r) => demand_repos.contains(r),
+                        None => true,
+                    };
+                }
+                return false; // idle running → not covering
+            }
+            if !w.running && !is_busy(w) {
+                return match w.repo.as_deref() {
+                    Some(r) => demand_repos.contains(r),
+                    None => true,
+                };
+            }
+            match w.repo.as_deref() {
+                Some(r) => demand_repos.contains(r) && (is_busy(w) || w.running),
+                None => w.running || is_busy(w),
+            }
+        })
+        .count() as u32;
+
     let host_slots_left = input
         .max_host_workers
         .saturating_sub(input.host_claim_count);
     let local_slots_left = input.max_local_workers.saturating_sub(occupied_local);
     let slot_cap = host_slots_left.min(local_slots_left);
-    // Desired total workers from queue pressure (before packing failures).
-    let desired_count = (input.jobs.len() as u32)
-        .min(input.max_local_workers)
-        .min(occupied_local.saturating_add(host_slots_left));
+    let desired_count = (input.jobs.len() as u32).min(input.max_local_workers);
+    let need = desired_count.saturating_sub(covering_local);
 
-    // Only plan the deficit toward desired — do not stack N new spawns when N
-    // workers already cover N (queued or in_progress) jobs.
-    let need = desired_count.saturating_sub(occupied_local);
+    let can_spawn_now = slot_cap > 0
+        && input.free_cpus + 1e-9 >= DEFAULT_MIN_CPUS
+        && input.free_memory_mib >= DEFAULT_MIN_MEMORY_MIB;
+
+    // Reclaim list for this demand tick.
+    let reclaim: Vec<String> = if input.ephemeral_post_job_exit {
+        idle_workers
+    } else if need > 0 {
+        preempt_idle_wrong_repo
+    } else {
+        Vec::new()
+    };
+
+    // When we need capacity but free budget is held by idlers, reclaim this tick
+    // (listen runs scale_in before spawn; try_claim re-checks after release).
+    if need > 0 && !reclaim.is_empty() && !can_spawn_now {
+        let n = reclaim.len();
+        let tag = if input.ephemeral_post_job_exit {
+            "post-job-exit"
+        } else {
+            "preempt"
+        };
+        return ScalePlan {
+            spawns: Vec::new(),
+            scale_in: reclaim,
+            desired_count,
+            notes: format!(
+                "{tag}: reclaim {n} idle worker(s) for demand (covering={covering_local} need={need}); spawn next tick"
+            ),
+        };
+    }
+
     let spawn_budget = input.max_spawn_per_tick.min(slot_cap).min(need);
 
     let mut free_c = input.free_cpus.max(0.0);
@@ -802,19 +907,27 @@ pub fn plan_scale(input: &ScaleInput) -> ScalePlan {
         }
     }
 
+    let scale_in = reclaim;
+    let exit_tag = if input.ephemeral_post_job_exit {
+        " post-job-exit"
+    } else {
+        ""
+    };
     let notes = format!(
-        "scale-out: queue={} desired={} spawn={} skip_cap={} free_left={:.2}c/{}MiB",
+        "scale-out: queue={} desired={} spawn={} skip_cap={} covering={} reclaim={}{exit_tag} free_left={:.2}c/{}MiB",
         input.jobs.len(),
         desired_count,
         spawns.len(),
         skipped_capacity,
+        covering_local,
+        scale_in.len(),
         free_c,
         free_m
     );
 
     ScalePlan {
         spawns,
-        scale_in: Vec::new(),
+        scale_in,
         desired_count,
         notes,
     }
@@ -1123,7 +1236,145 @@ mod tests {
             container: format!("ctl-w{slot}"),
             running,
             busy,
+            repo: None,
         }
+    }
+
+    fn worker_repo(slot: u32, running: bool, busy: bool, repo: &str) -> WorkerSnapshot {
+        WorkerSnapshot {
+            slot,
+            worker_id: format!("runner-w{slot}"),
+            container: format!("ctl-w{slot}"),
+            running,
+            busy,
+            repo: Some(repo.into()),
+        }
+    }
+
+    /// CTL-1 fallback: idle workers on another repo must not block demand for repo B.
+    #[test]
+    fn preempt_idle_wrong_repo_when_demand() {
+        let jobs = vec![DemandSignal {
+            job_name: "test".into(),
+            labels: vec!["self-hosted".into()],
+            repo: "tzervas/aphelion-scribe-daemon".into(),
+        }];
+        let input = ScaleInput {
+            jobs,
+            workers: vec![
+                worker_repo(0, true, false, "tzervas/aphelion-scribe-core"),
+                worker_repo(1, true, false, "tzervas/aphelion-scribe-core"),
+                worker_repo(2, true, true, "tzervas/aphelion-scribe-core"), // busy protected
+            ],
+            // Pool full of medium claims (no free mem) — classic sticky case.
+            free_cpus: 0.0,
+            free_memory_mib: 0,
+            host_claim_count: 3,
+            idle_expired: false,
+            ephemeral_post_job_exit: false,
+            ..ScaleInput::default()
+        };
+        let plan = plan_scale(&input);
+        assert!(
+            plan.spawns.is_empty(),
+            "should not spawn without free budget: {}",
+            plan.notes
+        );
+        assert_eq!(plan.scale_in.len(), 2, "notes={}", plan.notes);
+        assert!(plan.scale_in.contains(&"runner-w0".into()));
+        assert!(plan.scale_in.contains(&"runner-w1".into()));
+        assert!(
+            !plan.scale_in.contains(&"runner-w2".into()),
+            "busy worker must not be preempted"
+        );
+        assert!(plan.notes.contains("preempt"), "notes={}", plan.notes);
+    }
+
+    /// Idle worker already on the demand repo counts as covering — no need to preempt it
+    /// when post-job exit is off (warm cover on matching repo).
+    #[test]
+    fn matching_idle_repo_covers_demand() {
+        let jobs = vec![DemandSignal {
+            job_name: "test".into(),
+            labels: vec!["self-hosted".into()],
+            repo: "tzervas/aphelion-scribe-daemon".into(),
+        }];
+        let input = ScaleInput {
+            jobs,
+            workers: vec![worker_repo(
+                0,
+                true,
+                false,
+                "tzervas/aphelion-scribe-daemon",
+            )],
+            free_cpus: 14.0,
+            free_memory_mib: 12_288,
+            host_claim_count: 1,
+            idle_expired: false,
+            ephemeral_post_job_exit: false,
+            ..ScaleInput::default()
+        };
+        let plan = plan_scale(&input);
+        assert!(
+            plan.spawns.is_empty(),
+            "covering idle on same repo: {}",
+            plan.notes
+        );
+        assert!(
+            plan.scale_in.is_empty(),
+            "must not preempt matching repo: {}",
+            plan.notes
+        );
+    }
+
+    /// CTL-1 primary: post-job exit reclaims *all* idle workers, even matching repo.
+    #[test]
+    fn post_job_exit_reclaims_matching_idle() {
+        let jobs = vec![DemandSignal {
+            job_name: "test".into(),
+            labels: vec!["self-hosted".into()],
+            repo: "tzervas/aphelion-scribe-daemon".into(),
+        }];
+        let input = ScaleInput {
+            jobs,
+            workers: vec![
+                worker_repo(0, true, false, "tzervas/aphelion-scribe-daemon"),
+                worker_repo(1, true, true, "tzervas/aphelion-scribe-daemon"),
+            ],
+            free_cpus: 0.0,
+            free_memory_mib: 0,
+            host_claim_count: 2,
+            idle_expired: false,
+            ephemeral_post_job_exit: true,
+            ..ScaleInput::default()
+        };
+        let plan = plan_scale(&input);
+        assert!(plan.spawns.is_empty(), "notes={}", plan.notes);
+        assert_eq!(plan.scale_in, vec!["runner-w0".to_string()]);
+        assert!(
+            !plan.scale_in.contains(&"runner-w1".into()),
+            "busy protected"
+        );
+        assert!(plan.notes.contains("post-job-exit"), "notes={}", plan.notes);
+    }
+
+    /// CTL-1 primary: no demand → reclaim idle without waiting for idle_expired.
+    #[test]
+    fn post_job_exit_no_demand_immediate() {
+        let input = ScaleInput {
+            jobs: Vec::new(),
+            workers: vec![
+                worker_repo(0, true, false, "tzervas/aphelion-scribe-core"),
+                worker_repo(1, true, true, "tzervas/aphelion-scribe-core"),
+            ],
+            idle_expired: false,
+            ephemeral_post_job_exit: true,
+            ..ScaleInput::default()
+        };
+        let plan = plan_scale(&input);
+        assert!(plan.spawns.is_empty());
+        assert_eq!(plan.scale_in, vec!["runner-w0".to_string()]);
+        assert!(plan.notes.contains("post-job-exit"), "notes={}", plan.notes);
     }
 
     /// Idle scale-in: no jobs + idle_expired → tear down **idle** running pool workers.
