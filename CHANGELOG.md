@@ -1,3 +1,46 @@
+## Unreleased
+
+### Changed — pool tier resource grants sized for the actual homelab host, not a laptop
+
+Controller pool logs showed ~39 of 48 pool cores sitting idle immediately after
+scale-out (`free_left=38.75c/76288MiB`) while CI jobs crawled, on a host with
+56 cores / 125 GB RAM and a load average around 4.58 (roughly 8% utilised).
+The cause: `resources_for_tier()` in `src/pool.rs` granted each job a sliver of
+the machine — `large` (cargo test/release) got 4 of 56 cores; `micro` lint jobs
+got a quarter of one core.
+
+| Tier | Old | New |
+|------|-----|-----|
+| micro | 0.25c / 512m | 1c / 2g |
+| small | 0.5c / 1g | 2c / 4g |
+| medium | 2c / 4g | 4c / 8g |
+| large | 4c / 8g | 12c / 24g |
+| xlarge | 8c / 16g | 20c / 40g |
+| gpu | 4c / 8g | 8c / 16g |
+
+`fit_to_budget` still shrinks a job's grant toward the free remainder (floor
+0.25c/256 MiB) when the pool is tight, so smaller hosts degrade gracefully
+instead of failing outright — these are *preferred* sizes, not hard minimums.
+
+Tests and docs that asserted the old numbers (`src/pool.rs` unit tests,
+`docs/DYNAMIC_POOL.md`, the `gha_pool` Mycelium port's differential oracle in
+`mycelium-port/gha_pool.myc`) were updated to match.
+
+**Deployment required — this change alone does nothing.** The deployed
+`gha-runner-ctl` binary on both the homelab and WSL controllers must be
+rebuilt from this source and redeployed before pool workers see the new
+grants; the currently-running binary is already stale in the other direction
+(`large` grants 4c/4g in production vs. 4c/8g already in pre-change source).
+Restart the controller only when the pool is idle — per issue #95, restarting
+while jobs are in flight kills them.
+
+Pool caps should be widened alongside this change (not applied here — homelab
+env-file edit is a separate follow-up): current live caps are
+`GHA_POOL_CPUS=48` / `GHA_POOL_MEMORY=85g`. Four concurrent `large` jobs alone
+now want 48c/96g, so at the new tier sizes memory caps the pool before CPU
+does. Recommended: `GHA_POOL_CPUS=48→52`, `GHA_POOL_MEMORY=85g→100g`, leaving
+~4 cores / ~25 GB headroom for the host on the 56c/125 GB box.
+
 ## v0.3.0 (2026-07-25)
 
 ### Fixed — release automation: a crates.io failure no longer blocks the release

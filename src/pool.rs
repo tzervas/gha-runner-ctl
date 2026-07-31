@@ -209,17 +209,27 @@ fn name_contains_any(name: &str, needles: &[&str]) -> bool {
 }
 
 /// Map tier → (cpus string, memory string) for podman.
-/// Caps: xlarge/gpu ≤ 16 CPU / 16 GiB (host pool default matches).
+///
+/// Sized for a 56-core/125 GiB-class homelab host, not a laptop: the previous
+/// grants (0.25c..8c) left ~80% of pool CPU idle under load (measured: 4/56
+/// cores in flight against a 4.58 load average, `free_left=38.75c/76288MiB`
+/// immediately after scale-out). `cargo test`/`release --locked` in particular
+/// were bottlenecked at 4c, worse than a modern laptop. These are *preferred*
+/// sizes — `fit_to_budget` still shrinks toward the free remainder (floor
+/// 0.25c/256 MiB) when the pool is tight, so small hosts degrade gracefully.
+/// Caps: xlarge ≤ 20 CPU / 40 GiB; gpu ≤ 8 CPU / 16 GiB host-side (device is separate).
 pub fn resources_for_tier(tier: SizeTier) -> (String, String) {
     match tier {
-        SizeTier::Micro => ("0.25".into(), "512m".into()),
-        SizeTier::Small => ("0.5".into(), "1g".into()),
-        // Medium crates / cargo check — 2c/4g avoids OOM on self-hosted workers
-        SizeTier::Medium => ("2".into(), "4g".into()),
-        SizeTier::Large => ("4".into(), "8g".into()),
-        SizeTier::Xlarge => ("8".into(), "16g".into()),
+        // Lint/secrets scans (gitleaks, ruff, fmt…) — cheap, but no longer starved at 0.25c.
+        SizeTier::Micro => ("1".into(), "2g".into()),
+        SizeTier::Small => ("2".into(), "4g".into()),
+        // Medium crates / cargo check — 4c/8g keeps headroom on self-hosted workers
+        SizeTier::Medium => ("4".into(), "8g".into()),
+        // cargo test + release --locked: the previous 4c/8g was the actual bottleneck.
+        SizeTier::Large => ("12".into(), "24g".into()),
+        SizeTier::Xlarge => ("20".into(), "40g".into()),
         // GPU jobs: solid host CPU/RAM for data loaders + full device on GPU slice
-        SizeTier::Gpu => ("4".into(), "8g".into()),
+        SizeTier::Gpu => ("8".into(), "16g".into()),
     }
 }
 
@@ -1051,15 +1061,15 @@ mod tests {
     #[test]
     fn resources_medium_has_headroom() {
         let (c, m) = resources_for_tier(SizeTier::Medium);
-        assert_eq!(c, "2");
-        assert_eq!(m, "4g");
+        assert_eq!(c, "4");
+        assert_eq!(m, "8g");
     }
 
     #[test]
     fn resources_xlarge_cap() {
         let (c, m) = resources_for_tier(SizeTier::Xlarge);
-        assert_eq!(c, "8");
-        assert_eq!(m, "16g");
+        assert_eq!(c, "20");
+        assert_eq!(m, "40g");
     }
 
     #[test]
@@ -1125,42 +1135,49 @@ mod tests {
     /// Vertical: job size/labels map to tier + preferred resources in the plan.
     #[test]
     fn scale_job_size_vertical() {
-        // micro (0.25c/512) + large (4c/8g) + medium (2c/4g) fit under 16c/16g.
+        // micro (1c/2g) + large (12c/24g) + medium (4c/8g) = 17c/34g; fits under
+        // a 20c/36g free budget (base_input's default 16c/16g is too tight now
+        // that Large/Xlarge are sized for a many-core homelab host).
         let jobs = vec![
             job("gitleaks", &["self-hosted"]),
             job("cargo test", &["self-hosted"]),
             job("pytest", &["self-hosted"]),
         ];
-        let plan = plan_scale(&base_input(jobs));
+        let mut input = base_input(jobs);
+        input.free_cpus = 20.0;
+        input.free_memory_mib = 36 * 1024;
+        let plan = plan_scale(&input);
         assert_eq!(plan.spawns.len(), 3, "notes={}", plan.notes);
         assert_eq!(plan.spawns[0].tier, SizeTier::Micro);
         assert_eq!(plan.spawns[1].tier, SizeTier::Large);
         assert_eq!(plan.spawns[2].tier, SizeTier::Medium);
-        assert!((plan.spawns[0].cpus - 0.25).abs() < 1e-9);
-        assert_eq!(plan.spawns[0].memory_mib, 512);
-        assert!((plan.spawns[1].cpus - 4.0).abs() < 1e-9);
-        assert_eq!(plan.spawns[1].memory_mib, 8 * 1024);
-        assert!((plan.spawns[2].cpus - 2.0).abs() < 1e-9);
-        assert_eq!(plan.spawns[2].memory_mib, 4 * 1024);
+        assert!((plan.spawns[0].cpus - 1.0).abs() < 1e-9);
+        assert_eq!(plan.spawns[0].memory_mib, 2 * 1024);
+        assert!((plan.spawns[1].cpus - 12.0).abs() < 1e-9);
+        assert_eq!(plan.spawns[1].memory_mib, 24 * 1024);
+        assert!((plan.spawns[2].cpus - 4.0).abs() < 1e-9);
+        assert_eq!(plan.spawns[2].memory_mib, 8 * 1024);
     }
 
     /// Explicit xlarge label gets full preferred size when budget allows.
     #[test]
     fn scale_xlarge_preferred_when_budget_allows() {
         let mut input = base_input(vec![job("unit", &["self-hosted", "xlarge"])]);
-        input.free_cpus = 16.0;
-        input.free_memory_mib = 16 * 1024;
+        // Xlarge now prefers 20c/40g; give it headroom above that so the plan
+        // grants the full preferred size rather than shrinking to free.
+        input.free_cpus = 24.0;
+        input.free_memory_mib = 44 * 1024;
         let plan = plan_scale(&input);
         assert_eq!(plan.spawns.len(), 1);
         assert_eq!(plan.spawns[0].tier, SizeTier::Xlarge);
-        assert!((plan.spawns[0].cpus - 8.0).abs() < 1e-9);
-        assert_eq!(plan.spawns[0].memory_mib, 16 * 1024);
+        assert!((plan.spawns[0].cpus - 20.0).abs() < 1e-9);
+        assert_eq!(plan.spawns[0].memory_mib, 40 * 1024);
     }
 
     /// Capacity ceiling: never plan more workers than free CPU/memory allow.
     #[test]
     fn scale_capacity_bound_clamp() {
-        // 2c free / 4g free → at most one Medium (2c/4g); second Medium skipped.
+        // 2c free / 4g free → Medium (4c/8g preferred) shrinks to fit; second Medium skipped.
         let mut input = base_input(vec![
             job("pytest", &["self-hosted"]),
             job("unit test", &["self-hosted"]),
@@ -1546,11 +1563,11 @@ mod tests {
     #[test]
     fn scale_skips_large_allows_micro() {
         let mut input = base_input(vec![
-            job("unit", &["self-hosted", "xlarge"]), // 8c/16g — won't fit
-            job("gitleaks", &["self-hosted"]),       // micro — fits
+            job("unit", &["self-hosted", "xlarge"]), // 20c/40g — won't fit
+            job("gitleaks", &["self-hosted"]),       // micro (1c/2g) — fits
         ]);
-        input.free_cpus = 1.0;
-        input.free_memory_mib = 1024;
+        input.free_cpus = 2.0;
+        input.free_memory_mib = 3 * 1024;
         let plan = plan_scale(&input);
         assert_eq!(plan.spawns.len(), 1, "notes={}", plan.notes);
         assert_eq!(plan.spawns[0].tier, SizeTier::Micro);
