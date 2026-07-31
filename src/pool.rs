@@ -520,6 +520,9 @@ pub struct WorkerSnapshot {
     /// Scale-in must never target a busy worker even when the partial RR demand
     /// sample looks empty (busy job may live on an un-scanned prefer-repo).
     pub busy: bool,
+    /// Repo this worker is registered/claimed for (`owner/name`), when known.
+    /// Ephemeral user-batch workers only serve that one repo until retargeted.
+    pub repo: Option<String>,
 }
 
 /// True when the worker is known to be executing a job (not merely online/idle).
@@ -648,6 +651,11 @@ impl Default for ScaleInput {
 ///   **provably-idle** local pool workers (`running && !busy`). Busy workers
 ///   (local job signal) are never scaled in — demand emptiness alone is not
 ///   enough when the prefer-list is only partially scanned.
+/// * **Preempt (CTL-1):** when demand exists, idle workers claimed for a **different**
+///   repo (or unknown claim repo) cannot serve it under repo-scoped ephemeral
+///   registration. They do **not** count as covering capacity; reclaim them so
+///   the next tick can spawn onto the demand repo (avoids pool mem stuck on
+///   e.g. scribe-core while daemon/cli queue forever).
 /// * **Storm bound:** at most `max_spawn_per_tick` spawns per call.
 ///
 /// Callers must set `idle_expired` only after a **full prefer-repo sweep** of
@@ -709,19 +717,77 @@ pub fn plan_scale(input: &ScaleInput) -> ScalePlan {
     }
 
     // --- Scale-OUT from queue pressure ---
+    let demand_repos: std::collections::HashSet<&str> =
+        input.jobs.iter().map(|j| j.repo.as_str()).collect();
+
+    // Idle workers with a **known** claim repo outside this demand sample cannot
+    // pick up those jobs (GitHub repo-scoped ephemeral registration). They still
+    // hold pool CPU/mem/slots until reclaimed. Unknown repo (`None`) keeps legacy
+    // covering behavior (tests / retain paths without claim metadata).
+    let preempt_idle_wrong_repo: Vec<String> = input
+        .workers
+        .iter()
+        .filter(|w| w.running && !is_busy(w))
+        .filter(|w| match w.repo.as_deref() {
+            Some(r) => !demand_repos.contains(r),
+            None => false,
+        })
+        .map(|w| w.worker_id.clone())
+        .collect();
+
+    // Capacity that can serve current demand:
+    // - known claim on a demand repo (busy or idle), or
+    // - unknown claim repo (legacy / missing metadata): count as covering so we
+    //   do not overspawn when claim.repo was not populated.
+    // Busy workers on a *known wrong* repo do not cover (cannot pick up these jobs)
+    // but remain protected from preempt (busy filter above).
+    let covering_local = input
+        .workers
+        .iter()
+        .filter(|w| {
+            if !w.running && !is_busy(w) {
+                // Claimed-but-not-running still occupies a planner slot via
+                // used_slots; only count as covering if we know it will serve.
+                return match w.repo.as_deref() {
+                    Some(r) => demand_repos.contains(r),
+                    None => true, // legacy: claim occupies without repo metadata
+                };
+            }
+            match w.repo.as_deref() {
+                Some(r) => demand_repos.contains(r) && (is_busy(w) || w.running),
+                None => w.running || is_busy(w),
+            }
+        })
+        .count() as u32;
+
     let host_slots_left = input
         .max_host_workers
         .saturating_sub(input.host_claim_count);
     let local_slots_left = input.max_local_workers.saturating_sub(occupied_local);
     let slot_cap = host_slots_left.min(local_slots_left);
-    // Desired total workers from queue pressure (before packing failures).
-    let desired_count = (input.jobs.len() as u32)
-        .min(input.max_local_workers)
-        .min(occupied_local.saturating_add(host_slots_left));
+    // Desired = queue pressure capped by local max. Wrong-repo idlers must not
+    // reduce need (they cannot serve these jobs under repo-scoped registration).
+    let desired_count = (input.jobs.len() as u32).min(input.max_local_workers);
+    let need = desired_count.saturating_sub(covering_local);
 
-    // Only plan the deficit toward desired — do not stack N new spawns when N
-    // workers already cover N (queued or in_progress) jobs.
-    let need = desired_count.saturating_sub(occupied_local);
+    // CTL-1: when we need capacity for demand but free pool budget/slots are
+    // held by idle wrong-repo listeners, reclaim them this tick (spawn next).
+    // Listen runs scale_in before spawn; try_claim re-checks after release.
+    let can_spawn_now = slot_cap > 0
+        && input.free_cpus + 1e-9 >= DEFAULT_MIN_CPUS
+        && input.free_memory_mib >= DEFAULT_MIN_MEMORY_MIB;
+    if need > 0 && !preempt_idle_wrong_repo.is_empty() && !can_spawn_now {
+        let n = preempt_idle_wrong_repo.len();
+        return ScalePlan {
+            spawns: Vec::new(),
+            scale_in: preempt_idle_wrong_repo,
+            desired_count,
+            notes: format!(
+                "preempt: reclaim {n} idle wrong-repo worker(s) for demand (covering={covering_local} need={need}); spawn next tick"
+            ),
+        };
+    }
+
     let spawn_budget = input.max_spawn_per_tick.min(slot_cap).min(need);
 
     let mut free_c = input.free_cpus.max(0.0);
@@ -802,19 +868,28 @@ pub fn plan_scale(input: &ScaleInput) -> ScalePlan {
         }
     }
 
+    // Also reclaim idle wrong-repo listeners when demand needs retarget even if
+    // we could spawn into leftover free budget (keeps pool from drifting sticky).
+    let scale_in = if need > 0 {
+        preempt_idle_wrong_repo
+    } else {
+        Vec::new()
+    };
     let notes = format!(
-        "scale-out: queue={} desired={} spawn={} skip_cap={} free_left={:.2}c/{}MiB",
+        "scale-out: queue={} desired={} spawn={} skip_cap={} covering={} preempt={} free_left={:.2}c/{}MiB",
         input.jobs.len(),
         desired_count,
         spawns.len(),
         skipped_capacity,
+        covering_local,
+        scale_in.len(),
         free_c,
         free_m
     );
 
     ScalePlan {
         spawns,
-        scale_in: Vec::new(),
+        scale_in,
         desired_count,
         notes,
     }
@@ -1123,7 +1198,92 @@ mod tests {
             container: format!("ctl-w{slot}"),
             running,
             busy,
+            repo: None,
         }
+    }
+
+    fn worker_repo(slot: u32, running: bool, busy: bool, repo: &str) -> WorkerSnapshot {
+        WorkerSnapshot {
+            slot,
+            worker_id: format!("runner-w{slot}"),
+            container: format!("ctl-w{slot}"),
+            running,
+            busy,
+            repo: Some(repo.into()),
+        }
+    }
+
+    /// CTL-1: idle workers on another repo must not block demand for repo B.
+    #[test]
+    fn preempt_idle_wrong_repo_when_demand() {
+        let jobs = vec![DemandSignal {
+            job_name: "test".into(),
+            labels: vec!["self-hosted".into()],
+            repo: "tzervas/aphelion-scribe-daemon".into(),
+        }];
+        let input = ScaleInput {
+            jobs,
+            workers: vec![
+                worker_repo(0, true, false, "tzervas/aphelion-scribe-core"),
+                worker_repo(1, true, false, "tzervas/aphelion-scribe-core"),
+                worker_repo(2, true, true, "tzervas/aphelion-scribe-core"), // busy protected
+            ],
+            // Pool full of medium claims (no free mem) — classic sticky case.
+            free_cpus: 0.0,
+            free_memory_mib: 0,
+            host_claim_count: 3,
+            idle_expired: false,
+            ..ScaleInput::default()
+        };
+        let plan = plan_scale(&input);
+        assert!(
+            plan.spawns.is_empty(),
+            "should not spawn without free budget: {}",
+            plan.notes
+        );
+        assert_eq!(plan.scale_in.len(), 2, "notes={}", plan.notes);
+        assert!(plan.scale_in.contains(&"runner-w0".into()));
+        assert!(plan.scale_in.contains(&"runner-w1".into()));
+        assert!(
+            !plan.scale_in.contains(&"runner-w2".into()),
+            "busy worker must not be preempted"
+        );
+        assert!(plan.notes.contains("preempt"), "notes={}", plan.notes);
+    }
+
+    /// Idle worker already on the demand repo counts as covering — no need to preempt it.
+    #[test]
+    fn matching_idle_repo_covers_demand() {
+        let jobs = vec![DemandSignal {
+            job_name: "test".into(),
+            labels: vec!["self-hosted".into()],
+            repo: "tzervas/aphelion-scribe-daemon".into(),
+        }];
+        let input = ScaleInput {
+            jobs,
+            workers: vec![worker_repo(
+                0,
+                true,
+                false,
+                "tzervas/aphelion-scribe-daemon",
+            )],
+            free_cpus: 14.0,
+            free_memory_mib: 12_288,
+            host_claim_count: 1,
+            idle_expired: false,
+            ..ScaleInput::default()
+        };
+        let plan = plan_scale(&input);
+        assert!(
+            plan.spawns.is_empty(),
+            "covering idle on same repo: {}",
+            plan.notes
+        );
+        assert!(
+            plan.scale_in.is_empty(),
+            "must not preempt matching repo: {}",
+            plan.notes
+        );
     }
 
     /// Idle scale-in: no jobs + idle_expired → tear down **idle** running pool workers.

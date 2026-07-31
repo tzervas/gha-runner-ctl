@@ -4276,12 +4276,17 @@ fn local_worker_snapshots(cli: &Cli, pool: &ResourcePool, max_local: u32) -> Vec
         if running || claimed {
             // Local job signal only; independent of list_demand_jobs RR sample.
             let busy = running && container_worker_busy(&container);
+            let repo = claims
+                .iter()
+                .find(|c| c.container == container || c.worker_id == worker_id)
+                .and_then(|c| c.repo.clone());
             out.push(WorkerSnapshot {
                 slot,
                 worker_id,
                 container,
                 running,
                 busy,
+                repo,
             });
         }
     }
