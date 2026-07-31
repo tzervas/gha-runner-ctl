@@ -17,10 +17,10 @@
 # PR into main is gated at main strength BEFORE it merges.
 #
 #   dev   check+test, GitHub-hosted
-#   main  full (adds cargo doc -D warnings), self-hosted fleet host-homelab (jobs=1)
+#   main  full (adds cargo doc -D warnings), self-hosted fleet `large` tier
 #
-# Self-hosted path uses host-homelab (not hard `large`): large slots often fail to
-# register under scan-starvation/seed bugs; CARGO_BUILD_JOBS=1 keeps peak RSS down.
+# `large` is kept on the main tier deliberately: it is a fleet size label (4c/8g)
+# and dropping it is how rustup+cargo get OOM-killed with exit 137 here.
 #
 # NOTHING IS WEAKENED BY THIS CHANGE. The previous gate was
 #   cargo fmt --check; cargo clippy --all-targets -- -D warnings;
@@ -87,7 +87,7 @@ jobs:
       runner-labels: >-
         ${{ (inputs.runner == 'self-hosted-fleet'
              || (inputs.runner == '' && (github.base_ref || github.ref_name) == 'main'))
-            && '["self-hosted","linux","x64","podman","compute-cpu","host-homelab"]'
+            && '["self-hosted","linux","x64","podman","large"]'
             || '["ubuntu-latest"]' }}
 
   release-build:
@@ -103,7 +103,7 @@ jobs:
     runs-on: >-
       ${{ (inputs.runner == 'self-hosted-fleet'
            || (inputs.runner == '' && (github.base_ref || github.ref_name) == 'main'))
-          && fromJSON('["self-hosted","linux","x64","podman","compute-cpu","host-homelab"]')
+          && fromJSON('["self-hosted","linux","x64","podman","large"]')
           || fromJSON('["ubuntu-latest"]') }}
     env:
       CARGO_INCREMENTAL: '0'
