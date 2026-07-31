@@ -3866,7 +3866,7 @@ fn ensure_worker_volume(cli: &Cli, worker_volume: &str) -> Result<(), String> {
         "--security-opt",
         "no-new-privileges",
         "--entrypoint",
-        "/bin/sh",
+        "/bin/bash",
         "-v",
         &format!("{base_volume}:/from:ro,Z"),
         "-v",
