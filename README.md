@@ -255,11 +255,28 @@ See [docs/troubleshoot/FLEET_QUEUE_STALL_2026-07-22.md](docs/troubleshoot/FLEET_
 | Mode | Behavior |
 |---|---|
 | `ephemeral` (default) | Fresh registration each `up`; runner drops after one job |
-| `retain` | Keep `.runner` on the snapshot volume across restarts |
+| `retain` | Keep `.runner` on the snapshot volume across restarts; a pool listener serves **multiple** jobs from one registration instead of exiting after one |
 
 ```bash
 gha-runner-ctl --mode retain up
 ```
+
+`GHA_MODE` defaults to `ephemeral` — retain is opt-in per instance.
+
+The registration token is single-use (consumed once by `config.sh`, ~1h expiry
+if unused); once registered, the runner holds its own durable credentials and
+does **not** need a new token to keep serving jobs. So `retain` is not limited
+to a 1-hour lifetime by credentials. It *is* bounded for workspace hygiene —
+two env vars cap how long / how many times one registration is reused before
+the next `up` forces a fresh registration-token POST:
+
+| Env | Default | Meaning |
+|---|---|---|
+| `GHA_RETAIN_MAX_AGE_SECS` | `3000` (50 min) | Wall-clock age of the registration since it was last freshly minted |
+| `GHA_RETAIN_MAX_JOBS` | `25` | Times the registration has been reused since it was last freshly minted |
+
+A retain marker written by an older build (bare URL, no recorded age) is
+treated as unknown age and **not** reused — the safe direction.
 
 ## Consumer workflows
 

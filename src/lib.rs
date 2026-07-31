@@ -73,6 +73,17 @@ const DEFAULT_REPOS_PER_TICK: u32 = 1;
 const DEFAULT_REG_MIN_GAP_SECS: u64 = 5;
 /// Max registration-token POSTs per rolling hour (shared host budget).
 const DEFAULT_REG_MAX_PER_HOUR: u32 = 90;
+/// Bounded retain lifetime (seconds). NOT a credential-expiry workaround — the
+/// registration token is single-use and consumed by `config.sh`; after that the
+/// runner holds durable, non-expiring credentials (see `effective_ephemeral` doc
+/// comment). This bound exists for workspace hygiene / drift control: a retained
+/// runner's `_work` dir and job history accumulate over a long-lived container,
+/// so we force a fresh registration (fresh volume state) periodically rather than
+/// let one runner serve indefinitely. Overridable via GHA_RETAIN_MAX_AGE_SECS.
+const DEFAULT_RETAIN_MAX_AGE_SECS: u64 = 3000;
+/// Bounded retain lifetime (job count). Same rationale as the age bound above —
+/// caps drift, not credentials. Overridable via GHA_RETAIN_MAX_JOBS.
+const DEFAULT_RETAIN_MAX_JOBS: u32 = 25;
 
 #[derive(Debug, Clone, ValueEnum)]
 pub enum Mode {
@@ -2150,6 +2161,17 @@ fn registration_token(cli: &Cli, api_token: &str) -> Result<String, String> {
 
 /// Ephemeral only when we must re-bind to a different repo (user multi-target).
 /// Retain keeps the runner online so GitHub pushes jobs without new tokens.
+///
+/// Token/credential model: the registration token minted by [`registration_token`]
+/// is single-use, consumed once by `config.sh` during registration, and expires in
+/// ~1 hour if unused. Once `config.sh` succeeds, the runner has written its own
+/// durable credentials (`.runner` / `.credentials*` on the volume) and does not
+/// need another token to keep listening or to pick up further jobs — GitHub's
+/// Actions service pushes jobs to the already-registered runner. So a retained
+/// runner is NOT limited to the 1-hour token lifetime; it can serve jobs
+/// indefinitely on that registration. Bounded retirement (`GHA_RETAIN_MAX_AGE_SECS`,
+/// `GHA_RETAIN_MAX_JOBS`, see [`volume_has_runner_config`]) exists for workspace
+/// hygiene and drift control, not because the credential is about to expire.
 fn effective_ephemeral(cli: &Cli) -> bool {
     if matches!(cli.mode, Mode::Retain) {
         return false;
@@ -2699,40 +2721,118 @@ fn private_env_path() -> PathBuf {
     ))
 }
 
-fn volume_has_runner_config(cli: &Cli) -> bool {
-    // Heuristic: volume was used before; entrypoint will detect .runner.
-    // We cannot inspect volume contents without a container; prefer retain path
-    // and let entrypoint skip config when .runner exists.
-    // Marker file on host tracks last successful retain target.
+fn retain_marker_path(cli: &Cli) -> PathBuf {
     let user_suffix = current_username();
-    let marker = reg_pace_paths()
+    reg_pace_paths()
         .0
         .parent()
         .unwrap_or(Path::new("/tmp"))
         .join(format!(
             "gha-runner-ctl-retain-{}-{}.ok",
             cli.container, user_suffix
-        ));
-    if !marker.is_file() {
-        return false;
-    }
-    let Ok(s) = fs::read_to_string(&marker) else {
-        return false;
-    };
-    s.trim() == github_url(cli)
+        ))
 }
 
-fn mark_retain_ok(cli: &Cli) {
-    let user_suffix = current_username();
-    let marker = reg_pace_paths()
-        .0
-        .parent()
-        .unwrap_or(Path::new("/tmp"))
-        .join(format!(
-            "gha-runner-ctl-retain-{}-{}.ok",
-            cli.container, user_suffix
-        ));
-    let _ = fs::write(&marker, github_url(cli));
+fn retain_max_age_secs() -> u64 {
+    std::env::var("GHA_RETAIN_MAX_AGE_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_RETAIN_MAX_AGE_SECS)
+}
+
+fn retain_max_jobs() -> u32 {
+    std::env::var("GHA_RETAIN_MAX_JOBS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_RETAIN_MAX_JOBS)
+}
+
+/// On-disk retain marker: last successful retain target plus the bookkeeping
+/// needed to bound reuse (age + reuse count — see [`DEFAULT_RETAIN_MAX_AGE_SECS`]).
+/// `created_unix` is set once, at fresh registration, and never touched again;
+/// `reuse_count` increments each time [`up`] reuses this registration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RetainMarker {
+    url: String,
+    created_unix: u64,
+    reuse_count: u32,
+}
+
+fn read_retain_marker(cli: &Cli) -> Option<RetainMarker> {
+    let marker = retain_marker_path(cli);
+    let s = fs::read_to_string(&marker).ok()?;
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Old format (pre-bounded-retain): the marker held nothing but the bare repo
+    // URL. `serde_json::from_str` on a bare `https://…` string fails to parse as
+    // `RetainMarker`, so this branch naturally returns `None` for it — the caller
+    // treats a parse failure as "unknown age, do not reuse" (safe direction).
+    serde_json::from_str::<RetainMarker>(trimmed).ok()
+}
+
+/// Volume already holds a durable runner registration we can reuse without a
+/// fresh registration-token POST — *iff* it is for the same repo/org target and
+/// within the bounded retain lifetime (age and reuse-count caps).
+///
+/// This is NOT a credential-expiry check: the registration token is long since
+/// consumed (single-use, at `config.sh`) and the runner's own credentials on the
+/// volume do not expire on this schedule. The bound is workspace hygiene — evict
+/// a long-lived `_work` dir / job history periodically — so an old URL-only
+/// marker (no recorded age) is treated as unknown age and refused, the safe
+/// direction, rather than assumed fresh.
+fn volume_has_runner_config(cli: &Cli) -> bool {
+    let Some(marker) = read_retain_marker(cli) else {
+        return false;
+    };
+    if marker.url != github_url(cli) {
+        return false;
+    }
+    let age = now_unix().saturating_sub(marker.created_unix);
+    if age > retain_max_age_secs() {
+        return false;
+    }
+    if marker.reuse_count >= retain_max_jobs() {
+        return false;
+    }
+    true
+}
+
+/// Record a successful retain target after [`up`]. `reused` must match the
+/// `can_reuse` decision that drove this `up()` call: `true` preserves the
+/// original `created_unix` and bumps `reuse_count` (this container is riding an
+/// existing registration); `false` resets both (a fresh registration-token POST
+/// just happened, so the retain clock restarts).
+fn mark_retain_ok(cli: &Cli, reused: bool) {
+    let marker_path = retain_marker_path(cli);
+    let now = now_unix();
+    let url = github_url(cli);
+    let record = if reused {
+        match read_retain_marker(cli).filter(|m| m.url == url) {
+            Some(prior) => RetainMarker {
+                url,
+                created_unix: prior.created_unix,
+                reuse_count: prior.reuse_count.saturating_add(1),
+            },
+            // Prior marker vanished or targeted a different repo — cannot have
+            // been the source of the reuse decision; treat as fresh, safe side.
+            None => RetainMarker {
+                url,
+                created_unix: now,
+                reuse_count: 0,
+            },
+        }
+    } else {
+        RetainMarker {
+            url,
+            created_unix: now,
+            reuse_count: 0,
+        }
+    };
+    if let Ok(s) = serde_json::to_string(&record) {
+        let _ = fs::write(&marker_path, s);
+    }
 }
 
 fn write_env_file(path: &Path, reg_token: &str, cli: &Cli) -> Result<(), String> {
@@ -2988,7 +3088,7 @@ fn up(cli: &Cli) -> Result<(), String> {
         set_active_target(cli, repo);
     }
     if !ephemeral {
-        mark_retain_ok(cli);
+        mark_retain_ok(cli, can_reuse);
     }
     eprintln!(
         "up: container {} gpu={} slice={:?}",
@@ -4486,9 +4586,18 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
                 })
                 .collect();
 
-            // CTL-1 primary: dynamic pool is always ephemeral re-register → idle
-            // workers must exit (not warm-pin a repo). Flag off keeps preempt-only
-            // behavior for unit tests / experimental retain hybrids.
+            // CTL-1 primary (default GHA_MODE=ephemeral): dynamic pool re-registers
+            // per job → idle workers must exit (not warm-pin a repo).
+            //
+            // GHA_MODE=retain (opt-in): idle workers hold a durable registration
+            // and should NOT be torn down after one job — that was the bug fixed
+            // here (this flag used to be hardcoded `true` regardless of mode,
+            // which silently defeated retain: idle retained workers never got a
+            // chance to take a second job because plan_scale reclaimed them every
+            // tick, see [`pool::plan_scale`] "Post-job exit (CTL-1 primary)").
+            // Deriving from `effective_ephemeral` makes retain's own idle-preempt
+            // fallback (wrong-repo reclaim, still active) the only reclaim path.
+            let ephemeral_post_job_exit = effective_ephemeral(&cli);
             let plan = plan_scale(&ScaleInput {
                 jobs: signals,
                 workers: workers.clone(),
@@ -4502,7 +4611,7 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
                 force_gpu: cli.gpu,
                 idle_expired,
                 max_spawn_per_tick: max_spawn,
-                ephemeral_post_job_exit: true,
+                ephemeral_post_job_exit,
             });
 
             eprintln!(
@@ -5144,5 +5253,125 @@ mod robust_queue_tests {
     fn normalize_podman_started_at_iso() {
         let raw = "2026-07-21T19:52:33.909118621Z";
         assert_eq!(normalize_podman_started_at(raw), "2026-07-21 19:52:33 UTC");
+    }
+}
+
+/// Bounded-retain marker tests (`GHA_RETAIN_MAX_AGE_SECS` / `GHA_RETAIN_MAX_JOBS`).
+/// Each test uses a distinct `--container` name so the on-disk marker path
+/// (derived from container + username, see [`retain_marker_path`]) cannot
+/// collide with another test running in the same process.
+#[cfg(test)]
+mod retain_marker_tests {
+    use super::*;
+
+    fn retain_test_cli(container: &str) -> Cli {
+        Cli::try_parse_from([
+            "gha-runner-ctl",
+            "--repo",
+            "tzervas/retain-marker-test",
+            "--container",
+            container,
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn retain_marker_fresh_within_bounds_is_reusable() {
+        let cli = retain_test_cli("retain-fresh-test");
+        let marker_path = retain_marker_path(&cli);
+        let _ = fs::remove_file(&marker_path);
+        mark_retain_ok(&cli, false);
+        assert!(
+            volume_has_runner_config(&cli),
+            "freshly marked retain target should be reusable"
+        );
+        let _ = fs::remove_file(&marker_path);
+    }
+
+    #[test]
+    fn retain_marker_expires_on_age() {
+        let cli = retain_test_cli("retain-age-test");
+        let marker_path = retain_marker_path(&cli);
+        let stale = RetainMarker {
+            url: github_url(&cli),
+            created_unix: now_unix().saturating_sub(DEFAULT_RETAIN_MAX_AGE_SECS + 60),
+            reuse_count: 0,
+        };
+        fs::write(&marker_path, serde_json::to_string(&stale).unwrap()).unwrap();
+        assert!(
+            !volume_has_runner_config(&cli),
+            "marker older than GHA_RETAIN_MAX_AGE_SECS must not be reusable"
+        );
+        let _ = fs::remove_file(&marker_path);
+    }
+
+    #[test]
+    fn retain_marker_expires_on_job_count() {
+        let cli = retain_test_cli("retain-jobs-test");
+        let marker_path = retain_marker_path(&cli);
+        let maxed = RetainMarker {
+            url: github_url(&cli),
+            created_unix: now_unix(),
+            reuse_count: DEFAULT_RETAIN_MAX_JOBS,
+        };
+        fs::write(&marker_path, serde_json::to_string(&maxed).unwrap()).unwrap();
+        assert!(
+            !volume_has_runner_config(&cli),
+            "marker at/above GHA_RETAIN_MAX_JOBS must not be reusable"
+        );
+        let _ = fs::remove_file(&marker_path);
+    }
+
+    /// Pre-bounded-retain markers were a bare repo URL with no recorded age.
+    /// Unknown age must resolve to "not reusable" — the safe direction — rather
+    /// than being assumed fresh.
+    #[test]
+    fn retain_marker_old_url_only_format_is_not_reusable() {
+        let cli = retain_test_cli("retain-legacy-test");
+        let marker_path = retain_marker_path(&cli);
+        fs::write(&marker_path, github_url(&cli)).unwrap();
+        assert!(
+            !volume_has_runner_config(&cli),
+            "URL-only legacy marker (unknown age) must not be reusable"
+        );
+        let _ = fs::remove_file(&marker_path);
+    }
+
+    #[test]
+    fn retain_marker_wrong_repo_is_not_reusable() {
+        let cli = retain_test_cli("retain-wrong-repo-test");
+        let marker_path = retain_marker_path(&cli);
+        let other = RetainMarker {
+            url: "https://github.com/tzervas/some-other-repo".into(),
+            created_unix: now_unix(),
+            reuse_count: 0,
+        };
+        fs::write(&marker_path, serde_json::to_string(&other).unwrap()).unwrap();
+        assert!(
+            !volume_has_runner_config(&cli),
+            "marker for a different repo must not be reusable"
+        );
+        let _ = fs::remove_file(&marker_path);
+    }
+
+    #[test]
+    fn mark_retain_ok_reuse_preserves_created_and_bumps_count() {
+        let cli = retain_test_cli("retain-reuse-test");
+        let marker_path = retain_marker_path(&cli);
+        let _ = fs::remove_file(&marker_path);
+
+        mark_retain_ok(&cli, false);
+        let first = read_retain_marker(&cli).expect("marker written on fresh registration");
+        assert_eq!(first.reuse_count, 0);
+
+        mark_retain_ok(&cli, true);
+        let second = read_retain_marker(&cli).expect("marker written on reuse");
+        assert_eq!(
+            second.created_unix, first.created_unix,
+            "reuse must preserve the original creation time"
+        );
+        assert_eq!(second.reuse_count, 1, "reuse must bump the reuse counter");
+
+        let _ = fs::remove_file(&marker_path);
     }
 }

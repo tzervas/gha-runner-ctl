@@ -1327,6 +1327,67 @@ mod tests {
         );
     }
 
+    /// GHA_MODE=retain regression (the bug this change fixes): a caller that
+    /// correctly derives `ephemeral_post_job_exit` from `effective_ephemeral(cli)`
+    /// (false in retain mode) must let an idle-but-registered worker sit and wait
+    /// for its *next* job instead of being torn down between jobs. Before the fix,
+    /// the dynamic-pool call site hardcoded `ephemeral_post_job_exit: true`
+    /// regardless of `cli.mode`, so this scenario was unreachable in retain mode —
+    /// idle workers were reclaimed every tick (see `post_job_exit_reclaims_matching_idle`
+    /// for the contrasting ephemeral behavior) and never got a chance to pick up a
+    /// second job. Two ticks are simulated here: covering with no new spawn, then
+    /// no demand with no reclaim — a retained worker must survive both.
+    #[test]
+    fn retain_mode_idle_worker_survives_between_jobs() {
+        let repo = "tzervas/aphelion-scribe-daemon";
+        let worker = worker_repo(0, true, false, repo);
+
+        // Tick 1: a second job lands for the same repo while the retained worker
+        // is idle between jobs — it must count as covering, not trigger a spawn.
+        let demand = ScaleInput {
+            jobs: vec![DemandSignal {
+                job_name: "job-2".into(),
+                labels: vec!["self-hosted".into()],
+                repo: repo.into(),
+            }],
+            workers: vec![worker.clone()],
+            free_cpus: 14.0,
+            free_memory_mib: 12_288,
+            host_claim_count: 1,
+            idle_expired: false,
+            ephemeral_post_job_exit: false,
+            ..ScaleInput::default()
+        };
+        let plan = plan_scale(&demand);
+        assert!(
+            plan.spawns.is_empty(),
+            "retained idle worker should cover new demand, not trigger a respawn: {}",
+            plan.notes
+        );
+        assert!(
+            plan.scale_in.is_empty(),
+            "retained idle worker must not be reclaimed while covering demand: {}",
+            plan.notes
+        );
+
+        // Tick 2: no demand at all — retain's own idle-expiry path (idle_expired)
+        // still governs teardown; a not-yet-idle-expired retained worker must not
+        // be swept by the (correctly disabled) post-job-exit path.
+        let quiet = ScaleInput {
+            jobs: Vec::new(),
+            workers: vec![worker],
+            idle_expired: false,
+            ephemeral_post_job_exit: false,
+            ..ScaleInput::default()
+        };
+        let plan = plan_scale(&quiet);
+        assert!(
+            plan.scale_in.is_empty(),
+            "retained worker must not be reclaimed on a quiet tick before idle_expired: {}",
+            plan.notes
+        );
+    }
+
     /// CTL-1 primary: post-job exit reclaims *all* idle workers, even matching repo.
     #[test]
     fn post_job_exit_reclaims_matching_idle() {

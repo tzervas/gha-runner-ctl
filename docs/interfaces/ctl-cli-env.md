@@ -121,6 +121,8 @@ All global options accept the same name as env var (clap `env =`); boolean env v
 | Env | Effect |
 |-----|--------|
 | `GHA_BATCH=1` | If `scope` was default `repo`, switch to `scope=user` and set user from `gh` |
+| `GHA_RETAIN_MAX_AGE_SECS` (default `3000`) | `mode=retain` only: wall-clock age (since last fresh registration) after which the on-disk retain marker is treated as expired and `up` mints a new registration token instead of reusing `.runner` on the volume. Workspace-hygiene bound, not a credential-expiry workaround — the registration token itself is already consumed at `config.sh` time |
+| `GHA_RETAIN_MAX_JOBS` (default `25`) | `mode=retain` only: number of reuses (container restarts riding the same registration) after which the marker is treated as expired, same effect as the age bound |
 
 ## Scope and registration
 
