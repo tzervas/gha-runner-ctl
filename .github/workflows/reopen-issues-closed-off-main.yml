@@ -29,7 +29,7 @@ jobs:
   # jobs". Cheap on ubuntu-latest — no fleet load (the reason the old self-hosted gate was wrong).
   gate:
     name: gate
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, podman]
     steps:
       - name: noop
         run: echo "reopen workflow loaded"
@@ -37,7 +37,7 @@ jobs:
   reopen:
     name: Reopen epics closed off-main
     needs: [gate]
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, podman]
     if: >
       github.event_name == 'pull_request' &&
       github.event.pull_request.merged == true &&

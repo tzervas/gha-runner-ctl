@@ -134,7 +134,7 @@ jobs:
     name: build
     needs: [ci, release-build]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, podman]
     steps:
       - name: Aggregate the centralized gate
         run: |

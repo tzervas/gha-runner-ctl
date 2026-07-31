@@ -149,7 +149,7 @@ jobs:
     name: gate
     needs: [detect, rust, python, noop]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, podman]
     steps:
       - name: Aggregate fleet-ci job results
         run: |
