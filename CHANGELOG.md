@@ -170,6 +170,48 @@ now want 48c/96g, so at the new tier sizes memory caps the pool before CPU
 does. Recommended: `GHA_POOL_CPUS=48→52`, `GHA_POOL_MEMORY=85g→100g`, leaving
 ~4 cores / ~25 GB headroom for the host on the 56c/125 GB box.
 
+### Fixed — `GHA_MODE=retain` worker reuse was silently defeated by a hardcoded flag
+
+The dynamic pool's scale-decision call site (`listen()` in `src/lib.rs`) hardcoded
+`ephemeral_post_job_exit: true` on every tick, independent of `cli.mode`. In
+`src/pool.rs`, that flag makes an idle-but-registered worker (a) not count as
+covering demand and (b) get reclaimed on the very next tick — so even with
+`GHA_MODE=retain` set, a retained worker was torn down before it could pick up
+a second job. Retain mode registered once, then behaved exactly like ephemeral
+mode anyway. The flag is now derived from `effective_ephemeral(&cli)`, so
+retain's idle workers are left alone (subject to the existing wrong-repo
+preempt fallback and the new bounded-retirement window below) instead of being
+swept every tick.
+
+**Default mode is unchanged** (`GHA_MODE` still defaults to `ephemeral`) — this
+fix is inert until an instance is explicitly opted into `GHA_MODE=retain`.
+
+### Added — bounded retain lifetime (`GHA_RETAIN_MAX_AGE_SECS`, `GHA_RETAIN_MAX_JOBS`)
+
+Clarifying the credential model first: the registration token minted for
+`config.sh` is single-use and expires in ~1 hour if unused, but once
+`config.sh` succeeds the runner holds its own durable credentials and does not
+need another token to keep serving jobs — retained runners are **not** limited
+to a 1-hour lifetime by anything credential-related.
+
+What bounded retirement *is* for: workspace hygiene and drift control. A
+long-lived retained container accumulates `_work` directory state and job
+history, so retirement is now capped by two independent, env-tunable bounds:
+
+- `GHA_RETAIN_MAX_AGE_SECS` (default `3000`, i.e. 50 minutes) — wall-clock age
+  of the registration since it was last freshly minted.
+- `GHA_RETAIN_MAX_JOBS` (default `25`) — number of times the registration has
+  been reused (i.e. how many container restarts have ridden the same
+  registration) since it was last freshly minted.
+
+The on-disk retain marker (`gha-runner-ctl-retain-{container}-{user}.ok`) now
+records a creation timestamp and a reuse counter alongside the target repo URL,
+instead of just the URL. Once either bound is exceeded, `volume_has_runner_config()`
+returns `false` and `up()` falls back to minting a fresh registration token, as
+if nothing had been retained. **Backward compatible:** a marker written by a
+prior build (bare URL, no recorded age) parses as unknown age and is treated
+as not-reusable — the safe direction — rather than assumed fresh.
+
 ## v0.3.0 (2026-07-25)
 
 ### Fixed — release automation: a crates.io failure no longer blocks the release

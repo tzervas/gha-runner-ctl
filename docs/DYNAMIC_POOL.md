@@ -81,7 +81,12 @@ GPU listeners require `gpu` on the job; they claim **gpu** CPU+RAM from the **sa
 
 ## Policy
 
-- Ephemeral workers (warm retain is opt-in)  
+- Ephemeral workers (warm retain is opt-in). Default `GHA_MODE=ephemeral`; set
+  `GHA_MODE=retain` to let a dynamic-pool worker serve multiple jobs from one
+  registration instead of exiting after each job. Retain reuse is bounded by
+  `GHA_RETAIN_MAX_AGE_SECS` (default 3000s) and `GHA_RETAIN_MAX_JOBS` (default
+  25) for workspace hygiene, not credential expiry — see the "Modes" section in
+  the repo README.
 - Managers (`listen`) stay warm via systemd  
 - Workflows set **labels**, not raw CPU/RAM env vars  
 - Resource choices must be **justified** (compile weight, matrix width, GPU training)  
