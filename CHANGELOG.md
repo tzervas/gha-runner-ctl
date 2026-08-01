@@ -1,5 +1,46 @@
 ## Unreleased
 
+### Changed — rebalance per-tier memory grants and lower the sizing catch-all (memory-bound pool)
+
+Real controller output under load showed the pool memory-bound, not CPU-bound:
+`skip_cap` climbing while `free_left=2.00c/0MiB` — cores still free, memory at
+zero. Two compounding causes, both fixed here:
+
+1. **`resources_for_tier()` over-granted memory per tier.** `micro` 2g→1g,
+   `small` 4g→2g, `medium` 8g→4g, `large` 24g→16g, `xlarge` 40g→28g (`gpu`
+   unchanged at 16g). CPU is left untouched — cores were measured idle, not the
+   bottleneck. At the 114 GiB pool cap this roughly *doubles* concurrency
+   (`medium` 14→28 workers, `large` 4→7 workers). The OOM history is
+   respected: the original exit-137 kills were `cargo test`/`cargo build
+   --release` on the OLD `large` tier's **4 GiB**; the new `large` (16 GiB) is
+   still 4x that headroom, not a return to the failing configuration.
+2. **`size_for_job()`'s catch-all fell through to `Medium` (now 4g).** Traced
+   concretely: `quadlet-generate`, a trivial generator job, matched none of
+   the classifier's branches and silently landed on the 8g-then-4g default —
+   8 GiB for a job that needs a fraction of that. The catch-all now defaults
+   to `Small` instead of `Medium` (heavy work is already caught explicitly by
+   the cargo/build/release/xlarge branches above the catch-all, so lowering
+   the fallback does not put compiles at risk), and observed light job names
+   (`quadlet-generate`, `capture-diff`, `registry-check`, `secret-keymap`,
+   `policy-check`, `adversarial`, `yamllint`, `shellcheck`, `notify`) are now
+   classified `Micro` directly instead of relying on the fallback at all.
+
+Updated every place that mirrors these numbers: `src/pool.rs` unit tests,
+`docs/DYNAMIC_POOL.md`, and `mycelium-port/gha_pool.myc`'s hand-encoded
+differential oracle (`tier_cpus_milli`/`tier_mem_mib` binary literals +
+`check_all` assertions).
+
+**Follow-up (not implemented here):** the real fix is genuinely dynamic
+sizing — cores, RAM, and disk from each job's actual measured usage (peak
+RSS/CPU from cgroup stats at reap time, persisted per `(repo, job_name)`,
+falling back to the name heuristic only when there's no history) — which
+supersedes name-based tiers entirely. Podman also supports per-container disk
+limits (`--storage-opt size=`) that the controller does not currently set.
+Also unaddressed: the Medium-default keyword list matches the bare substring
+`"ci"`, which fires on any job name containing that fragment, not just CI
+jobs; left as-is pending a full inventory of job names across every
+consuming repo.
+
 ### Added — GitHub App installation-token authentication as a first-class CLI feature (opt-in, closes #41)
 
 `listen` re-scans every `GHA_PRIORITY_REPOS` repo every tick — measured on the homelab

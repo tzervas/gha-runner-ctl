@@ -26,7 +26,8 @@ pub const DEFAULT_MIN_MEMORY_MIB: u64 = 256;
 pub enum SizeTier {
     /// fleet-security / lint / gitleaks-class
     Micro,
-    /// light unit tests, ruff, detect
+    /// light unit tests, ruff, detect; also the catch-all default for job names
+    /// `size_for_job` does not recognise (see the tail of that function)
     Small,
     /// default cargo test / full CI (enough RAM to avoid OOM on medium crates)
     Medium,
@@ -157,6 +158,21 @@ pub fn size_for_job(job_name: &str, labels: &[String], force_gpu: bool) -> SizeT
             "sbom",
             "commitizen",
             "conventional",
+            // Observed light jobs (fleet-ops pr-ci.yml) that were falling through to the
+            // Medium-default block below (or the bare-Medium catch-all) and holding 8g
+            // for work that is a generator/scanner/notifier, not a compile. Traced
+            // concretely: `quadlet-generate` matched none of the branches above and
+            // landed on Medium via the catch-all, holding 8 GiB for a trivial generator.
+            "quadlet-generate",
+            "capture-diff",
+            "registry-check",
+            "secret-keymap",
+            "policy-check",
+            "adversarial",
+            "yamllint",
+            "shellcheck",
+            "notify",
+            "render",
         ],
     ) {
         return SizeTier::Micro;
@@ -185,7 +201,33 @@ pub fn size_for_job(job_name: &str, labels: &[String], force_gpu: bool) -> SizeT
             SizeTier::Large
         };
     }
+    // Bare `test` / `mutants` are Rust COMPILE jobs on this fleet, not light checks.
+    // aphelion-scribe-{daemon,core,cli,runner} name their cargo build+test job exactly
+    // "test", and cargo-mutants names its job "mutants". Both were reaching Medium (via
+    // the "test" needle below) or the catch-all, which after the memory rebalance puts a
+    // full `cargo test` + `cargo build --release` — two private git deps plus rusqlite
+    // `bundled`, i.e. the entire SQLite C amalgamation — back onto 4g. That is the exact
+    // configuration that produced the historic exit-137 OOM kills, so it must not be
+    // reachable by a job whose only sin is a short name.
+    //
+    // Matched on boundaries, not substrings: a bare `"test"` needle would also swallow
+    // "pytest"/"latest". Caught in review on #107 — the catch-all was checked, this list
+    // was not.
+    if matches!(name.as_str(), "test" | "mutants")
+        || name.starts_with("test ")
+        || name_contains_any(&name, &["build + test", "build+test", "build-and-test"])
+    {
+        return SizeTier::Large;
+    }
     // Medium-default non-Rust test/build (pytest, generic ci)
+    //
+    // NOTE: the bare "ci" needle here is a known-loose substring match — it fires on
+    // any job name containing "ci" as a fragment (e.g. "precision", "decision",
+    // "special-case"), not just CI jobs. Left as-is: tightening it (e.g. requiring a
+    // "-ci"/"ci-"/exact-"ci" boundary) risks silently reclassifying real job names this
+    // fleet already depends on, and doing that safely needs an inventory of every job
+    // name across every consuming repo, which is out of scope for this change. Flagged
+    // as a follow-up in the PR body rather than changed here.
     if name_contains_any(
         &name,
         &[
@@ -201,7 +243,16 @@ pub fn size_for_job(job_name: &str, labels: &[String], force_gpu: bool) -> SizeT
     if name.contains("fleet-ci") || name.contains("detect") {
         return SizeTier::Small;
     }
-    SizeTier::Medium
+    // Catch-all for anything unrecognised: default to Small, not Medium. An
+    // unrecognised job name is far more likely to be something light (a generator,
+    // a notifier, a doc step) than an undetected heavy compile — real compile/test/
+    // build work is already caught explicitly by the cargo/build/xlarge/large
+    // branches above, so lowering this fallback does not put those jobs at risk.
+    // This was the actual root cause of the pool's memory exhaustion under load:
+    // `quadlet-generate` (now caught above) matched nothing and fell all the way
+    // through to this line, landing on Medium (8g in the old table) purely because
+    // it was unrecognised, not because it needed 8g.
+    SizeTier::Small
 }
 
 fn name_contains_any(name: &str, needles: &[&str]) -> bool {
@@ -210,24 +261,40 @@ fn name_contains_any(name: &str, needles: &[&str]) -> bool {
 
 /// Map tier → (cpus string, memory string) for podman.
 ///
-/// Sized for a 56-core/125 GiB-class homelab host, not a laptop: the previous
-/// grants (0.25c..8c) left ~80% of pool CPU idle under load (measured: 4/56
-/// cores in flight against a 4.58 load average, `free_left=38.75c/76288MiB`
-/// immediately after scale-out). `cargo test`/`release --locked` in particular
-/// were bottlenecked at 4c, worse than a modern laptop. These are *preferred*
-/// sizes — `fit_to_budget` still shrinks toward the free remainder (floor
-/// 0.25c/256 MiB) when the pool is tight, so small hosts degrade gracefully.
-/// Caps: xlarge ≤ 20 CPU / 40 GiB; gpu ≤ 8 CPU / 16 GiB host-side (device is separate).
+/// Sized for a 56-core/125 GiB-class homelab host, not a laptop. The pool is
+/// **memory-bound, not CPU-bound**: measured controller output under load showed
+/// `free_left=2.00c/0MiB` — cores still free, memory exhausted — while `skip_cap`
+/// climbed because nothing could fit. Root cause: light jobs held far more RAM
+/// than they use (e.g. `quadlet-generate`, a trivial generator, held 8 GiB on
+/// `medium`), so at 8 GiB/worker a 114 GiB pool caps out around ~14 concurrent
+/// jobs regardless of idle cores. Memory is cut hard here (roughly half or better
+/// per tier); CPU is left generous since cores were measured idle, not the
+/// bottleneck — keeping CPU high keeps each job fast while memory now governs
+/// concurrency. At the 114 GiB pool cap this roughly *doubles* concurrency:
+/// `medium` 14 → 28 workers, `large` 4 → 7 workers.
+///
+/// The OOM history is respected, not reopened: the original exit-137 OOM kills
+/// (see `size_for_job`) were `cargo test`/`cargo build --release` running in the
+/// OLD `large` tier at **4 GiB**. The new `large` is **16 GiB — still 4x
+/// that** — a rebalance toward the measured bottleneck, not a return to the
+/// configuration that actually OOM-killed. `micro` was briefly 0.25c/512 MiB
+/// earlier and lint/scan jobs (gitleaks, trivy, shellcheck, yamllint) completed
+/// fine on it; `1c/1g` is double that, so 1 GiB is not tight for that class.
+///
+/// These are *preferred* sizes — `fit_to_budget` still shrinks toward the free
+/// remainder (floor 0.25c/256 MiB) when the pool is tight, so small hosts
+/// degrade gracefully. Caps: xlarge ≤ 20 CPU / 28 GiB; gpu ≤ 8 CPU / 16 GiB
+/// host-side (device is separate).
 pub fn resources_for_tier(tier: SizeTier) -> (String, String) {
     match tier {
         // Lint/secrets scans (gitleaks, ruff, fmt…) — cheap, but no longer starved at 0.25c.
-        SizeTier::Micro => ("1".into(), "2g".into()),
-        SizeTier::Small => ("2".into(), "4g".into()),
-        // Medium crates / cargo check — 4c/8g keeps headroom on self-hosted workers
-        SizeTier::Medium => ("4".into(), "8g".into()),
-        // cargo test + release --locked: the previous 4c/8g was the actual bottleneck.
-        SizeTier::Large => ("12".into(), "24g".into()),
-        SizeTier::Xlarge => ("20".into(), "40g".into()),
+        SizeTier::Micro => ("1".into(), "1g".into()),
+        SizeTier::Small => ("2".into(), "2g".into()),
+        // Medium crates / cargo check — memory-bound pool: cut RAM, keep CPU generous.
+        SizeTier::Medium => ("4".into(), "4g".into()),
+        // cargo test + release --locked: 16g is still 4x the 4g that actually OOM-killed.
+        SizeTier::Large => ("12".into(), "16g".into()),
+        SizeTier::Xlarge => ("20".into(), "28g".into()),
         // GPU jobs: solid host CPU/RAM for data loaders + full device on GPU slice
         SizeTier::Gpu => ("8".into(), "16g".into()),
     }
@@ -947,6 +1014,30 @@ pub fn plan_scale(input: &ScaleInput) -> ScalePlan {
 mod tests {
     use super::*;
 
+    /// Regression guard for grok's review catch on #107: the scribe repos name their
+    /// cargo build+test job exactly "test", and cargo-mutants names its job "mutants".
+    /// Both previously reached Medium/the catch-all, which after the memory rebalance
+    /// would have put a full cargo compile back on 4g — the historic exit-137 floor.
+    #[test]
+    fn bare_test_and_mutants_are_large_not_medium() {
+        for n in [
+            "test",
+            "mutants",
+            "Build + test",
+            "build-and-test",
+            "test (ubuntu)",
+        ] {
+            assert_eq!(
+                size_for_job(n, &[], false),
+                SizeTier::Large,
+                "{n:?} must be Large — it is a Rust compile job on this fleet"
+            );
+        }
+        // Boundary check: these must NOT be swept up by the promotion.
+        assert_ne!(size_for_job("pytest", &[], false), SizeTier::Large);
+        assert_ne!(size_for_job("latest-docs", &[], false), SizeTier::Large);
+    }
+
     #[test]
     fn tier_gitleaks_micro() {
         assert_eq!(
@@ -1062,14 +1153,49 @@ mod tests {
     fn resources_medium_has_headroom() {
         let (c, m) = resources_for_tier(SizeTier::Medium);
         assert_eq!(c, "4");
-        assert_eq!(m, "8g");
+        assert_eq!(m, "4g");
     }
 
     #[test]
     fn resources_xlarge_cap() {
         let (c, m) = resources_for_tier(SizeTier::Xlarge);
         assert_eq!(c, "20");
-        assert_eq!(m, "40g");
+        assert_eq!(m, "28g");
+    }
+
+    /// The catch-all for an unrecognised job name is Small, not Medium — an
+    /// unrecognised name is more likely light (generator/notifier/doc step) than
+    /// an undetected heavy compile, and real compile work is caught explicitly
+    /// above this fallback.
+    #[test]
+    fn tier_unrecognised_name_falls_to_small() {
+        assert_eq!(
+            size_for_job("some-totally-unknown-job", &["self-hosted".into()], false),
+            SizeTier::Small
+        );
+    }
+
+    /// Observed light job names (fleet-ops pr-ci.yml) must not fall through to the
+    /// Medium/Small default paths — they should be recognised as Micro directly.
+    #[test]
+    fn tier_observed_light_jobs_micro() {
+        for name in [
+            "quadlet-generate",
+            "capture-diff",
+            "registry-check",
+            "secret-keymap",
+            "policy-check",
+            "adversarial",
+            "yamllint",
+            "shellcheck",
+            "notify",
+        ] {
+            assert_eq!(
+                size_for_job(name, &["self-hosted".into()], false),
+                SizeTier::Micro,
+                "job {name} should be Micro"
+            );
+        }
     }
 
     #[test]
@@ -1135,9 +1261,12 @@ mod tests {
     /// Vertical: job size/labels map to tier + preferred resources in the plan.
     #[test]
     fn scale_job_size_vertical() {
-        // micro (1c/2g) + large (12c/24g) + medium (4c/8g) = 17c/34g; fits under
-        // a 20c/36g free budget (base_input's default 16c/16g is too tight now
-        // that Large/Xlarge are sized for a many-core homelab host).
+        // micro (1c/1g) + large (12c/16g) + medium (4c/4g) = 17c/21g; fits under
+        // a 20c/24g free budget (base_input's default 16c/16g is too tight now
+        // that Large/Xlarge are sized for a many-core homelab host). Main packing
+        // loop only spawns a job at its FULL preferred size (no shrink) when
+        // there is enough free budget, in job order — so each of these three
+        // gets exactly its resources_for_tier() preferred (cpus, memory_mib).
         let jobs = vec![
             job("gitleaks", &["self-hosted"]),
             job("cargo test", &["self-hosted"]),
@@ -1145,39 +1274,39 @@ mod tests {
         ];
         let mut input = base_input(jobs);
         input.free_cpus = 20.0;
-        input.free_memory_mib = 36 * 1024;
+        input.free_memory_mib = 24 * 1024;
         let plan = plan_scale(&input);
         assert_eq!(plan.spawns.len(), 3, "notes={}", plan.notes);
         assert_eq!(plan.spawns[0].tier, SizeTier::Micro);
         assert_eq!(plan.spawns[1].tier, SizeTier::Large);
         assert_eq!(plan.spawns[2].tier, SizeTier::Medium);
         assert!((plan.spawns[0].cpus - 1.0).abs() < 1e-9);
-        assert_eq!(plan.spawns[0].memory_mib, 2 * 1024);
+        assert_eq!(plan.spawns[0].memory_mib, 1024);
         assert!((plan.spawns[1].cpus - 12.0).abs() < 1e-9);
-        assert_eq!(plan.spawns[1].memory_mib, 24 * 1024);
+        assert_eq!(plan.spawns[1].memory_mib, 16 * 1024);
         assert!((plan.spawns[2].cpus - 4.0).abs() < 1e-9);
-        assert_eq!(plan.spawns[2].memory_mib, 8 * 1024);
+        assert_eq!(plan.spawns[2].memory_mib, 4 * 1024);
     }
 
     /// Explicit xlarge label gets full preferred size when budget allows.
     #[test]
     fn scale_xlarge_preferred_when_budget_allows() {
         let mut input = base_input(vec![job("unit", &["self-hosted", "xlarge"])]);
-        // Xlarge now prefers 20c/40g; give it headroom above that so the plan
+        // Xlarge now prefers 20c/28g; give it headroom above that so the plan
         // grants the full preferred size rather than shrinking to free.
         input.free_cpus = 24.0;
-        input.free_memory_mib = 44 * 1024;
+        input.free_memory_mib = 32 * 1024;
         let plan = plan_scale(&input);
         assert_eq!(plan.spawns.len(), 1);
         assert_eq!(plan.spawns[0].tier, SizeTier::Xlarge);
         assert!((plan.spawns[0].cpus - 20.0).abs() < 1e-9);
-        assert_eq!(plan.spawns[0].memory_mib, 40 * 1024);
+        assert_eq!(plan.spawns[0].memory_mib, 28 * 1024);
     }
 
     /// Capacity ceiling: never plan more workers than free CPU/memory allow.
     #[test]
     fn scale_capacity_bound_clamp() {
-        // 2c free / 4g free → Medium (4c/8g preferred) shrinks to fit; second Medium skipped.
+        // 2c free / 4g free → Medium (4c/4g preferred) shrinks to fit; second Medium skipped.
         let mut input = base_input(vec![
             job("pytest", &["self-hosted"]),
             job("unit test", &["self-hosted"]),
@@ -1563,8 +1692,8 @@ mod tests {
     #[test]
     fn scale_skips_large_allows_micro() {
         let mut input = base_input(vec![
-            job("unit", &["self-hosted", "xlarge"]), // 20c/40g — won't fit
-            job("gitleaks", &["self-hosted"]),       // micro (1c/2g) — fits
+            job("unit", &["self-hosted", "xlarge"]), // 20c/28g — won't fit
+            job("gitleaks", &["self-hosted"]),       // micro (1c/1g) — fits
         ]);
         input.free_cpus = 2.0;
         input.free_memory_mib = 3 * 1024;
