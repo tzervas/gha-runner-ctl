@@ -1735,8 +1735,8 @@ struct RegistrationTokenResponse {
 /// at anything else — which is why the HTTP paths had zero test coverage.
 ///
 /// Production always constructs this via [`HttpConfig::github`] (equivalently
-/// [`Cli::http`]), which reproduces the previously-hardcoded values byte for byte:
-/// [`GITHUB_API_BASE`], [`UA`], [`HTTP_TIMEOUT`]. Tests construct one with
+/// `Cli::http`), which reproduces the previously-hardcoded values byte for byte:
+/// `GITHUB_API_BASE`, `UA`, `HTTP_TIMEOUT`. Tests construct one with
 /// [`HttpConfig::with_api_base`] pointing at a local server.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HttpConfig {
@@ -1773,7 +1773,7 @@ impl HttpConfig {
     }
 
     /// Override connect/read/write timeouts. Used by tests so a wedged local server
-    /// fails in milliseconds instead of [`HTTP_TIMEOUT`].
+    /// fails in milliseconds instead of `HTTP_TIMEOUT`.
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
@@ -5408,7 +5408,7 @@ mod http_seam_tests {
     }
 
     /// Config pointed at `server`, with timeouts short enough that a wedged server
-    /// fails the test in seconds rather than [`HTTP_TIMEOUT`].
+    /// fails the test in seconds rather than `HTTP_TIMEOUT`.
     fn test_http(server: &TestServer) -> HttpConfig {
         HttpConfig::with_api_base(server.base()).with_timeout(Duration::from_secs(5))
     }
