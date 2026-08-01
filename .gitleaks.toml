@@ -11,10 +11,32 @@ paths = [
   '''(^|/)tests/''',
   '''(^|/)target/''',
   '''(^|/)\.git/''',
+  # Deleted file, historical finding only. It held `CUDA_KEYRING_SHA256=<64 hex>` — the
+  # PUBLISHED integrity hash of NVIDIA's CUDA keyring .deb, fetched from
+  # developer.download.nvidia.com. Being public is the whole point of a checksum;
+  # `generic-api-key` fires only because the variable name contains "KEY".
+  #
+  # Scoped by PATH deliberately. gitleaks matches allowlist `regexes` against the SECRET
+  # (here a bare 64-char hex string), so a regex broad enough to match it — e.g.
+  # ^[a-f0-9]{64}$ — would silently suppress every 64-hex secret in the repo, including a
+  # real API key. A path entry for one deleted file cannot hide anything in live code.
+  #
+  # Needed because the pre-push gate scans FULL history while CI scans the tip with
+  # --no-git; the tip is already clean.
+  '''(^|/)packaging/Containerfile\.runner-gpu$''',
 ]
 regexes = [
   # Truncated/fake PAT shapes used only in redact unit tests
   '''ghp_ABC[A-Z0-9]{0,30}''',
   '''ghp_XYZ[A-Z0-9]{0,30}''',
   '''RUNNER_TOKEN=test[_-]?token[_-]?value''',
+  # Fake PEM placeholders in src/appauth.rs's inline #[cfg(test)] module, which the
+  # `tests/` path allowlist above cannot reach. These match ONLY the placeholder bodies
+  # ("MIIB..." with literal dots, and "abc") — a real key body is long base64 and can
+  # never match either pattern, so the private-key rule stays fully armed for real keys.
+  #
+  # Needed because the pre-push gate scans FULL git history while CI scans the tip with
+  # --no-git: the literals were removed from the working tree, but remain in history.
+  '''BEGIN RSA PRIVATE KEY-----\\nMIIB\.\.\.''',
+  '''BEGIN RSA PRIVATE KEY-----\\nabc\\n''',
 ]
