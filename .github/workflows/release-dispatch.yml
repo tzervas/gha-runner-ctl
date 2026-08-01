@@ -1,3 +1,8 @@
+# FLEET POLICY (owner, 2026-08-01): ALL GitHub Actions run on self-hosted runners.
+# No GitHub-hosted (cloud) runners, ever. If the fleet is fully down, the unblock is to
+# spawn a single container and register it as a one-off runner — not to fall back to cloud.
+# Consequence, accepted deliberately: while the fleet is unhealthy, gate/aggregator jobs
+# cannot run either, so PRs sit pending rather than failing loudly.
 # One release path. One button. Idempotent at every step.
 #
 # WHY THIS REPLACES TWO WORKFLOWS
@@ -50,7 +55,7 @@ concurrency:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, podman]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7

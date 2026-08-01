@@ -651,8 +651,11 @@ struct AppInfo {
     name: Option<String>,
 }
 
-fn list_installations_http(jwt: &str) -> Result<Vec<Installation>, String> {
-    let result = crate::http_agent()
+fn list_installations_http(
+    jwt: &str,
+    http: &crate::HttpConfig,
+) -> Result<Vec<Installation>, String> {
+    let result = crate::http_agent(http)
         .get("https://api.github.com/app/installations?per_page=100")
         .set("Authorization", &format!("Bearer {jwt}"))
         .set("Accept", "application/vnd.github+json")
@@ -679,8 +682,8 @@ fn list_installations_http(jwt: &str) -> Result<Vec<Installation>, String> {
     }
 }
 
-fn get_app_info_http(jwt: &str) -> Result<AppInfo, String> {
-    let result = crate::http_agent()
+fn get_app_info_http(jwt: &str, http: &crate::HttpConfig) -> Result<AppInfo, String> {
+    let result = crate::http_agent(http)
         .get("https://api.github.com/app")
         .set("Authorization", &format!("Bearer {jwt}"))
         .set("Accept", "application/vnd.github+json")
@@ -709,9 +712,10 @@ fn get_app_info_http(jwt: &str) -> Result<AppInfo, String> {
 pub(crate) fn get_installation_http(
     jwt: &str,
     installation_id: &str,
+    http: &crate::HttpConfig,
 ) -> Result<Installation, String> {
     let url = format!("https://api.github.com/app/installations/{installation_id}");
-    let result = crate::http_agent()
+    let result = crate::http_agent(http)
         .get(&url)
         .set("Authorization", &format!("Bearer {jwt}"))
         .set("Accept", "application/vnd.github+json")
@@ -838,6 +842,7 @@ fn resolve_installation_id(
     cfg: &AppAuthConfig,
     owner_hint: Option<&str>,
     now: i64,
+    http: &crate::HttpConfig,
 ) -> Result<String, String> {
     if let Some(id) = &cfg.installation_id {
         return Ok(id.clone());
@@ -855,9 +860,9 @@ fn resolve_installation_id(
     }
 
     let jwt = encode_jwt(&cfg.app_id, &cfg.key_source, now)?;
-    let installations = list_installations_http(&jwt)?;
+    let installations = list_installations_http(&jwt, http)?;
     let app_slug = if installations.is_empty() {
-        get_app_info_http(&jwt).ok().and_then(|a| a.slug)
+        get_app_info_http(&jwt, http).ok().and_then(|a| a.slug)
     } else {
         None
     };
@@ -883,9 +888,10 @@ struct InstallationTokenResponse {
 fn mint_installation_token_http(
     jwt: &str,
     installation_id: &str,
+    http: &crate::HttpConfig,
 ) -> Result<(InstallationToken, i64), String> {
     let url = format!("https://api.github.com/app/installations/{installation_id}/access_tokens");
-    let result = crate::http_agent()
+    let result = crate::http_agent(http)
         .post(&url)
         .set("Authorization", &format!("Bearer {jwt}"))
         .set("Accept", "application/vnd.github+json")
@@ -982,9 +988,10 @@ fn now_unix() -> i64 {
 pub(crate) fn installation_token(
     cfg: &AppAuthConfig,
     owner_hint: Option<&str>,
+    http: &crate::HttpConfig,
 ) -> Result<String, String> {
     let now = now_unix();
-    let installation_id = resolve_installation_id(cfg, owner_hint, now)?;
+    let installation_id = resolve_installation_id(cfg, owner_hint, now, http)?;
     let cache_key: TokenCacheKey = (cfg.app_id.clone(), installation_id.clone());
 
     {
@@ -999,7 +1006,7 @@ pub(crate) fn installation_token(
     }
 
     let jwt = encode_jwt(&cfg.app_id, &cfg.key_source, now)?;
-    let (token, expires_at_unix) = mint_installation_token_http(&jwt, &installation_id)?;
+    let (token, expires_at_unix) = mint_installation_token_http(&jwt, &installation_id, http)?;
     let out = token.expose().to_string();
 
     let mut guard = token_cache()
@@ -1047,12 +1054,13 @@ pub(crate) struct DoctorReport {
 pub(crate) fn doctor_report(
     cfg: &AppAuthConfig,
     owner_hint: Option<&str>,
+    http: &crate::HttpConfig,
 ) -> Result<DoctorReport, String> {
     let now = now_unix();
-    let installation_id = resolve_installation_id(cfg, owner_hint, now)?;
+    let installation_id = resolve_installation_id(cfg, owner_hint, now, http)?;
     let jwt = encode_jwt(&cfg.app_id, &cfg.key_source, now)?;
-    let app_info = get_app_info_http(&jwt)?;
-    let inst = get_installation_http(&jwt, &installation_id)?;
+    let app_info = get_app_info_http(&jwt, http)?;
+    let inst = get_installation_http(&jwt, &installation_id, http)?;
     Ok(DoctorReport {
         app_id: cfg.app_id.clone(),
         app_name: app_info.name.clone(),
