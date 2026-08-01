@@ -70,6 +70,29 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # Self-hosted work images historically lack `gh` (ubuntu-latest had it preinstalled).
+      # Prefer baking into ap-fleet-work-images (scribe-cpu-build / gha-work); this step is the
+      # interim so release can re-run before workers recycle the new image layers.
+      - name: Ensure gh CLI
+        env:
+          GH_VERSION: "2.97.0"
+          GH_SHA256: "a2c9b8497e1f85b1ad0dfcb78b5a622e098801b8e461e459e88e1ee12f018112"
+        run: |
+          set -euo pipefail
+          if command -v gh >/dev/null 2>&1; then
+            gh --version
+            exit 0
+          fi
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL -o /tmp/gh.tar.gz \
+            "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz"
+          echo "${GH_SHA256}  /tmp/gh.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/gh.tar.gz -C /tmp
+          install -m 755 "/tmp/gh_${GH_VERSION}_linux_amd64/bin/gh" "$HOME/.local/bin/gh"
+          rm -rf /tmp/gh.tar.gz "/tmp/gh_${GH_VERSION}_linux_amd64"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/gh" --version
+
       # ── resolve ────────────────────────────────────────────────────────────────────────
       - name: Resolve the version to release
         id: ver
