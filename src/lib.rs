@@ -3754,6 +3754,58 @@ fn repos_round_robin_state_path(container: &str) -> PathBuf {
     dir.join(format!("gha-runner-ctl-rr-{safe}-{user_suffix}.txt"))
 }
 
+/// Cursor for the PRIORITY scan, separate from the non-priority round-robin.
+fn priority_round_robin_state_path(container: &str) -> PathBuf {
+    let p = repos_round_robin_state_path(container);
+    let name = p
+        .file_name()
+        .map(|s| s.to_string_lossy().replace("-rr-", "-prio-rr-"))
+        .unwrap_or_else(|| "gha-runner-ctl-prio-rr.txt".to_string());
+    p.with_file_name(name)
+}
+
+/// Rotate `items` so the scan starts at a persisted offset, then advance that
+/// offset by however many entries were actually consumed last tick.
+///
+/// Why this exists: the priority set is scanned in FIXED order every tick, and
+/// the scan stops when the per-poll API budget is exhausted. Truncation
+/// therefore always cuts the same tail, so once the priority list outgrows the
+/// budget the repos at the end are never polled at all — not "polled late",
+/// never. Repos appended to the list land exactly there, which is how 47
+/// freshly-added mycelium repos sat unscanned while their jobs queued for hours.
+///
+/// Rotating trades strict head-first ordering for guaranteed coverage: over
+/// enough ticks every priority repo reaches the front. If strict ordering
+/// matters more than coverage, keep the priority list small enough to fit
+/// inside `--api-max-per-poll`, where this rotation is a no-op anyway.
+fn rotate_by_cursor(items: &[String], path: &PathBuf) -> (Vec<String>, usize) {
+    let len = items.len();
+    if len == 0 {
+        return (Vec::new(), 0);
+    }
+    let offset: usize = fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+        % len;
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        out.push(items[(offset + i) % len].clone());
+    }
+    (out, offset)
+}
+
+/// Persist where the next tick should start. `consumed` is how many entries the
+/// scan actually got through before the budget ran out; advancing by exactly
+/// that much makes coverage complete rather than merely shuffled.
+fn advance_cursor(path: &PathBuf, offset: usize, consumed: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let next = (offset + consumed.max(1)) % len;
+    let _ = fs::write(path, next.to_string());
+}
+
 /// Subset of allowlisted repos for this demand tick (`repos_per_tick`; 0 = all).
 fn select_repos_for_tick(cli: &Cli, repos: &[String]) -> Vec<String> {
     if repos.is_empty() {
@@ -4132,12 +4184,18 @@ fn list_demand_jobs(
     }
     let priority = priority_repos_list(cli);
     // Priority repos every tick (full set, capped), then RR the rest once.
-    let mut scan: Vec<String> = Vec::new();
+    // The priority set is rotated by a persisted cursor so that budget
+    // truncation does not repeatedly starve the same tail — see rotate_by_cursor.
+    let mut prio_scan: Vec<String> = Vec::new();
     for p in &priority {
-        if (repos.iter().any(|r| r == p) || is_safe_repo(p)) && !scan.contains(p) {
-            scan.push(p.clone());
+        if (repos.iter().any(|r| r == p) || is_safe_repo(p)) && !prio_scan.contains(p) {
+            prio_scan.push(p.clone());
         }
     }
+    let prio_cursor_path = priority_round_robin_state_path(&cli.container);
+    let (prio_scan, prio_offset) = rotate_by_cursor(&prio_scan, &prio_cursor_path);
+    let prio_len = prio_scan.len();
+    let mut scan: Vec<String> = prio_scan;
     let rest: Vec<String> = repos
         .iter()
         .filter(|r| !priority.iter().any(|p| p == *r))
@@ -4165,8 +4223,15 @@ fn list_demand_jobs(
 
     // Prefer queued runs; also sample in_progress (multi-job matrices can still have
     // queued jobs while the run is overall in_progress). Cap hard for API budget.
+    // How many PRIORITY entries the scan got through before stopping. Drives the
+    // cursor so the next tick resumes where this one ran out of budget.
+    let mut prio_consumed: usize = 0;
+    let mut prio_complete = prio_len == 0;
     'budget_hit: {
-        for name in &scan {
+        for (idx, name) in scan.iter().enumerate() {
+            if idx < prio_len {
+                prio_consumed = idx;
+            }
             if out.len() >= max_jobs {
                 break;
             }
@@ -4216,7 +4281,21 @@ fn list_demand_jobs(
                     }
                 }
             }
+            if idx + 1 >= prio_len {
+                // Whole priority set polled this tick: nothing starved, so keep
+                // strict head-first order next tick rather than churning it.
+                prio_complete = true;
+            }
         }
+    }
+
+    if prio_complete {
+        let _ = fs::write(&prio_cursor_path, "0");
+    } else {
+        advance_cursor(&prio_cursor_path, prio_offset, prio_consumed, prio_len);
+        eprintln!(
+            "listen: priority scan truncated after {prio_consumed}/{prio_len}; next tick resumes there"
+        );
     }
 
     // Dedupe by repo+job_name
@@ -4825,9 +4904,7 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
                 let w = local_worker_snapshots(&cli, &pool, max_local);
                 let running_n = w.iter().filter(|x| x.running).count();
                 let busy_n = w.iter().filter(|x| x.running && is_busy(x)).count();
-                eprintln!(
-                    "listen: quiesced running={running_n} busy={busy_n} — waiting for drain"
-                );
+                eprintln!("listen: quiesced running={running_n} busy={busy_n} — waiting for drain");
             } else {
                 eprintln!("listen: quiesced — admission paused");
             }
@@ -6213,5 +6290,90 @@ mod http_seam_tests {
             "the unrouted status must not be swallowed by the demand poll's soft-error filter, \
              otherwise a bypassed seam could look like 'no demand' instead of a test failure"
         );
+    }
+}
+
+#[cfg(test)]
+mod priority_cursor_tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "gha-prio-cursor-{}-{}-{}",
+            tag,
+            std::process::id(),
+            tag.len()
+        ));
+        let _ = fs::remove_file(&p);
+        p
+    }
+
+    #[test]
+    fn no_cursor_file_starts_at_head() {
+        let p = tmp("head");
+        let items: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        let (rot, off) = rotate_by_cursor(&items, &p);
+        assert_eq!(off, 0);
+        assert_eq!(
+            rot, items,
+            "a fresh host must scan in strict priority order"
+        );
+    }
+
+    #[test]
+    fn rotation_preserves_every_entry() {
+        let items: Vec<String> = (0..7).map(|i| format!("r{i}")).collect();
+        let p = tmp("perm");
+        for off in 0..7 {
+            fs::write(&p, off.to_string()).unwrap();
+            let (rot, got) = rotate_by_cursor(&items, &p);
+            assert_eq!(got, off);
+            assert_eq!(rot.len(), items.len(), "rotation must not drop entries");
+            let mut s = rot.clone();
+            s.sort();
+            let mut orig = items.clone();
+            orig.sort();
+            assert_eq!(s, orig, "rotation must be a permutation, never a filter");
+            assert_eq!(rot[0], items[off], "rotation must start at the cursor");
+        }
+        let _ = fs::remove_file(&p);
+    }
+
+    /// The regression this exists for: with a fixed scan order, truncation cuts
+    /// the same tail forever and those repos are NEVER polled. Advancing by what
+    /// was actually consumed must eventually bring every entry to the front.
+    #[test]
+    fn truncated_scans_eventually_cover_every_repo() {
+        let items: Vec<String> = (0..10).map(|i| format!("r{i}")).collect();
+        let p = tmp("cover");
+        let budget = 3usize; // only 3 repos fit per tick
+        let mut ever_first: std::collections::HashSet<String> = Default::default();
+        for _ in 0..10 {
+            let (rot, off) = rotate_by_cursor(&items, &p);
+            for r in rot.iter().take(budget) {
+                ever_first.insert(r.clone());
+            }
+            advance_cursor(&p, off, budget, items.len());
+        }
+        assert_eq!(
+            ever_first.len(),
+            items.len(),
+            "every priority repo must get scanned within a bounded number of ticks; \
+             starved entries are exactly the mycelium-never-polled bug"
+        );
+        let _ = fs::remove_file(&p);
+    }
+
+    #[test]
+    fn advance_never_stalls_even_when_nothing_consumed() {
+        let items: Vec<String> = (0..4).map(|i| format!("r{i}")).collect();
+        let p = tmp("stall");
+        fs::write(&p, "0").unwrap();
+        // consumed = 0 (budget died immediately). Cursor must still move, or the
+        // same head repo is retried forever and the tail never advances.
+        advance_cursor(&p, 0, 0, items.len());
+        let (_, off) = rotate_by_cursor(&items, &p);
+        assert_ne!(off, 0, "a zero-progress tick must still advance the cursor");
+        let _ = fs::remove_file(&p);
     }
 }
