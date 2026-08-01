@@ -11,7 +11,10 @@ at ~96% of its budget and `listen: list_demand_jobs: budget exhausted mid-scan` 
 nearly every tick. The poll interval can't be lowered further — the credential is the
 throttle, not the config.
 
-A **GitHub App installation token** gets **15,000 requests/hour** (3x headroom), which is
+A **GitHub App installation token** raises that ceiling. GitHub scales an installation's limit
+with the size of the installation, so there is no single universal figure — measured on the
+`tzervas` personal-account installation (all repositories, 2026-07-31): **12,500 requests/hour**,
+2.5x a classic PAT's 5,000/hour. That is what
 what makes a faster, steadier poll sustainable.
 
 ## What changed (source)
@@ -130,7 +133,7 @@ gha-runner-ctl --scope repo --auto detect
 A successful App-auth mint logs (to stderr, never the token itself):
 
 ```
-auth: minted GitHub App installation token (app_id=123456, installation_id=78901234, expires in 3540s, ~15000/hour budget)
+auth: minted GitHub App installation token (app_id=123456, installation_id=78901234, expires in 3540s)
 ```
 
 If `GHA_APP_ID`/`GHA_APP_INSTALLATION_ID`/`GHA_APP_PRIVATE_KEY` are only partially set

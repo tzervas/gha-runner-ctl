@@ -6,9 +6,10 @@
 //! `listen` re-scans every repo in `GHA_PRIORITY_REPOS` every tick. On the homelab
 //! instance that is ~80 GETs/min ≈ 4,800/hour against a classic PAT's 5,000/hour cap —
 //! ~96% of budget, which is why `listen: list_demand_jobs: budget exhausted mid-scan`
-//! fires on nearly every tick. A GitHub App installation token gets 15,000 requests/hour
-//! (3x headroom), which is what makes a faster, steadier poll interval sustainable. The
-//! poll interval is not the bottleneck here — the credential is.
+//! fires on nearly every tick. A GitHub App installation token raises that ceiling —
+//! measured at 12,500 requests/hour on this fleet's installation (2.5x the PAT), which is
+//! what makes a faster, steadier poll interval sustainable. The poll interval is not the
+//! bottleneck here — the credential is.
 //!
 //! ## Selection
 //!
@@ -64,8 +65,18 @@ const REFRESH_MARGIN_SECS: i64 = 300;
 /// Used only when GitHub's `expires_at` cannot be parsed: deliberately shorter than
 /// the documented 1h TTL so the failure mode is an extra mint, not a 401.
 const FALLBACK_TTL_SECS: i64 = 1800;
-/// GitHub App installation tokens: 15,000 requests/hour vs. a classic PAT's 5,000/hour.
-pub const APP_AUTH_HOURLY_BUDGET: u32 = 15_000;
+// NO HOURLY-BUDGET CONSTANT ON PURPOSE.
+//
+// An installation's rate limit is NOT a fixed number: GitHub scales it with the size of
+// the installation (repositories and users), so any constant compiled in here is a guess
+// that will be wrong for some installations. Measured on the `tzervas` personal-account
+// installation (all repositories, 2026-07-31): **12,500 req/hour**, not the 15,000 that
+// is widely quoted — still 2.5x a classic PAT's 5,000/hour.
+//
+// Printing a guessed budget in the mint log would state a confident wrong number to
+// whoever is debugging a rate-limit problem, which is worse than printing nothing.
+// `ApiPacer` already reads the real values from the `X-RateLimit-*` response headers, and
+// `GET /rate_limit` reports them on demand — both are authoritative where a constant is not.
 
 // --- Configuration / selection -----------------------------------------------
 
@@ -370,9 +381,12 @@ pub(crate) fn installation_token(cfg: &AppAuthConfig) -> Result<String, String> 
         token: token.clone(),
         expires_at_unix,
     });
+    // Deliberately does NOT state an hourly budget — see the note where the constant used
+    // to live. The real limit is installation-dependent; `X-RateLimit-*` and `/rate_limit`
+    // report it accurately, a compiled-in guess does not.
     eprintln!(
         "auth: minted GitHub App installation token (app_id={}, installation_id={}, \
-         expires in {}s, ~{APP_AUTH_HOURLY_BUDGET}/hour budget)",
+         expires in {}s)",
         cfg.app_id,
         cfg.installation_id,
         (expires_at_unix - now).max(0)
