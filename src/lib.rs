@@ -4449,7 +4449,7 @@ fn save_repo_last_polled(path: &std::path::Path, map: &std::collections::HashMap
         .map(|(repo, ts)| format!("{repo}={ts}"))
         .collect();
     // Stable write order for easier debugging / smaller diffs in tests that inspect files.
-    lines.sort();
+    lines.sort_unstable();
     let body = lines.join("\n");
     let body = if body.is_empty() {
         body
