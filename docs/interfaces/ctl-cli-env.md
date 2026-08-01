@@ -11,10 +11,21 @@
 
 | Artifact | Value |
 |----------|--------|
-| Crate / binary | `gha-runner-ctl` |
-| `VERSION` file | `0.3.0` |
-| `Cargo.toml` `package.version` | `0.3.0` |
-| GitHub HTTP User-Agent | `gha-runner-ctl/0.3.0` (`src/lib.rs` `UA`) |
+| Crate | `ap_runner_ctl` |
+| Primary binary | `ap-runner-ctl` |
+| Compat binary | `gha-runner-ctl` (alias, one minor cycle) |
+| `VERSION` file | `0.3.3` |
+| `Cargo.toml` `package.version` | `0.3.3` |
+| GitHub HTTP User-Agent | `ap-runner-ctl/0.3.3` (`src/lib.rs` `UA`) |
+
+**Rename note.** `gha-` asserts *GitHub Actions* only, which stops being true as
+soon as the GitLab `Forge` lands. Renamed while the cost is zero — the crate is
+not on crates.io — per `DESIGN-runner-ctl-forges.md`.
+
+Deliberately **unchanged**: all `GHA_*` env vars, the `$XDG_DATA_HOME/gha-runner-ctl/`
+data path, lock-file prefixes, and the `gha-runner-ctl@*.service` unit names.
+Deployed hosts invoke `~/.local/bin/gha-runner-ctl`, so the alias must ship until
+those units are migrated — dropping it early breaks every host on next restart.
 
 ## Entry behavior
 

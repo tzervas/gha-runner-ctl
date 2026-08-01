@@ -1,20 +1,27 @@
 [package]
-name = "gha_runner_ctl"
+name = "ap_runner_ctl"
 version = "0.3.3"
 edition = "2021"
 rust-version = "1.96"
 license = "MIT"
-description = "One Podman-backed GitHub Actions self-hosted runner: snapshot, auto-register, on-demand up/down"
+description = "Podman-backed self-hosted CI runner control plane: registration, dynamic resource pool, on-demand up/down. GitHub Actions today, GitLab next."
 repository = "https://github.com/tzervas/gha-runner-ctl"
 readme = "README.md"
-keywords = ["github-actions", "self-hosted", "podman", "runner"]
+keywords = ["self-hosted", "podman", "runner", "ci", "github-actions"]
 categories = ["command-line-utilities", "development-tools"]
 publish = true
 
 [lib]
-name = "gha_runner_ctl"
+name = "ap_runner_ctl"
 path = "src/lib.rs"
 
+[[bin]]
+name = "ap-runner-ctl"
+path = "src/main.rs"
+
+# Compat alias for one minor cycle. Deployed systemd units invoke the old path
+# (gha-runner-ctl@cpu.service -> ~/.local/bin/gha-runner-ctl), so removing this
+# before those units are updated would break every host on restart.
 [[bin]]
 name = "gha-runner-ctl"
 path = "src/main.rs"
