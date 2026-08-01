@@ -1,3 +1,8 @@
+# FLEET POLICY (owner, 2026-08-01): ALL GitHub Actions run on self-hosted runners.
+# No GitHub-hosted (cloud) runners, ever. If the fleet is fully down, the unblock is to
+# spawn a single container and register it as a one-off runner — not to fall back to cloud.
+# Consequence, accepted deliberately: while the fleet is unhealthy, gate/aggregator jobs
+# cannot run either, so PRs sit pending rather than failing loudly.
 # Centralized CI — calls tzervas/ap-workflows (renamed from mycelium-workflows).
 #
 # Policy for this gate now lives in one place. Changing it fleet-wide is a commit
@@ -88,7 +93,7 @@ jobs:
         ${{ (inputs.runner == 'self-hosted-fleet'
              || (inputs.runner == '' && (github.base_ref || github.ref_name) == 'main'))
             && '["self-hosted","linux","x64","podman","large"]'
-            || '["ubuntu-latest"]' }}
+            || '["self-hosted","linux","x64","podman"]' }}
 
   release-build:
     # Stands in for the `release-build` reusable-workflow input until
@@ -104,7 +109,7 @@ jobs:
       ${{ (inputs.runner == 'self-hosted-fleet'
            || (inputs.runner == '' && (github.base_ref || github.ref_name) == 'main'))
           && fromJSON('["self-hosted","linux","x64","podman","large"]')
-          || fromJSON('["ubuntu-latest"]') }}
+          || fromJSON('["self-hosted","linux","x64","podman"]') }}
     env:
       CARGO_INCREMENTAL: '0'
     steps:
@@ -134,7 +139,7 @@ jobs:
     name: build
     needs: [ci, release-build]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, podman]
     steps:
       - name: Aggregate the centralized gate
         run: |
