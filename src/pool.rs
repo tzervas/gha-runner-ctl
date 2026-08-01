@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -524,11 +524,40 @@ fn pool_state_path() -> PathBuf {
     if let Ok(p) = std::env::var("GHA_POOL_STATE") {
         return PathBuf::from(p);
     }
+    pool_dir().join("state.json")
+}
+
+fn pool_dir() -> PathBuf {
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
         .unwrap_or_else(|| PathBuf::from("/tmp"));
-    base.join("gha-runner-ctl/pool/state.json")
+    base.join("gha-runner-ctl/pool")
+}
+
+/// Path to the quiesce flag file. Its presence means "admit no new work".
+///
+/// A file rather than a signal: it survives a supervisor restart, is trivially
+/// inspectable by an operator or a deploy script, and needs no PID discovery.
+/// Override with `GHA_QUIESCE_FILE`.
+pub fn quiesce_path() -> PathBuf {
+    if let Ok(p) = std::env::var("GHA_QUIESCE_FILE") {
+        return PathBuf::from(p);
+    }
+    pool_dir().join("quiesce")
+}
+
+/// True while admission is paused. Cheap enough to call every tick.
+pub fn quiesce_active() -> bool {
+    quiesce_active_at(&quiesce_path())
+}
+
+/// Pure form, so the predicate is testable without mutating process env.
+///
+/// A directory does NOT count: a stray `mkdir` should not silently wedge the
+/// fleet into a paused state that looks identical to a deliberate one.
+pub fn quiesce_active_at(path: &Path) -> bool {
+    path.is_file()
 }
 
 /// Shrink request to fit remaining budget (never below min). Returns None if cannot fit min.
@@ -1013,6 +1042,43 @@ pub fn plan_scale(input: &ScaleInput) -> ScalePlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A missing flag file means "run normally". This is the fail-safe direction:
+    /// losing the file must never wedge a host into permanent pause.
+    #[test]
+    fn quiesce_absent_means_active_admission() {
+        let d = std::env::temp_dir().join(format!("gha-quiesce-absent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        assert!(!quiesce_active_at(&d.join("quiesce")));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn quiesce_file_pauses_admission() {
+        let d = std::env::temp_dir().join(format!("gha-quiesce-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("quiesce");
+        std::fs::write(&f, b"").unwrap();
+        assert!(quiesce_active_at(&f));
+        // Removing it resumes admission — quiesce must be reversible without a restart.
+        std::fs::remove_file(&f).unwrap();
+        assert!(!quiesce_active_at(&f));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A directory at the flag path must NOT pause the fleet. A stray mkdir
+    /// would otherwise be indistinguishable from a deliberate pause, and would
+    /// silently stop the host claiming work with no obvious cause.
+    #[test]
+    fn quiesce_directory_does_not_pause() {
+        let d = std::env::temp_dir().join(format!("gha-quiesce-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("quiesce")).unwrap();
+        assert!(!quiesce_active_at(&d.join("quiesce")));
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     /// Regression guard for grok's review catch on #107: the scribe repos name their
     /// cargo build+test job exactly "test", and cargo-mutants names its job "mutants".

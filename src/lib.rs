@@ -4761,6 +4761,9 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
     // Consecutive ticks where the (partial) demand sample was empty.
     // Idle timer starts only after a full prefer-list sweep of empty.
     let mut empty_streak: u32 = 0;
+    // Tracks quiesce state so ENTER/EXIT are logged once on transition rather
+    // than every tick; a deploy script watches for these lines.
+    let mut quiesced = false;
     let mut cli = cli.clone_for_listen();
     let mut pacer = ApiPacer::from_cli(&cli, cli.http());
     let max_local = cli.pool_max_workers.min(pool.max_workers).max(1);
@@ -4798,6 +4801,42 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
             if n > 0 {
                 eprintln!("listen: reaped {n} finished/orphan claim(s) before poll");
             }
+        }
+
+        // Quiesce gate: pause ADMISSION only, deliberately after the reap above.
+        //
+        // In-flight work runs to completion and finished workers are still
+        // reaped, so `running=` converges to zero and a deploy can wait on it.
+        // Placed before github_token() so a quiesced manager makes no API calls
+        // at all — which also means an idle, quiesced host stops waking up to
+        // talk to GitHub.
+        //
+        // Restarting the unit instead would orphan in-flight containers and
+        // cancel their jobs; that is the whole reason this exists.
+        if crate::pool::quiesce_active() {
+            if !quiesced {
+                quiesced = true;
+                eprintln!(
+                    "listen: quiesce ENTER ({}) — admitting no new work; in-flight jobs continue",
+                    crate::pool::quiesce_path().display()
+                );
+            }
+            if dynamic {
+                let w = local_worker_snapshots(&cli, &pool, max_local);
+                let running_n = w.iter().filter(|x| x.running).count();
+                let busy_n = w.iter().filter(|x| x.running && is_busy(x)).count();
+                eprintln!(
+                    "listen: quiesced running={running_n} busy={busy_n} — waiting for drain"
+                );
+            } else {
+                eprintln!("listen: quiesced — admission paused");
+            }
+            thread::sleep(Duration::from_secs(interval));
+            continue;
+        }
+        if quiesced {
+            quiesced = false;
+            eprintln!("listen: quiesce EXIT — resuming admission");
         }
 
         let api = match github_token(&cli) {
