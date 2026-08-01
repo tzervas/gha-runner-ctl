@@ -7,7 +7,15 @@
 | CPU | **16** cores total (all ephemeral workers) |
 | Memory | **16 GiB** total |
 | Max workers | **16–24** (process + host caps) |
-| Single worker ceiling | **8 CPU / 16 GiB** (`xlarge`) or **4 CPU / 8 GiB** (`gpu`) |
+| Single worker ceiling | **20 CPU / 40 GiB** (`xlarge`) or **8 CPU / 16 GiB** (`gpu`) |
+
+The 16c/16 GiB figures above are the built-in *fallback* default for hosts
+that don't set `GHA_POOL_CPUS`/`GHA_POOL_MEMORY` — they are deliberately small
+so an unconfigured pool fails safe on a modest box. They are **not** big enough
+to grant a `large` or `xlarge` job its preferred size (see table below); on a
+fallback-sized pool those jobs shrink toward the free remainder instead. Set
+`GHA_POOL_CPUS`/`GHA_POOL_MEMORY` to match the real host — the tiers below are
+sized for a many-core self-hosted box, not a laptop.
 
 Shared across CPU + GPU soft-slice managers via  
 `$XDG_DATA_HOME/gha-runner-ctl/pool/state.json` (file lock).
@@ -25,12 +33,12 @@ GHA_POOL_MAX_WORKERS=16
 
 | Tier | When | Size |
 |------|------|------|
-| **micro** | gitleaks, trivy, lint, ruff, fmt, security, commitizen… | 0.25 CPU / 512 MiB |
-| **small** | fleet-ci detect, light checks | 0.5 CPU / 1 GiB |
-| **medium** | cargo/pytest/test/check/docs (default) | 2 CPU / 4 GiB |
-| **large** | release, e2e, build-image, “build and test”, local-parity… | 4 CPU / 8 GiB |
-| **xlarge** | workspace-build, chromium, all-features, label `xlarge` | 8 CPU / 16 GiB |
-| **gpu** | label `gpu` / `gpu-slice-*` / `cuda` | 4 CPU / 8 GiB + GPU device |
+| **micro** | gitleaks, trivy, lint, ruff, fmt, security, commitizen… | 1 CPU / 2 GiB |
+| **small** | fleet-ci detect, light checks | 2 CPU / 4 GiB |
+| **medium** | cargo/pytest/test/check/docs (default) | 4 CPU / 8 GiB |
+| **large** | release, e2e, build-image, “build and test”, local-parity… | 12 CPU / 24 GiB |
+| **xlarge** | workspace-build, chromium, all-features, label `xlarge` | 20 CPU / 40 GiB |
+| **gpu** | label `gpu` / `gpu-slice-*` / `cuda` | 8 CPU / 16 GiB + GPU device |
 
 If the preferred size does not fit free budget, the allocator **shrinks** toward the free remainder (floor 0.25c / 256 MiB) or skips until a worker finishes.
 
@@ -39,13 +47,13 @@ If the preferred size does not fit free budget, the allocator **shrinks** toward
 Put a size token on `runs-on` **only when justified**. The worker re-registers with that label so GitHub routes the job correctly.
 
 ```yaml
-# Default — medium (2c/4g). No size label required.
+# Default — medium (4c/8g). No size label required.
 runs-on: [self-hosted, linux, x64, podman]
 
-# Heavy Rust / multi-crate — 4c/8g
+# Heavy Rust / multi-crate — 12c/24g
 runs-on: [self-hosted, linux, x64, podman, large]
 
-# Max single worker — 8c/16g (must be justified: full workspace, chromium, etc.)
+# Max single worker — 20c/40g (must be justified: full workspace, chromium, etc.)
 runs-on: [self-hosted, linux, x64, podman, xlarge]
 
 # GPU (5080 soft-slice listeners) — must include gpu
@@ -64,7 +72,8 @@ On each listen tick (pool mode `dynamic`):
 2. List matching queued/in-progress jobs  
 3. Spawn `container-w{N}` workers until local max or pool full  
 
-Example: eight micro jobs → many small workers under 16c/16g.
+Example: eight micro jobs (1c/2g each = 8c/16g) fill the default 16c/16g pool;
+size `GHA_POOL_CPUS`/`GHA_POOL_MEMORY` to the real host for actual concurrency.
 
 ## GPU slices
 

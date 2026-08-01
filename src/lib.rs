@@ -10,6 +10,7 @@
 //! multiple ephemeral workers sized from job complexity within a host budget
 //! (default 8 CPU / 8 GiB shared across all managers).
 
+mod appauth;
 mod image_arch;
 mod pool;
 
@@ -27,6 +28,7 @@ pub use pool::{
 
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -50,6 +52,9 @@ const DEFAULT_RUNNER_SHA256: &str =
 const DEFAULT_RUNNER_ARCH: &str = "x64";
 const UA: &str = "gha-runner-ctl/0.3.0";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
+/// Production GitHub REST base, **without** a trailing slash. Previously inlined into
+/// every `format!` that built an API URL; now the default of [`HttpConfig`].
+const GITHUB_API_BASE: &str = "https://api.github.com";
 const MIN_POLL_SECS: u64 = 5;
 const MAX_POLL_SECS: u64 = 3600;
 const MIN_IDLE_SECS: u64 = 30;
@@ -376,9 +381,42 @@ pub struct Cli {
     /// job arch labels at spawn; CLI/env override applies to single-container `up`.
     #[arg(long, env = "GHA_PLATFORM", global = true)]
     platform: Option<String>,
+
+    /// GitHub App ID for installation-token auth (an alternative to GH_TOKEN/PAT with a
+    /// much higher, installation-scoped rate limit). Requires --app-private-key too.
+    /// See docs/GITHUB_APP_AUTH.md. Setting only some App-auth flags is a hard error,
+    /// not a silent fall-back to GH_TOKEN — run `doctor` to check what's configured.
+    #[arg(long, env = "GHA_APP_ID", global = true)]
+    app_id: Option<String>,
+
+    /// GitHub App installation id. Optional: when omitted (with --app-id and
+    /// --app-private-key set), it is auto-discovered via `GET /app/installations` —
+    /// picking an owner-matched installation if `--owner`/`--user`/`--repo`'s owner
+    /// disambiguates, else the sole installation, else failing with the list of
+    /// candidates. See `doctor` and docs/GITHUB_APP_AUTH.md.
+    #[arg(long, env = "GHA_APP_INSTALLATION_ID", global = true)]
+    app_installation_id: Option<String>,
+
+    /// GitHub App private key: `secret:<group>/<key>` (recommended — retrieved from the
+    /// vault via the `secret` CLI, decrypted only into a 0600 tmpfs file for the span of
+    /// a signing operation), `file:<path>`, or a bare filesystem path. Never inline PEM
+    /// content — that is refused outright (readable via `/proc/<pid>/environ`, leaks
+    /// into shell history / env dumps / CI logs, can't be chmod-restricted).
+    #[arg(long, env = "GHA_APP_PRIVATE_KEY", global = true)]
+    app_private_key: Option<String>,
 }
 
 impl Cli {
+    /// The HTTP seam configuration for this invocation.
+    ///
+    /// This is the **single** place production code decides which host it talks to.
+    /// Today it is unconditionally GitHub; it is a method on `Cli` rather than a bare
+    /// constant so that the eventual forge selection has exactly one seat to take,
+    /// and so every call site already reads `cli.http()` instead of a literal.
+    fn http(&self) -> HttpConfig {
+        HttpConfig::github()
+    }
+
     /// Resolves the flat repo allowlist, preferring the honestly-named `GHA_ALLOWLIST_REPOS`
     /// over the deprecated `GHA_PREFER_REPOS` (WP-09 rename: it's an allowlist, not an
     /// ordering). If both are set, `GHA_ALLOWLIST_REPOS` wins silently — no need to warn about
@@ -405,6 +443,38 @@ impl Cli {
             .as_ref()
             .or(self.prefer_repos.as_ref())
             .cloned()
+    }
+
+    /// Build a GitHub App auth config from the already-clap-resolved `--app-*` fields
+    /// (flag beats env, exactly like every other option — clap did that resolution when
+    /// it parsed `Cli`, so this just reads the fields; it never touches `std::env::var`
+    /// itself). `Ok(None)` means "nothing App-auth-shaped is set, use GH_TOKEN/PAT."
+    /// `Err` means App auth was *attempted* but is incomplete or invalid — callers must
+    /// treat that as a hard failure, not a silent fall-back (see `appauth` module docs).
+    fn app_auth_config(&self) -> Result<Option<appauth::AppAuthConfig>, String> {
+        appauth::resolve_app_auth_config(|k| match k {
+            "GHA_APP_ID" => self.app_id.clone(),
+            "GHA_APP_INSTALLATION_ID" => self.app_installation_id.clone(),
+            "GHA_APP_PRIVATE_KEY" => self.app_private_key.clone(),
+            _ => None,
+        })
+    }
+
+    /// Best-effort owner login to disambiguate App-auth installation auto-discovery:
+    /// `--owner` (org scope), else `--user` (user scope), else the owner half of
+    /// `--repo owner/name`. `None` when nothing is resolved yet (e.g. `doctor` run with
+    /// no scope flags at all) — auto-discovery still works via the sole-installation
+    /// fallback, it just can't disambiguate multiple installations without this.
+    fn app_auth_owner_hint(&self) -> Option<String> {
+        self.owner
+            .clone()
+            .or_else(|| self.user.clone())
+            .or_else(|| {
+                self.repo
+                    .as_ref()
+                    .and_then(|r| r.split('/').next())
+                    .map(str::to_string)
+            })
     }
 }
 
@@ -458,6 +528,14 @@ pub enum Cmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Check auth configuration without printing secrets: which credential path is
+    /// active (GitHub App vs GH_TOKEN/PAT/gh/GCM/config/interactive), App identity +
+    /// installation + granted permissions when App auth is configured, and the live
+    /// `GET /rate_limit` budget. A separate command (not folded into `status`, which
+    /// reports container/volume/registration state and requires a resolved scope) so
+    /// it runs with no other flags and exits non-zero with actionable text per failed
+    /// check — the thing to run first when a repo/user says jobs aren't picking up.
+    Doctor,
 }
 
 /// Dump troubleshooting context after a failure (no secrets).
@@ -628,11 +706,33 @@ pub fn prevent_raw_token_args() {
                 std::process::exit(127);
             }
         }
+        // Same rationale, for App private key material: `--app-private-key` only ever
+        // accepts `secret:<group>/<key>`, `file:<path>`, or a bare path — inline PEM on
+        // argv would land in /proc/<pid>/cmdline and shell history just like a raw PAT.
+        if arg.contains("-----BEGIN") {
+            eprintln!(
+                "gha-runner-ctl ERROR: inline PEM key material detected in command line arguments!"
+            );
+            eprintln!("--app-private-key only accepts secret:<group>/<key>, file:<path>, or a bare path — never inline key content.");
+            eprintln!("\nTo scrub this command from your shell history:");
+            eprintln!("  - In Bash: history -d $(history | tail -n 2 | head -n 1 | awk '{{print $1}}') (or edit ~/.bash_history)");
+            eprintln!("  - In Zsh:  fc -W && fc -R (or edit ~/.zsh_history)");
+            std::process::exit(127);
+        }
     }
 }
 
 pub fn run() -> Result<(), String> {
     let mut cli = Cli::parse();
+
+    // `doctor` is a read-only diagnostic and deliberately bypasses scope resolution/
+    // validation (which requires --repo/--owner/--user or --auto): it should run with
+    // no other flags at all, since its whole point is "check auth before anything else
+    // needs a resolved target."
+    if matches!(cli.cmd, Some(Cmd::Doctor)) {
+        return doctor(&cli);
+    }
+
     resolve_cli(&mut cli)?;
     validate_cli(&cli)?;
 
@@ -692,19 +792,21 @@ pub fn run() -> Result<(), String> {
         }
         Cmd::Warm { gap_secs, start } => warm(&cli, gap_secs, start),
         Cmd::Recover { prune_exited, json } => recover(&cli, prune_exited, json),
+        Cmd::Doctor => doctor(&cli),
     }
 }
 
 // --- Resolve auto / batch context --------------------------------------------
 
-fn get_user_login_from_token(token: &str) -> Result<String, String> {
+fn get_user_login_from_token(token: &str, http: &HttpConfig) -> Result<String, String> {
     #[derive(Deserialize)]
     struct UserResponse {
         login: String,
     }
 
-    let resp = http_agent()
-        .get("https://api.github.com/user")
+    let url = http.api_url("user");
+    let resp = http_agent(http)
+        .get(&url)
         .set("Authorization", &format!("Bearer {token}"))
         .set("Accept", "application/vnd.github+json")
         .set("X-GitHub-Api-Version", "2022-11-28")
@@ -766,8 +868,8 @@ fn resolve_cli(cli: &mut Cli) -> Result<(), String> {
     if cli.scope == Scope::User && cli.user.is_none() {
         let u = if let Ok(login) = gh_login() {
             login
-        } else if let Ok(tok) = github_token() {
-            get_user_login_from_token(&tok)?
+        } else if let Ok(tok) = github_token(cli) {
+            get_user_login_from_token(&tok, &cli.http())?
         } else {
             return Err("Could not resolve authenticated user login. Please log in using 'gh auth login' or provide a token.".into());
         };
@@ -1274,19 +1376,19 @@ fn github_url(cli: &Cli) -> String {
     }
 }
 
-fn registration_api_for_repo(repo: &str) -> String {
-    format!("https://api.github.com/repos/{repo}/actions/runners/registration-token")
+fn registration_api_for_repo(repo: &str, http: &HttpConfig) -> String {
+    http.api_url(&format!("repos/{repo}/actions/runners/registration-token"))
 }
 
-fn registration_api(cli: &Cli) -> String {
+fn registration_api(cli: &Cli, http: &HttpConfig) -> String {
     match cli.scope {
         Scope::Repo | Scope::User => {
-            registration_api_for_repo(cli.repo.as_ref().expect("validated"))
+            registration_api_for_repo(cli.repo.as_ref().expect("validated"), http)
         }
-        Scope::Org => format!(
-            "https://api.github.com/orgs/{}/actions/runners/registration-token",
+        Scope::Org => http.api_url(&format!(
+            "orgs/{}/actions/runners/registration-token",
             cli.owner.as_ref().expect("validated")
-        ),
+        )),
     }
 }
 
@@ -1544,7 +1646,11 @@ fn install_gcm() -> Result<(), String> {
 
     let dest_path = std::env::temp_dir().join(format!("gcm-{ver}.deb"));
 
-    let resp = http_agent()
+    // Deliberately NOT parameterised on the forge: this is a fixed vendor artifact on
+    // github.com/releases (the GCM project's own tarball), not a call against whichever
+    // forge we are registering runners with. It goes through the seam only to inherit
+    // the shared UA and timeouts.
+    let resp = http_agent(&HttpConfig::github())
         .get(&url)
         .call()
         .map_err(|e| format!("Failed to download GCM deb package: {e}"))?;
@@ -1629,19 +1735,60 @@ fn prompt_token_interactively() -> Option<String> {
     }
 }
 
-fn github_token() -> Result<String, String> {
+/// Which credential path produced a token — reported by `doctor`, otherwise
+/// discarded. Never carries the token itself.
+enum TokenSource {
+    GithubApp,
+    EnvVar(&'static str),
+    GitCredentialHelper,
+    GhCli,
+    ConfigFile,
+    Interactive,
+}
+
+impl fmt::Display for TokenSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TokenSource::GithubApp => write!(f, "GitHub App installation token"),
+            TokenSource::EnvVar(name) => write!(f, "{name} environment variable"),
+            TokenSource::GitCredentialHelper => write!(f, "git credential helper (GCM)"),
+            TokenSource::GhCli => write!(f, "gh CLI (`gh auth token`)"),
+            TokenSource::ConfigFile => write!(f, "config file"),
+            TokenSource::Interactive => write!(f, "interactive prompt"),
+        }
+    }
+}
+
+fn github_token(cli: &Cli) -> Result<String, String> {
+    github_token_with_source(cli).map(|(t, _)| t)
+}
+
+fn github_token_with_source(cli: &Cli) -> Result<(String, TokenSource), String> {
+    // GitHub App auth (opt-in, additive): only engages when --app-id/GHA_APP_ID and
+    // --app-private-key/GHA_APP_PRIVATE_KEY are both set (installation id is optional
+    // — see src/appauth.rs auto-discovery). `Ok(None)` means nothing App-auth-shaped
+    // is configured at all — fall through to the PAT chain below unchanged. Any other
+    // outcome (`Ok(Some(cfg))` or `Err`) is authoritative: a mint failure or a partial/
+    // invalid config is a hard error, never a silent fall-through to the PAT path,
+    // since that could mask a real misconfiguration or mint against the wrong identity.
+    if let Some(cfg) = cli.app_auth_config()? {
+        let token =
+            appauth::installation_token(&cfg, cli.app_auth_owner_hint().as_deref(), &cli.http())?;
+        return Ok((token, TokenSource::GithubApp));
+    }
+
     // 1. Try env variables
     for key in ["GH_TOKEN", "GITHUB_TOKEN"] {
         if let Ok(t) = std::env::var(key) {
             if !t.is_empty() {
-                return Ok(t);
+                return Ok((t, TokenSource::EnvVar(key)));
             }
         }
     }
 
     // 2. Try GCM or git credential helper
     if let Some(t) = get_token_from_git_credential() {
-        return Ok(t);
+        return Ok((t, TokenSource::GitCredentialHelper));
     }
 
     // 3. Try GH CLI
@@ -1654,7 +1801,7 @@ fn github_token() -> Result<String, String> {
         if out.status.success() {
             let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if !t.is_empty() {
-                return Ok(t);
+                return Ok((t, TokenSource::GhCli));
             }
         }
     }
@@ -1663,7 +1810,7 @@ fn github_token() -> Result<String, String> {
     if let Some(cfg) = load_config() {
         if let Some(t) = cfg.github_token {
             if !t.is_empty() {
-                return Ok(t);
+                return Ok((t, TokenSource::ConfigFile));
             }
         }
     }
@@ -1708,7 +1855,7 @@ fn github_token() -> Result<String, String> {
                     }
                 }
             }
-            return Ok(t);
+            return Ok((t, TokenSource::Interactive));
         }
     }
 
@@ -1720,12 +1867,83 @@ struct RegistrationTokenResponse {
     token: String,
 }
 
-fn http_agent() -> ureq::Agent {
+/// The injectable HTTP seam: **every** outbound request in this crate is built from
+/// one of these.
+///
+/// Before this existed, `http_agent()` took no arguments and each call site pasted
+/// `https://api.github.com` into a `format!`, so there was no way to point the client
+/// at anything else — which is why the HTTP paths had zero test coverage.
+///
+/// Production always constructs this via [`HttpConfig::github`] (equivalently
+/// `Cli::http`), which reproduces the previously-hardcoded values byte for byte:
+/// `GITHUB_API_BASE`, `UA`, `HTTP_TIMEOUT`. Tests construct one with
+/// [`HttpConfig::with_api_base`] pointing at a local server.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HttpConfig {
+    /// REST base with **no** trailing slash (`https://api.github.com`).
+    api_base: String,
+    user_agent: String,
+    timeout: Duration,
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self::github()
+    }
+}
+
+impl HttpConfig {
+    /// Production defaults — the exact values that were hardcoded before the seam.
+    pub fn github() -> Self {
+        Self {
+            api_base: GITHUB_API_BASE.to_string(),
+            user_agent: UA.to_string(),
+            timeout: HTTP_TIMEOUT,
+        }
+    }
+
+    /// Point the REST base somewhere else (a test server today; a self-hosted forge
+    /// later). Trailing slashes are stripped so [`HttpConfig::api_url`] always joins
+    /// with exactly one separator.
+    pub fn with_api_base(base: impl Into<String>) -> Self {
+        Self {
+            api_base: base.into().trim_end_matches('/').to_string(),
+            ..Self::github()
+        }
+    }
+
+    /// Override connect/read/write timeouts. Used by tests so a wedged local server
+    /// fails in milliseconds instead of `HTTP_TIMEOUT`.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    pub fn api_base(&self) -> &str {
+        &self.api_base
+    }
+
+    /// Join a **relative** API path onto the configured base.
+    ///
+    /// With the default base this is string-identical to the old inline
+    /// `format!("https://api.github.com/{path}")`, so no production request changes.
+    pub fn api_url(&self, path: &str) -> String {
+        format!("{}/{}", self.api_base, path.trim_start_matches('/'))
+    }
+}
+
+/// Build the ureq agent for a given seam configuration.
+///
+/// Takes `&HttpConfig` rather than reading the constants directly — that parameter is
+/// the whole point of this function; bypassing it is what the HTTP tests are written
+/// to catch.
+fn http_agent(http: &HttpConfig) -> ureq::Agent {
     ureq::AgentBuilder::new()
-        .timeout_connect(HTTP_TIMEOUT)
-        .timeout_read(HTTP_TIMEOUT)
-        .timeout_write(HTTP_TIMEOUT)
-        .user_agent(UA)
+        .timeout_connect(http.timeout)
+        .timeout_read(http.timeout)
+        .timeout_write(http.timeout)
+        .user_agent(&http.user_agent)
         .build()
 }
 
@@ -1739,10 +1957,14 @@ struct ApiPacer {
     max_backoff: Duration,
     /// When set, skip further API until this instant (rate-limit cool-down).
     cool_until: Option<Instant>,
+    /// The HTTP seam every paced request is issued through. Owned by the pacer because
+    /// the pacer is already threaded down the whole demand-poll call chain, so nothing
+    /// on that chain needs a new parameter to reach the seam.
+    http: HttpConfig,
 }
 
 impl ApiPacer {
-    fn from_cli(cli: &Cli) -> Self {
+    fn from_cli(cli: &Cli, http: HttpConfig) -> Self {
         let gap_ms = cli.api_min_gap_ms.clamp(50, 60_000);
         let max_per = cli.api_max_per_poll.clamp(2, 500);
         let backoff = Duration::from_secs(cli.api_backoff_secs.clamp(5, MAX_API_BACKOFF_SECS));
@@ -1751,6 +1973,7 @@ impl ApiPacer {
             max_per_poll: max_per,
             calls_this_poll: 0,
             last_call: None,
+            http,
             backoff,
             max_backoff: Duration::from_secs(MAX_API_BACKOFF_SECS),
             cool_until: None,
@@ -1759,6 +1982,17 @@ impl ApiPacer {
 
     fn begin_poll(&mut self) {
         self.calls_this_poll = 0;
+    }
+
+    /// Absolute URL for a relative API path, via this pacer's seam.
+    ///
+    /// Demand-poll callers build their URL with this instead of pasting
+    /// `https://api.github.com/...` into a `format!`, which is what makes the poll
+    /// path reachable from a test. [`ApiPacer::get`] still takes an absolute URL so
+    /// that `Link: rel="next"` pagination (whose URLs come from the server) works
+    /// unchanged.
+    fn api_url(&self, path: &str) -> String {
+        self.http.api_url(path)
     }
 
     fn cooling(&self) -> Option<Duration> {
@@ -1843,7 +2077,7 @@ impl ApiPacer {
 
     fn get(&mut self, url: &str, api: &str) -> Result<ureq::Response, String> {
         self.wait_turn()?;
-        let result = http_agent()
+        let result = http_agent(&self.http)
             .get(url)
             .set("Authorization", &format!("Bearer {api}"))
             .set("Accept", "application/vnd.github+json")
@@ -1875,9 +2109,15 @@ impl ApiPacer {
                         self.note_rate_limited(retry_after, reset);
                         return Err(format!("status code {status} (rate limited)"));
                     }
-                    return Err(format!("status code {status}"));
+                    return Err(format!(
+                        "status code {status}{}",
+                        FORBIDDEN_NOT_RATE_LIMIT_HINT
+                    ));
                 }
-                if status == 401 || status == 404 {
+                if status == 401 {
+                    return Err(format!("status code {status}{}", UNAUTHORIZED_HINT));
+                }
+                if status == 404 {
                     return Err(format!("status code {status}"));
                 }
                 if !(200..300).contains(&status) {
@@ -1907,12 +2147,34 @@ impl ApiPacer {
                     self.note_rate_limited(retry_after, reset);
                     return Err(format!("status code {code} (rate limited)"));
                 }
+                if code == 403 {
+                    return Err(format!(
+                        "status code {code}{}",
+                        FORBIDDEN_NOT_RATE_LIMIT_HINT
+                    ));
+                }
+                if code == 401 {
+                    return Err(format!("status code {code}{}", UNAUTHORIZED_HINT));
+                }
                 Err(format!("status code {code}"))
             }
             Err(e) => Err(redact(&e.to_string())),
         }
     }
 }
+
+/// Appended to a 403 that `api_status_is_hard_rate_limit` ruled out — this is
+/// deliberately a *different* failure from a rate limit and must not be conflated with
+/// one: a scope 403 means the credential doesn't cover this repo (GitHub App
+/// `repository_selection`, or a PAT's granted scopes), and no amount of backing off
+/// will fix it, unlike a rate limit which resolves on its own.
+const FORBIDDEN_NOT_RATE_LIMIT_HINT: &str = " (not a rate limit — the credential's \
+     installation/token scope likely doesn't cover this repo; run `doctor` to check \
+     the GitHub App's repository_selection or the PAT's scopes)";
+
+/// Appended to a bare 401 from a demand-poll GET.
+const UNAUTHORIZED_HINT: &str = " (credential rejected — expired/revoked token, rotated \
+     App key, or wrong App id; run `doctor` to check)";
 
 /// True when GitHub indicates a hard API rate limit (not a soft permission 403).
 fn api_status_is_hard_rate_limit(status: u16, remaining: Option<u32>, body: Option<&str>) -> bool {
@@ -2103,10 +2365,10 @@ fn note_registration_failure_backoff(secs: u64) {
     thread::sleep(Duration::from_secs(secs));
 }
 
-fn registration_token(cli: &Cli, api_token: &str) -> Result<String, String> {
+fn registration_token(cli: &Cli, api_token: &str, http: &HttpConfig) -> Result<String, String> {
     pace_registration(cli)?;
-    let url = registration_api(cli);
-    let resp = http_agent()
+    let url = registration_api(cli, http);
+    let resp = http_agent(http)
         .post(&url)
         .set("Authorization", &format!("Bearer {api_token}"))
         .set("Accept", "application/vnd.github+json")
@@ -2415,8 +2677,8 @@ fn warm(cli: &Cli, gap_secs: u64, start: bool) -> Result<(), String> {
             }
         } else {
             // Mint token only to prove registration rights (still paced); do not start.
-            let api = github_token()?;
-            match registration_token(&unit, &api) {
+            let api = github_token(&unit)?;
+            match registration_token(&unit, &api, &unit.http()) {
                 Ok(_) => eprintln!("warm: token mint OK for {repo} (not starting)"),
                 Err(e) => eprintln!("warm: token mint failed for {repo}: {}", redact(&e)),
             }
@@ -2961,8 +3223,8 @@ fn up(cli: &Cli) -> Result<(), String> {
         );
         write_env_file(&env_path, "REUSE", cli)?;
     } else {
-        let api = github_token()?;
-        let reg = registration_token(cli, &api)?;
+        let api = github_token(cli)?;
+        let reg = registration_token(cli, &api, &cli.http())?;
         write_env_file(&env_path, &reg, cli)?;
         drop(reg);
         drop(api);
@@ -3178,6 +3440,147 @@ fn status(cli: &Cli) -> Result<(), String> {
     println!("mode: {:?}", cli.mode);
     println!("labels: {}", cli.labels);
     Ok(())
+}
+
+// --- doctor / auth-check -------------------------------------------------------
+
+#[derive(Deserialize)]
+struct RateLimitResponse {
+    resources: RateLimitResources,
+}
+
+#[derive(Deserialize)]
+struct RateLimitResources {
+    core: RateLimitDetail,
+}
+
+#[derive(Deserialize)]
+struct RateLimitDetail {
+    limit: u32,
+    remaining: u32,
+}
+
+/// `GET /rate_limit` for whatever token is active. This is the live figure `doctor`
+/// prints — never a compiled-in constant (installation limits scale with installation
+/// size; a classic PAT is a flat 5,000/hour; neither is safe to hardcode here).
+fn rate_limit_http(token: &str, http: &HttpConfig) -> Result<RateLimitDetail, String> {
+    let resp = http_agent(http)
+        .get("https://api.github.com/rate_limit")
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("Accept", "application/vnd.github+json")
+        .set("X-GitHub-Api-Version", "2022-11-28")
+        .call()
+        .map_err(|e| format!("GET /rate_limit failed: {}", redact(&e.to_string())))?;
+    let status = resp.status();
+    if !(200..300).contains(&status) {
+        return Err(format!("GET /rate_limit failed: HTTP {status}"));
+    }
+    resp.into_json::<RateLimitResponse>()
+        .map(|b| b.resources.core)
+        .map_err(|e| format!("GET /rate_limit response parse failed: {e}"))
+}
+
+/// `gha-runner-ctl doctor`: report which auth path is active and its live health,
+/// without ever printing a token, JWT, or key. See `Cmd::Doctor` for why this is a
+/// separate command from `status`. Each check prints `[PASS]`/`[FAIL]`/`[INFO]` with
+/// actionable text on failure; returns `Err` (non-zero exit) if anything failed.
+fn doctor(cli: &Cli) -> Result<(), String> {
+    println!("gha-runner-ctl doctor");
+    println!("======================");
+    let mut any_fail = false;
+
+    match cli.app_auth_config() {
+        Ok(Some(cfg)) => {
+            println!("[PASS] auth path: GitHub App (app_id={})", cfg.app_id);
+            match appauth::doctor_report(&cfg, cli.app_auth_owner_hint().as_deref(), &cli.http()) {
+                Ok(report) => {
+                    println!(
+                        "[PASS] app: {} (id={}, slug={})",
+                        report.app_name.as_deref().unwrap_or("(name unavailable)"),
+                        report.app_id,
+                        report.app_slug.as_deref().unwrap_or("?")
+                    );
+                    println!(
+                        "[PASS] installation: id={} account={} repository_selection={}",
+                        report.installation_id,
+                        report.account_login,
+                        report.repository_selection.as_deref().unwrap_or("?")
+                    );
+                    let perms_str = if report.permissions.is_empty() {
+                        "(none reported)".to_string()
+                    } else {
+                        report
+                            .permissions
+                            .iter()
+                            .map(|(k, v)| format!("{k}={v}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+                    println!("[PASS] permissions granted: {perms_str}");
+                    let missing = appauth::missing_permissions(&report.permissions);
+                    if missing.is_empty() {
+                        println!(
+                            "[PASS] permissions: cover the documented set (actions:read, \
+                             administration:write, metadata:read)"
+                        );
+                    } else {
+                        let slug = report.app_slug.as_deref().unwrap_or("<app-slug>");
+                        println!(
+                            "[FAIL] permissions: missing/under-scoped: {} — fix at \
+                             https://github.com/settings/apps/{slug}/permissions, then \
+                             approve the update on the account it's installed on",
+                            missing.join(", ")
+                        );
+                        any_fail = true;
+                    }
+                }
+                Err(e) => {
+                    println!("[FAIL] app auth: {}", redact(&e));
+                    any_fail = true;
+                }
+            }
+        }
+        Ok(None) => {
+            println!(
+                "[INFO] auth path: not using GitHub App auth (--app-id/GHA_APP_ID and/or \
+                 --app-private-key/GHA_APP_PRIVATE_KEY not set)"
+            );
+        }
+        Err(e) => {
+            println!("[FAIL] app auth configuration: {}", redact(&e));
+            any_fail = true;
+        }
+    }
+
+    match github_token_with_source(cli) {
+        Ok((token, source)) => {
+            println!("[PASS] token acquired via {source}");
+            match rate_limit_http(&token, &cli.http()) {
+                Ok(rl) => {
+                    println!(
+                        "[PASS] rate limit (core, live): {}/{} remaining",
+                        rl.remaining, rl.limit
+                    );
+                }
+                Err(e) => {
+                    println!("[FAIL] rate limit check: {}", redact(&e));
+                    any_fail = true;
+                }
+            }
+        }
+        Err(e) => {
+            println!("[FAIL] token acquisition: {}", redact(&e));
+            any_fail = true;
+        }
+    }
+
+    println!("======================");
+    if any_fail {
+        Err("doctor: one or more checks failed (see [FAIL] lines above)".to_string())
+    } else {
+        println!("all checks passed");
+        Ok(())
+    }
 }
 
 // --- Demand ------------------------------------------------------------------
@@ -3548,7 +3951,7 @@ fn demand(cli: &Cli, api: &str, pacer: &mut ApiPacer) -> Result<(bool, Option<St
         }
         Scope::Org => {
             let owner = cli.owner.as_ref().expect("validated");
-            let url = format!("https://api.github.com/orgs/{owner}/repos?per_page=100&type=all");
+            let url = pacer.api_url(&format!("orgs/{owner}/repos?per_page=100&type=all"));
             let repos = list_repos_paginated(&url, api, pacer)?;
             for r in repos {
                 if r.archived.unwrap_or(false) || !is_safe_repo(&r.full_name) {
@@ -3593,9 +3996,9 @@ fn demand(cli: &Cli, api: &str, pacer: &mut ApiPacer) -> Result<(bool, Option<St
                 pacer.max_per_poll,
                 pacer.min_gap.as_millis()
             );
-            let url = format!(
-                "https://api.github.com/users/{user}/repos?type=owner&per_page=100&sort=updated"
-            );
+            let url = pacer.api_url(&format!(
+                "users/{user}/repos?type=owner&per_page=100&sort=updated"
+            ));
             let repos = list_repos_paginated(&url, api, pacer)?;
             for r in repos {
                 if r.archived.unwrap_or(false) || r.fork.unwrap_or(false) {
@@ -3687,8 +4090,9 @@ fn repo_needs_runner(
 ) -> Result<bool, String> {
     // Only probe "queued" first (cheaper); check in_progress only if needed for sticky.
     for status in ["queued", "in_progress"] {
-        let url =
-            format!("https://api.github.com/repos/{repo}/actions/runs?status={status}&per_page=5");
+        let url = pacer.api_url(&format!(
+            "repos/{repo}/actions/runs?status={status}&per_page=5"
+        ));
         let runs = match fetch_runs(&url, api, pacer) {
             Ok(r) => r,
             Err(e) if is_soft_api_err(&e) => {
@@ -3785,7 +4189,7 @@ fn collect_jobs_for_run(
     api: &str,
     pacer: &mut ApiPacer,
 ) -> Result<Vec<DemandJob>, String> {
-    let url = format!("https://api.github.com/repos/{repo}/actions/runs/{run_id}/jobs");
+    let url = pacer.api_url(&format!("repos/{repo}/actions/runs/{run_id}/jobs"));
     let resp = pacer
         .get(&url, api)
         .map_err(|e| format!("list jobs: {}", redact(&e)))?;
@@ -3870,9 +4274,9 @@ fn list_demand_jobs(
                 if out.len() >= max_jobs {
                     break;
                 }
-                let url = format!(
-                    "https://api.github.com/repos/{name}/actions/runs?status={status}&per_page=5"
-                );
+                let url = pacer.api_url(&format!(
+                    "repos/{name}/actions/runs?status={status}&per_page=5"
+                ));
                 let runs = match fetch_runs(&url, api, pacer) {
                     Ok(r) => r,
                     Err(e) if is_soft_api_err(&e) => {
@@ -3966,7 +4370,7 @@ fn ensure_worker_volume(cli: &Cli, worker_volume: &str) -> Result<(), String> {
         "--security-opt",
         "no-new-privileges",
         "--entrypoint",
-        "/bin/sh",
+        "/bin/bash",
         "-v",
         &format!("{base_volume}:/from:ro,Z"),
         "-v",
@@ -4458,7 +4862,7 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
     // Idle timer starts only after a full prefer-list sweep of empty.
     let mut empty_streak: u32 = 0;
     let mut cli = cli.clone_for_listen();
-    let mut pacer = ApiPacer::from_cli(&cli);
+    let mut pacer = ApiPacer::from_cli(&cli, cli.http());
     let max_local = cli.pool_max_workers.min(pool.max_workers).max(1);
     // Effective partial-scan width for the empty-sweep gate (mirrors list_demand_jobs).
     let scan_width: usize = if dynamic {
@@ -4496,7 +4900,7 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
             }
         }
 
-        let api = match github_token() {
+        let api = match github_token(&cli) {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("listen: auth: {}", redact(&e));
@@ -4756,7 +5160,7 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
 
             // Vertical size for single worker from first matching job name if any
             if need {
-                if let Ok(api2) = github_token() {
+                if let Ok(api2) = github_token(&cli) {
                     if let Ok(jobs) = list_demand_jobs(&cli, &api2, &mut pacer, 1) {
                         if let Some(j) = jobs.first() {
                             let tier = size_for_job(&j.job_name, &j.labels, cli.gpu);
@@ -4875,6 +5279,9 @@ impl Cli {
             public_only: self.public_only,
             private_only: self.private_only,
             all_repos: self.all_repos,
+            app_id: self.app_id.clone(),
+            app_installation_id: self.app_installation_id.clone(),
+            app_private_key: self.app_private_key.clone(),
         }
     }
 }
@@ -4932,6 +5339,9 @@ struct CliSnap {
     public_only: bool,
     private_only: bool,
     all_repos: bool,
+    app_id: Option<String>,
+    app_installation_id: Option<String>,
+    app_private_key: Option<String>,
 }
 
 fn cli_snapshot(cli: &Cli) -> CliSnap {
@@ -4988,6 +5398,9 @@ fn cli_snapshot(cli: &Cli) -> CliSnap {
         public_only: cli.public_only,
         private_only: cli.private_only,
         all_repos: cli.all_repos,
+        app_id: cli.app_id.clone(),
+        app_installation_id: cli.app_installation_id.clone(),
+        app_private_key: cli.app_private_key.clone(),
     }
 }
 
@@ -5047,6 +5460,9 @@ fn snap_to_cli(s: &CliSnap) -> Cli {
         public_only: s.public_only,
         private_only: s.private_only,
         all_repos: s.all_repos,
+        app_id: s.app_id.clone(),
+        app_installation_id: s.app_installation_id.clone(),
+        app_private_key: s.app_private_key.clone(),
     }
 }
 
@@ -5149,6 +5565,13 @@ fn wake_server(port: u16, snap: CliSnap, token: String) {
 #[cfg(test)]
 mod robust_queue_tests {
     use super::*;
+
+    /// Guards every test below that reads or writes the process-wide `GHA_APP_ID` /
+    /// `GHA_APP_INSTALLATION_ID` / `GHA_APP_PRIVATE_KEY` env vars. `std::env::set_var`
+    /// is process-global and Rust runs tests on multiple threads by default, so without
+    /// this a test asserting "none of these are set" can observe a sibling test's var
+    /// mid-flight. Every test in that group takes this lock for its whole body.
+    static APP_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn lock_is_stale_grace_protects_mid_creation_and_live_pid() {
@@ -5253,6 +5676,613 @@ mod robust_queue_tests {
     fn normalize_podman_started_at_iso() {
         let raw = "2026-07-21T19:52:33.909118621Z";
         assert_eq!(normalize_podman_started_at(raw), "2026-07-21 19:52:33 UTC");
+    }
+
+    // --- App-auth CLI surface: flag-vs-env precedence, matches every other option ---
+    //
+    // These mutate the process-wide GHA_APP_* env vars, which is inherently racy
+    // against any *other* test reading the same names — but nothing else in this
+    // binary does (they're unique to App auth), so this follows existing precedent
+    // (e.g. `dynamic_pool`'s GHA_POOL_* env writes) rather than needing extra machinery.
+    // Each test clears what it set so it doesn't leak into a neighbor.
+
+    #[test]
+    fn cli_app_id_flag_beats_env_and_env_is_used_when_flag_absent() {
+        // Both assertions mutate the same process-wide GHA_APP_ID var, so they live in
+        // one test (guaranteed sequential within a single thread) rather than two —
+        // splitting them would race any other test/thread reading GHA_APP_ID mid-run.
+        let _guard = APP_ENV_TEST_LOCK.lock().unwrap();
+        use clap::Parser as _;
+
+        std::env::set_var("GHA_APP_ID", "111111");
+        let flag_wins =
+            Cli::try_parse_from(["gha-runner-ctl", "--app-id", "222222", "status"]).unwrap();
+        assert_eq!(
+            flag_wins.app_id.as_deref(),
+            Some("222222"),
+            "an explicit --app-id must win over GHA_APP_ID, exactly like every other flag"
+        );
+
+        let env_used = Cli::try_parse_from(["gha-runner-ctl", "status"]).unwrap();
+        assert_eq!(env_used.app_id.as_deref(), Some("111111"));
+
+        std::env::remove_var("GHA_APP_ID");
+    }
+
+    #[test]
+    fn cli_app_installation_id_and_private_key_flags_and_env_both_populate_cli() {
+        let _guard = APP_ENV_TEST_LOCK.lock().unwrap();
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from([
+            "gha-runner-ctl",
+            "--app-id",
+            "4451176",
+            "--app-installation-id",
+            "150429495",
+            "--app-private-key",
+            "secret:runner/gha-app-key",
+            "status",
+        ])
+        .unwrap();
+        assert_eq!(cli.app_id.as_deref(), Some("4451176"));
+        assert_eq!(cli.app_installation_id.as_deref(), Some("150429495"));
+        assert_eq!(
+            cli.app_private_key.as_deref(),
+            Some("secret:runner/gha-app-key")
+        );
+
+        std::env::set_var("GHA_APP_PRIVATE_KEY", "file:/etc/gha/key.pem");
+        let cli_env = Cli::try_parse_from(["gha-runner-ctl", "status"]).unwrap();
+        std::env::remove_var("GHA_APP_PRIVATE_KEY");
+        assert_eq!(
+            cli_env.app_private_key.as_deref(),
+            Some("file:/etc/gha/key.pem")
+        );
+    }
+
+    #[test]
+    fn cli_app_installation_id_is_optional() {
+        let _guard = APP_ENV_TEST_LOCK.lock().unwrap();
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from([
+            "gha-runner-ctl",
+            "--app-id",
+            "1",
+            "--app-private-key",
+            "file:/k.pem",
+            "status",
+        ])
+        .unwrap();
+        assert_eq!(cli.app_installation_id, None);
+    }
+
+    #[test]
+    fn cli_app_auth_config_partial_is_a_hard_error_naming_the_missing_flag() {
+        let _guard = APP_ENV_TEST_LOCK.lock().unwrap();
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from(["gha-runner-ctl", "--app-id", "123456", "status"]).unwrap();
+        let err = cli.app_auth_config().unwrap_err();
+        assert!(err.contains("app-private-key"), "{err}");
+    }
+
+    #[test]
+    fn cli_app_auth_config_none_set_falls_back_silently() {
+        let _guard = APP_ENV_TEST_LOCK.lock().unwrap();
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from(["gha-runner-ctl", "status"]).unwrap();
+        assert!(cli.app_auth_config().unwrap().is_none());
+    }
+
+    #[test]
+    fn cli_app_auth_owner_hint_prefers_owner_then_user_then_repo() {
+        use clap::Parser as _;
+        let by_owner = Cli::try_parse_from([
+            "gha-runner-ctl",
+            "--owner",
+            "org-owner",
+            "--user",
+            "user-login",
+            "--repo",
+            "repo-owner/name",
+            "status",
+        ])
+        .unwrap();
+        assert_eq!(by_owner.app_auth_owner_hint().as_deref(), Some("org-owner"));
+
+        let by_user =
+            Cli::try_parse_from(["gha-runner-ctl", "--user", "user-login", "status"]).unwrap();
+        assert_eq!(by_user.app_auth_owner_hint().as_deref(), Some("user-login"));
+
+        let by_repo =
+            Cli::try_parse_from(["gha-runner-ctl", "--repo", "repo-owner/name", "status"]).unwrap();
+        assert_eq!(by_repo.app_auth_owner_hint().as_deref(), Some("repo-owner"));
+
+        let none = Cli::try_parse_from(["gha-runner-ctl", "status"]).unwrap();
+        assert_eq!(none.app_auth_owner_hint(), None);
+    }
+
+    #[test]
+    fn doctor_subcommand_parses() {
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from(["gha-runner-ctl", "doctor"]).unwrap();
+        assert!(matches!(cli.cmd, Some(Cmd::Doctor)));
+    }
+}
+
+/// Tests that drive **real HTTP** through [`HttpConfig`] — the seam added so that the
+/// registration and demand-poll paths are reachable without talking to github.com.
+///
+/// Every test here asserts on what a local server actually received. That is the point:
+/// if a call site stops going through the seam and pastes `https://api.github.com` back
+/// into a `format!`, the local server records nothing and these tests fail. They cannot
+/// pass by accident and they cannot pass while bypassed.
+#[cfg(test)]
+mod http_seam_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// A request exactly as the server saw it on the wire.
+    #[derive(Clone, Debug)]
+    struct SeenRequest {
+        method: String,
+        /// Path + query, verbatim.
+        url: String,
+        authorization: Option<String>,
+        accept: Option<String>,
+        api_version: Option<String>,
+        user_agent: Option<String>,
+    }
+
+    /// One canned reply, matched by method + exact path-with-query.
+    struct Route {
+        method: &'static str,
+        url: String,
+        status: u16,
+        body: &'static str,
+        /// Extra response headers (name, value), e.g. `Retry-After`.
+        headers: Vec<(&'static str, &'static str)>,
+    }
+
+    impl Route {
+        fn get(url: &str, status: u16, body: &'static str) -> Self {
+            Self {
+                method: "GET",
+                url: url.to_string(),
+                status,
+                body,
+                headers: Vec::new(),
+            }
+        }
+
+        fn post(url: &str, status: u16, body: &'static str) -> Self {
+            Self {
+                method: "POST",
+                url: url.to_string(),
+                status,
+                body,
+                headers: Vec::new(),
+            }
+        }
+
+        fn header(mut self, name: &'static str, value: &'static str) -> Self {
+            self.headers.push((name, value));
+            self
+        }
+    }
+
+    /// Status returned for a request no route matched. Deliberately *not* one of the
+    /// codes [`is_soft_api_err`] swallows, so an unrouted request surfaces loudly
+    /// instead of being mistaken for "no work queued".
+    const UNROUTED: u16 = 599;
+
+    /// A synchronous loopback HTTP server (tiny_http) that serves a fixed route table
+    /// and records every request.
+    struct TestServer {
+        base: String,
+        seen: Arc<Mutex<Vec<SeenRequest>>>,
+        server: Arc<tiny_http::Server>,
+        joiner: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl TestServer {
+        fn start(routes: Vec<Route>) -> Self {
+            let server =
+                Arc::new(tiny_http::Server::http("127.0.0.1:0").expect("bind loopback port"));
+            let addr = server
+                .server_addr()
+                .to_ip()
+                .expect("loopback listener has an IP address");
+            let base = format!("http://{addr}");
+            let seen: Arc<Mutex<Vec<SeenRequest>>> = Arc::new(Mutex::new(Vec::new()));
+
+            let srv = Arc::clone(&server);
+            let sink = Arc::clone(&seen);
+            let joiner = std::thread::spawn(move || {
+                for req in srv.incoming_requests() {
+                    let record = {
+                        // `HeaderField::equiv` compares against a `&'static str`.
+                        let header = |name: &'static str| -> Option<String> {
+                            req.headers()
+                                .iter()
+                                .find(|h| h.field.equiv(name))
+                                .map(|h| h.value.as_str().to_string())
+                        };
+                        SeenRequest {
+                            method: req.method().as_str().to_string(),
+                            url: req.url().to_string(),
+                            authorization: header("Authorization"),
+                            accept: header("Accept"),
+                            api_version: header("X-GitHub-Api-Version"),
+                            user_agent: header("User-Agent"),
+                        }
+                    };
+
+                    let hit = routes
+                        .iter()
+                        .find(|r| r.method == record.method && r.url == record.url);
+                    let (status, body, extra) = match hit {
+                        Some(r) => (r.status, r.body, r.headers.as_slice()),
+                        None => (UNROUTED, "{\"unrouted\":true}", &[][..]),
+                    };
+                    sink.lock().expect("seen sink").push(record);
+
+                    let mut resp = tiny_http::Response::from_string(body)
+                        .with_status_code(status)
+                        .with_header(
+                            tiny_http::Header::from_bytes(
+                                &b"Content-Type"[..],
+                                &b"application/json"[..],
+                            )
+                            .expect("content-type header"),
+                        );
+                    for (name, value) in extra {
+                        resp = resp.with_header(
+                            tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes())
+                                .expect("extra header"),
+                        );
+                    }
+                    let _ = req.respond(resp);
+                }
+            });
+
+            Self {
+                base,
+                seen,
+                server,
+                joiner: Some(joiner),
+            }
+        }
+
+        /// Base URL to hand to [`HttpConfig::with_api_base`].
+        fn base(&self) -> &str {
+            &self.base
+        }
+
+        fn seen(&self) -> Vec<SeenRequest> {
+            self.seen.lock().expect("seen sink").clone()
+        }
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            self.server.unblock();
+            if let Some(j) = self.joiner.take() {
+                let _ = j.join();
+            }
+        }
+    }
+
+    /// Config pointed at `server`, with timeouts short enough that a wedged server
+    /// fails the test in seconds rather than `HTTP_TIMEOUT`.
+    fn test_http(server: &TestServer) -> HttpConfig {
+        HttpConfig::with_api_base(server.base()).with_timeout(Duration::from_secs(5))
+    }
+
+    /// Redirect host-wide registration-pace state (see [`reg_pace_paths`]) into a
+    /// private directory. Without this the tests would read and mutate the real
+    /// hourly registration budget of any listener running on the same machine.
+    fn isolate_runtime_dir() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let dir = std::env::temp_dir().join(format!("ghar-http-seam-{}", std::process::id()));
+            let _ = fs::create_dir_all(&dir);
+            std::env::set_var("XDG_RUNTIME_DIR", &dir);
+        });
+    }
+
+    fn cli_for(args: &[&str]) -> Cli {
+        let mut argv = vec!["gha-runner-ctl"];
+        argv.extend_from_slice(args);
+        Cli::try_parse_from(argv).expect("test CLI parses")
+    }
+
+    fn assert_github_headers(req: &SeenRequest, token: &str) {
+        assert_eq!(
+            req.authorization.as_deref(),
+            Some(format!("Bearer {token}").as_str()),
+            "Authorization must reach the wire unchanged"
+        );
+        assert_eq!(req.accept.as_deref(), Some("application/vnd.github+json"));
+        assert_eq!(req.api_version.as_deref(), Some("2022-11-28"));
+        assert_eq!(
+            req.user_agent.as_deref(),
+            Some(UA),
+            "the seam must still stamp the crate UA"
+        );
+    }
+
+    /// The default config must rebuild the *exact* strings that were hardcoded before
+    /// the seam existed. This is the no-behaviour-change proof: if `api_url` ever
+    /// composes differently (double slash, missing slash, changed host), production
+    /// requests change and this fails.
+    #[test]
+    fn default_config_reproduces_the_previously_hardcoded_urls() {
+        let http = HttpConfig::github();
+        assert_eq!(http.api_base(), "https://api.github.com");
+        assert_eq!(http.api_url("user"), "https://api.github.com/user");
+        assert_eq!(
+            registration_api_for_repo("owner/repo", &http),
+            "https://api.github.com/repos/owner/repo/actions/runners/registration-token"
+        );
+        assert_eq!(
+            http.api_url("orgs/acme/actions/runners/registration-token"),
+            "https://api.github.com/orgs/acme/actions/runners/registration-token"
+        );
+        assert_eq!(
+            http.api_url("repos/owner/repo/actions/runs?status=queued&per_page=5"),
+            "https://api.github.com/repos/owner/repo/actions/runs?status=queued&per_page=5"
+        );
+        assert_eq!(
+            http.api_url("repos/owner/repo/actions/runs/42/jobs"),
+            "https://api.github.com/repos/owner/repo/actions/runs/42/jobs"
+        );
+        assert_eq!(
+            http.api_url("orgs/acme/repos?per_page=100&type=all"),
+            "https://api.github.com/orgs/acme/repos?per_page=100&type=all"
+        );
+        assert_eq!(
+            http.api_url("users/tzervas/repos?type=owner&per_page=100&sort=updated"),
+            "https://api.github.com/users/tzervas/repos?type=owner&per_page=100&sort=updated"
+        );
+        // Production always resolves to the GitHub defaults today.
+        assert_eq!(cli_for(&["--repo", "owner/repo"]).http(), http);
+    }
+
+    /// A base with a trailing slash must not produce `//` — the join has exactly one
+    /// separator regardless of how the base was written.
+    #[test]
+    fn api_base_join_is_slash_normalised() {
+        let http = HttpConfig::with_api_base("https://example.test/api/v4/");
+        assert_eq!(http.api_base(), "https://example.test/api/v4");
+        assert_eq!(
+            http.api_url("/user/runners"),
+            "https://example.test/api/v4/user/runners"
+        );
+        assert_eq!(
+            http.api_url("user/runners"),
+            "https://example.test/api/v4/user/runners"
+        );
+    }
+
+    /// Drives `registration_token()` — a real POST over a real socket.
+    ///
+    /// Covers the success mint and the rate-limited path, in that order and in one
+    /// test, because both share the host-wide pace lock and must not race.
+    #[test]
+    fn registration_token_posts_through_the_seam() {
+        isolate_runtime_dir();
+
+        let server = TestServer::start(vec![
+            Route::post(
+                "/repos/owner/repo/actions/runners/registration-token",
+                201,
+                "{\"token\":\"AAAA1111BBBB2222\"}",
+            ),
+            Route::post(
+                "/orgs/acme/actions/runners/registration-token",
+                403,
+                "{\"message\":\"rate limited\"}",
+            )
+            .header("Retry-After", "1"),
+        ]);
+        let http = test_http(&server);
+
+        // --- repo scope, success -------------------------------------------------
+        let cli = cli_for(&[
+            "--scope",
+            "repo",
+            "--repo",
+            "owner/repo",
+            "--reg-min-gap-secs",
+            "1",
+            "--reg-max-per-hour",
+            "500",
+        ]);
+        let token =
+            registration_token(&cli, "pat-repo", &http).expect("registration token is minted");
+        assert_eq!(token, "AAAA1111BBBB2222");
+
+        // --- org scope, 403 + Retry-After ---------------------------------------
+        let org_cli = cli_for(&[
+            "--scope",
+            "org",
+            "--owner",
+            "acme",
+            "--reg-min-gap-secs",
+            "1",
+            "--reg-max-per-hour",
+            "500",
+        ]);
+        let err = registration_token(&org_cli, "pat-org", &http)
+            .expect_err("403 must surface as an error");
+        assert!(err.contains("403"), "unexpected error text: {err}");
+
+        // --- what actually went over the wire ------------------------------------
+        let seen = server.seen();
+        assert_eq!(
+            seen.len(),
+            2,
+            "expected exactly the two registration POSTs, got {seen:?}"
+        );
+
+        assert_eq!(seen[0].method, "POST");
+        assert_eq!(
+            seen[0].url, "/repos/owner/repo/actions/runners/registration-token",
+            "repo scope must POST the repo-scoped registration path"
+        );
+        assert_github_headers(&seen[0], "pat-repo");
+
+        assert_eq!(seen[1].method, "POST");
+        assert_eq!(
+            seen[1].url, "/orgs/acme/actions/runners/registration-token",
+            "org scope must POST the org-scoped registration path"
+        );
+        assert_github_headers(&seen[1], "pat-org");
+    }
+
+    /// Drives the demand poll (`repo_needs_runner`) end to end: the runs listing and
+    /// the per-run jobs listing, both issued through `ApiPacer`'s seam.
+    #[test]
+    fn demand_poll_gets_runs_and_jobs_through_the_seam() {
+        let server = TestServer::start(vec![
+            Route::get(
+                "/repos/owner/repo/actions/runs?status=queued&per_page=5",
+                200,
+                "{\"workflow_runs\":[{\"id\":42}]}",
+            ),
+            Route::get(
+                "/repos/owner/repo/actions/runs/42/jobs",
+                200,
+                "{\"jobs\":[{\"name\":\"build\",\"status\":\"queued\",\
+                  \"labels\":[\"self-hosted\",\"linux\",\"podman\"]}]}",
+            ),
+        ]);
+
+        let cli = cli_for(&[
+            "--scope",
+            "repo",
+            "--repo",
+            "owner/repo",
+            "--api-min-gap-ms",
+            "50",
+            "--api-max-per-poll",
+            "8",
+        ]);
+        let mut pacer = ApiPacer::from_cli(&cli, test_http(&server));
+        pacer.begin_poll();
+
+        let needs = repo_needs_runner(&cli, "owner/repo", "pat-demand", &mut pacer)
+            .expect("demand poll succeeds");
+        assert!(needs, "a queued self-hosted job must be reported as demand");
+
+        let seen = server.seen();
+        assert_eq!(
+            seen.len(),
+            2,
+            "expected the runs GET then the jobs GET, got {seen:?}"
+        );
+        assert_eq!(seen[0].method, "GET");
+        assert_eq!(
+            seen[0].url,
+            "/repos/owner/repo/actions/runs?status=queued&per_page=5"
+        );
+        assert_github_headers(&seen[0], "pat-demand");
+
+        assert_eq!(seen[1].method, "GET");
+        assert_eq!(seen[1].url, "/repos/owner/repo/actions/runs/42/jobs");
+        assert_github_headers(&seen[1], "pat-demand");
+
+        // The pacer counted both calls against the per-poll budget.
+        assert_eq!(pacer.calls_this_poll, 2);
+    }
+
+    /// A queued job whose labels do not match must NOT wake the listener — and the
+    /// listener must then also probe `in_progress`. Exercises a second, distinct
+    /// demand request shape through the same seam.
+    #[test]
+    fn demand_poll_probes_in_progress_when_queued_does_not_match() {
+        let server = TestServer::start(vec![
+            Route::get(
+                "/repos/owner/repo/actions/runs?status=queued&per_page=5",
+                200,
+                "{\"workflow_runs\":[{\"id\":7}]}",
+            ),
+            // ubuntu-latest only: no self-hosted/podman baseline, so no demand.
+            Route::get(
+                "/repos/owner/repo/actions/runs/7/jobs",
+                200,
+                "{\"jobs\":[{\"name\":\"lint\",\"status\":\"queued\",\
+                  \"labels\":[\"ubuntu-latest\"]}]}",
+            ),
+            Route::get(
+                "/repos/owner/repo/actions/runs?status=in_progress&per_page=5",
+                200,
+                "{\"workflow_runs\":[]}",
+            ),
+        ]);
+
+        let cli = cli_for(&[
+            "--scope",
+            "repo",
+            "--repo",
+            "owner/repo",
+            "--api-min-gap-ms",
+            "50",
+            "--api-max-per-poll",
+            "8",
+        ]);
+        let mut pacer = ApiPacer::from_cli(&cli, test_http(&server));
+        pacer.begin_poll();
+
+        let needs = repo_needs_runner(&cli, "owner/repo", "pat-demand", &mut pacer)
+            .expect("demand poll succeeds");
+        assert!(
+            !needs,
+            "ubuntu-latest jobs must not wake a self-hosted runner"
+        );
+
+        let urls: Vec<String> = server.seen().into_iter().map(|r| r.url).collect();
+        assert_eq!(
+            urls,
+            vec![
+                "/repos/owner/repo/actions/runs?status=queued&per_page=5",
+                "/repos/owner/repo/actions/runs/7/jobs",
+                "/repos/owner/repo/actions/runs?status=in_progress&per_page=5",
+            ]
+        );
+    }
+
+    /// `get_user_login_from_token` is the third seam call site; prove it too resolves
+    /// its URL from the config rather than a literal.
+    #[test]
+    fn user_login_lookup_goes_through_the_seam() {
+        let server = TestServer::start(vec![Route::get("/user", 200, "{\"login\":\"tzervas\"}")]);
+
+        let login = get_user_login_from_token("pat-user", &test_http(&server))
+            .expect("login resolves from the test server");
+        assert_eq!(login, "tzervas");
+
+        let seen = server.seen();
+        assert_eq!(
+            seen.len(),
+            1,
+            "expected exactly one GET /user, got {seen:?}"
+        );
+        assert_eq!(seen[0].method, "GET");
+        assert_eq!(seen[0].url, "/user");
+        assert_github_headers(&seen[0], "pat-user");
+    }
+
+    /// Guard for the guard: if the seam were bypassed the local server would simply
+    /// see nothing, so confirm that "server saw nothing" is in fact a failing state
+    /// for the assertions above — an unrouted request is not silently tolerated.
+    #[test]
+    fn unrouted_requests_are_not_soft_errors() {
+        assert!(
+            !is_soft_api_err(&format!("status code {UNROUTED}")),
+            "the unrouted status must not be swallowed by the demand poll's soft-error filter, \
+             otherwise a bypassed seam could look like 'no demand' instead of a test failure"
+        );
     }
 }
 
