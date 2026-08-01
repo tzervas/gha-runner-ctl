@@ -1,5 +1,48 @@
 ## Unreleased
 
+### Added — GitHub App installation-token authentication as a first-class CLI feature (opt-in, closes #41)
+
+`listen` re-scans every `GHA_PRIORITY_REPOS` repo every tick — measured on the homelab
+instance at ~4,800 GETs/hour against a classic PAT's 5,000/hour cap, which is why
+`listen: list_demand_jobs: budget exhausted mid-scan` fired on nearly every tick.
+`--app-id`/`GHA_APP_ID` + `--app-private-key`/`GHA_APP_PRIVATE_KEY` mint short-lived
+installation tokens instead — measured 12,500 requests/hour on this fleet's installation
+(2.5x the PAT budget; installation limits scale with installation size, never a
+hardcoded figure — check the live number with `doctor` or `GET /rate_limit`). Purely
+additive: absent App flags/env fall back to the existing `GH_TOKEN`/PAT discovery
+unchanged, so existing deployments need zero config change; *partially*-set App config
+is now a hard error rather than a silent fall-back, so a typo can't quietly masquerade
+as a working PAT setup. RS256 JWT signing shells out to `openssl` (already required on
+the host) instead of adding a crate dependency.
+
+Three additions beyond the original opt-in mint:
+
+- **Real CLI parameters.** `--app-id`, `--app-installation-id`, `--app-private-key`
+  (with `GHA_APP_ID`/`GHA_APP_INSTALLATION_ID`/`GHA_APP_PRIVATE_KEY` env, flag-over-env
+  precedence, all visible in `--help`) — matching the `#[arg(long, env = "...", global =
+  true)]` convention every other option in this tool already follows, instead of the
+  env-var-only mechanism this started as.
+- **Installation auto-discovery.** `--app-installation-id` is now optional: omitted, it's
+  resolved via `GET /app/installations`, preferring an owner-matched installation, then
+  the sole installation, then failing with every candidate `id`/account listed (zero
+  installations names the install URL) — removing a manual copy-paste-prone lookup step.
+- **`doctor` subcommand.** Reports the active auth path, App identity/installation/
+  granted permissions (checked against the documented set), and the live
+  `GET /rate_limit` budget — all without ever printing a token, JWT, or key. Every
+  failure names its fix.
+- **Vault-integrated key handling.** `--app-private-key` accepts `secret:<group>/<key>`
+  (shells out to the existing `secret get` — never reimplements SOPS/age), `file:<path>`,
+  or a bare path. Vault content is auto-detected as raw or base64-encoded PEM. Inline PEM
+  content is refused on both the flag and the env var (and now also blocked at the argv
+  level by `prevent_raw_token_args`, alongside raw PAT patterns). Key files (including
+  the vault form's tmpfs-materialised copy) must be `0600`/`0400` or the run refuses with
+  the offending mode and a `chmod 600` fix; the vault form's temp file is shredded
+  immediately after each signing operation, including on error paths.
+
+See `src/appauth.rs` and [docs/GITHUB_APP_AUTH.md](docs/GITHUB_APP_AUTH.md) for the full
+setup steps (App permissions, installation target, key storage) and sample `doctor`
+output.
+
 ### Changed — pool tier resource grants sized for the actual homelab host, not a laptop
 
 Controller pool logs showed ~39 of 48 pool cores sitting idle immediately after

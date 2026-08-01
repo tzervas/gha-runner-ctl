@@ -69,7 +69,7 @@ Three different secrets appear in runner ops. Using the wrong one fails registra
 
 | Credential | Env / surface | What it is | Who consumes it |
 |---|---|---|---|
-| **API mint credential** | `GH_TOKEN` / `GITHUB_TOKEN` (or App installation token — see issue #41) | Long-lived classic PAT/OAuth (`ghp_`/`gho_`), fine-grained PAT (`github_pat_`), or short-lived App installation token (`ghs_`) that can **create** runner registration tokens | **Fleet agent only** — `POST /repos/{owner}/{repo}/actions/runners/registration-token` (or org equivalent), plus demand polling |
+| **API mint credential** | `GH_TOKEN` / `GITHUB_TOKEN`, or `GHA_APP_ID`+`GHA_APP_INSTALLATION_ID`+`GHA_APP_PRIVATE_KEY` (App installation token — closes #41, see [GITHUB_APP_AUTH](GITHUB_APP_AUTH.md)) | Long-lived classic PAT/OAuth (`ghp_`/`gho_`), fine-grained PAT (`github_pat_`), or short-lived App installation token (`ghs_`) that can **create** runner registration tokens | **Fleet agent only** — `POST /repos/{owner}/{repo}/actions/runners/registration-token` (or org equivalent), plus demand polling |
 | **One-shot registration token** | `RUNNER_TOKEN` inside the work container (minted per `up`; not stored long-term) | Opaque ~1h token returned by that POST (or GitHub UI "New self-hosted runner") | **`config.sh` only** — consumed at register time; runner then writes its own credentials. Special value `REUSE` skips mint when retain mode has a valid `.runner` on the volume |
 | **Packages / GHCR pull** | Host pull path (e.g. `podman login` / authfile); **not** `GH_TOKEN` for listen | Classic PAT with `read:packages` (and write only if you publish) | Image pull on the **host** agent user — never substitute for registration mint |
 
@@ -84,6 +84,21 @@ Host wiring pattern (SOPS/age stores are out of band): inject the mint credentia
 
 ```bash
 secret exec GH_TOKEN=runner/gh-token -- gha-runner-ctl listen …
+```
+
+For the App-auth alternative (higher rate-limit budget; the private key is a `0600`
+file path, never an inline env value — see [GITHUB_APP_AUTH](GITHUB_APP_AUTH.md)):
+
+```bash
+secret exec GHA_APP_PRIVATE_KEY_B64=runner/gha-app-key -- bash -c '
+  key="$(mktemp /dev/shm/gha-app-key.XXXXXX.pem)"
+  trap "rm -f \"$key\"" EXIT
+  umask 077
+  printf %s "$GHA_APP_PRIVATE_KEY_B64" | base64 -d > "$key"
+  GHA_APP_ID=<app-id> GHA_APP_INSTALLATION_ID=<installation-id> \
+  GHA_APP_PRIVATE_KEY="file:$key" \
+  exec gha-runner-ctl listen …
+'
 ```
 
 Registration POSTs are paced host-wide (`GHA_REG_MIN_GAP_SECS`, `GHA_REG_MAX_PER_HOUR`). See [ctl/reg-api-budget](interfaces/ctl-reg-api-budget.md).
