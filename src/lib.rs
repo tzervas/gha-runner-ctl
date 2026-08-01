@@ -50,6 +50,9 @@ const DEFAULT_RUNNER_SHA256: &str =
 const DEFAULT_RUNNER_ARCH: &str = "x64";
 const UA: &str = "gha-runner-ctl/0.3.0";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
+/// Production GitHub REST base, **without** a trailing slash. Previously inlined into
+/// every `format!` that built an API URL; now the default of [`HttpConfig`].
+const GITHUB_API_BASE: &str = "https://api.github.com";
 const MIN_POLL_SECS: u64 = 5;
 const MAX_POLL_SECS: u64 = 3600;
 const MIN_IDLE_SECS: u64 = 30;
@@ -368,6 +371,16 @@ pub struct Cli {
 }
 
 impl Cli {
+    /// The HTTP seam configuration for this invocation.
+    ///
+    /// This is the **single** place production code decides which host it talks to.
+    /// Today it is unconditionally GitHub; it is a method on `Cli` rather than a bare
+    /// constant so that the eventual forge selection has exactly one seat to take,
+    /// and so every call site already reads `cli.http()` instead of a literal.
+    fn http(&self) -> HttpConfig {
+        HttpConfig::github()
+    }
+
     /// Resolves the flat repo allowlist, preferring the honestly-named `GHA_ALLOWLIST_REPOS`
     /// over the deprecated `GHA_PREFER_REPOS` (WP-09 rename: it's an allowlist, not an
     /// ordering). If both are set, `GHA_ALLOWLIST_REPOS` wins silently — no need to warn about
@@ -686,14 +699,15 @@ pub fn run() -> Result<(), String> {
 
 // --- Resolve auto / batch context --------------------------------------------
 
-fn get_user_login_from_token(token: &str) -> Result<String, String> {
+fn get_user_login_from_token(token: &str, http: &HttpConfig) -> Result<String, String> {
     #[derive(Deserialize)]
     struct UserResponse {
         login: String,
     }
 
-    let resp = http_agent()
-        .get("https://api.github.com/user")
+    let url = http.api_url("user");
+    let resp = http_agent(http)
+        .get(&url)
         .set("Authorization", &format!("Bearer {token}"))
         .set("Accept", "application/vnd.github+json")
         .set("X-GitHub-Api-Version", "2022-11-28")
@@ -756,7 +770,7 @@ fn resolve_cli(cli: &mut Cli) -> Result<(), String> {
         let u = if let Ok(login) = gh_login() {
             login
         } else if let Ok(tok) = github_token() {
-            get_user_login_from_token(&tok)?
+            get_user_login_from_token(&tok, &cli.http())?
         } else {
             return Err("Could not resolve authenticated user login. Please log in using 'gh auth login' or provide a token.".into());
         };
@@ -1263,19 +1277,19 @@ fn github_url(cli: &Cli) -> String {
     }
 }
 
-fn registration_api_for_repo(repo: &str) -> String {
-    format!("https://api.github.com/repos/{repo}/actions/runners/registration-token")
+fn registration_api_for_repo(repo: &str, http: &HttpConfig) -> String {
+    http.api_url(&format!("repos/{repo}/actions/runners/registration-token"))
 }
 
-fn registration_api(cli: &Cli) -> String {
+fn registration_api(cli: &Cli, http: &HttpConfig) -> String {
     match cli.scope {
         Scope::Repo | Scope::User => {
-            registration_api_for_repo(cli.repo.as_ref().expect("validated"))
+            registration_api_for_repo(cli.repo.as_ref().expect("validated"), http)
         }
-        Scope::Org => format!(
-            "https://api.github.com/orgs/{}/actions/runners/registration-token",
+        Scope::Org => http.api_url(&format!(
+            "orgs/{}/actions/runners/registration-token",
             cli.owner.as_ref().expect("validated")
-        ),
+        )),
     }
 }
 
@@ -1533,7 +1547,11 @@ fn install_gcm() -> Result<(), String> {
 
     let dest_path = std::env::temp_dir().join(format!("gcm-{ver}.deb"));
 
-    let resp = http_agent()
+    // Deliberately NOT parameterised on the forge: this is a fixed vendor artifact on
+    // github.com/releases (the GCM project's own tarball), not a call against whichever
+    // forge we are registering runners with. It goes through the seam only to inherit
+    // the shared UA and timeouts.
+    let resp = http_agent(&HttpConfig::github())
         .get(&url)
         .call()
         .map_err(|e| format!("Failed to download GCM deb package: {e}"))?;
@@ -1709,12 +1727,83 @@ struct RegistrationTokenResponse {
     token: String,
 }
 
-fn http_agent() -> ureq::Agent {
+/// The injectable HTTP seam: **every** outbound request in this crate is built from
+/// one of these.
+///
+/// Before this existed, `http_agent()` took no arguments and each call site pasted
+/// `https://api.github.com` into a `format!`, so there was no way to point the client
+/// at anything else — which is why the HTTP paths had zero test coverage.
+///
+/// Production always constructs this via [`HttpConfig::github`] (equivalently
+/// `Cli::http`), which reproduces the previously-hardcoded values byte for byte:
+/// `GITHUB_API_BASE`, `UA`, `HTTP_TIMEOUT`. Tests construct one with
+/// [`HttpConfig::with_api_base`] pointing at a local server.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HttpConfig {
+    /// REST base with **no** trailing slash (`https://api.github.com`).
+    api_base: String,
+    user_agent: String,
+    timeout: Duration,
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self::github()
+    }
+}
+
+impl HttpConfig {
+    /// Production defaults — the exact values that were hardcoded before the seam.
+    pub fn github() -> Self {
+        Self {
+            api_base: GITHUB_API_BASE.to_string(),
+            user_agent: UA.to_string(),
+            timeout: HTTP_TIMEOUT,
+        }
+    }
+
+    /// Point the REST base somewhere else (a test server today; a self-hosted forge
+    /// later). Trailing slashes are stripped so [`HttpConfig::api_url`] always joins
+    /// with exactly one separator.
+    pub fn with_api_base(base: impl Into<String>) -> Self {
+        Self {
+            api_base: base.into().trim_end_matches('/').to_string(),
+            ..Self::github()
+        }
+    }
+
+    /// Override connect/read/write timeouts. Used by tests so a wedged local server
+    /// fails in milliseconds instead of `HTTP_TIMEOUT`.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    pub fn api_base(&self) -> &str {
+        &self.api_base
+    }
+
+    /// Join a **relative** API path onto the configured base.
+    ///
+    /// With the default base this is string-identical to the old inline
+    /// `format!("https://api.github.com/{path}")`, so no production request changes.
+    pub fn api_url(&self, path: &str) -> String {
+        format!("{}/{}", self.api_base, path.trim_start_matches('/'))
+    }
+}
+
+/// Build the ureq agent for a given seam configuration.
+///
+/// Takes `&HttpConfig` rather than reading the constants directly — that parameter is
+/// the whole point of this function; bypassing it is what the HTTP tests are written
+/// to catch.
+fn http_agent(http: &HttpConfig) -> ureq::Agent {
     ureq::AgentBuilder::new()
-        .timeout_connect(HTTP_TIMEOUT)
-        .timeout_read(HTTP_TIMEOUT)
-        .timeout_write(HTTP_TIMEOUT)
-        .user_agent(UA)
+        .timeout_connect(http.timeout)
+        .timeout_read(http.timeout)
+        .timeout_write(http.timeout)
+        .user_agent(&http.user_agent)
         .build()
 }
 
@@ -1728,10 +1817,14 @@ struct ApiPacer {
     max_backoff: Duration,
     /// When set, skip further API until this instant (rate-limit cool-down).
     cool_until: Option<Instant>,
+    /// The HTTP seam every paced request is issued through. Owned by the pacer because
+    /// the pacer is already threaded down the whole demand-poll call chain, so nothing
+    /// on that chain needs a new parameter to reach the seam.
+    http: HttpConfig,
 }
 
 impl ApiPacer {
-    fn from_cli(cli: &Cli) -> Self {
+    fn from_cli(cli: &Cli, http: HttpConfig) -> Self {
         let gap_ms = cli.api_min_gap_ms.clamp(50, 60_000);
         let max_per = cli.api_max_per_poll.clamp(2, 500);
         let backoff = Duration::from_secs(cli.api_backoff_secs.clamp(5, MAX_API_BACKOFF_SECS));
@@ -1740,6 +1833,7 @@ impl ApiPacer {
             max_per_poll: max_per,
             calls_this_poll: 0,
             last_call: None,
+            http,
             backoff,
             max_backoff: Duration::from_secs(MAX_API_BACKOFF_SECS),
             cool_until: None,
@@ -1748,6 +1842,17 @@ impl ApiPacer {
 
     fn begin_poll(&mut self) {
         self.calls_this_poll = 0;
+    }
+
+    /// Absolute URL for a relative API path, via this pacer's seam.
+    ///
+    /// Demand-poll callers build their URL with this instead of pasting
+    /// `https://api.github.com/...` into a `format!`, which is what makes the poll
+    /// path reachable from a test. [`ApiPacer::get`] still takes an absolute URL so
+    /// that `Link: rel="next"` pagination (whose URLs come from the server) works
+    /// unchanged.
+    fn api_url(&self, path: &str) -> String {
+        self.http.api_url(path)
     }
 
     fn cooling(&self) -> Option<Duration> {
@@ -1832,7 +1937,7 @@ impl ApiPacer {
 
     fn get(&mut self, url: &str, api: &str) -> Result<ureq::Response, String> {
         self.wait_turn()?;
-        let result = http_agent()
+        let result = http_agent(&self.http)
             .get(url)
             .set("Authorization", &format!("Bearer {api}"))
             .set("Accept", "application/vnd.github+json")
@@ -2092,10 +2197,10 @@ fn note_registration_failure_backoff(secs: u64) {
     thread::sleep(Duration::from_secs(secs));
 }
 
-fn registration_token(cli: &Cli, api_token: &str) -> Result<String, String> {
+fn registration_token(cli: &Cli, api_token: &str, http: &HttpConfig) -> Result<String, String> {
     pace_registration(cli)?;
-    let url = registration_api(cli);
-    let resp = http_agent()
+    let url = registration_api(cli, http);
+    let resp = http_agent(http)
         .post(&url)
         .set("Authorization", &format!("Bearer {api_token}"))
         .set("Accept", "application/vnd.github+json")
@@ -2394,7 +2499,7 @@ fn warm(cli: &Cli, gap_secs: u64, start: bool) -> Result<(), String> {
         } else {
             // Mint token only to prove registration rights (still paced); do not start.
             let api = github_token()?;
-            match registration_token(&unit, &api) {
+            match registration_token(&unit, &api, &unit.http()) {
                 Ok(_) => eprintln!("warm: token mint OK for {repo} (not starting)"),
                 Err(e) => eprintln!("warm: token mint failed for {repo}: {}", redact(&e)),
             }
@@ -2862,7 +2967,7 @@ fn up(cli: &Cli) -> Result<(), String> {
         write_env_file(&env_path, "REUSE", cli)?;
     } else {
         let api = github_token()?;
-        let reg = registration_token(cli, &api)?;
+        let reg = registration_token(cli, &api, &cli.http())?;
         write_env_file(&env_path, &reg, cli)?;
         drop(reg);
         drop(api);
@@ -3448,7 +3553,7 @@ fn demand(cli: &Cli, api: &str, pacer: &mut ApiPacer) -> Result<(bool, Option<St
         }
         Scope::Org => {
             let owner = cli.owner.as_ref().expect("validated");
-            let url = format!("https://api.github.com/orgs/{owner}/repos?per_page=100&type=all");
+            let url = pacer.api_url(&format!("orgs/{owner}/repos?per_page=100&type=all"));
             let repos = list_repos_paginated(&url, api, pacer)?;
             for r in repos {
                 if r.archived.unwrap_or(false) || !is_safe_repo(&r.full_name) {
@@ -3493,9 +3598,9 @@ fn demand(cli: &Cli, api: &str, pacer: &mut ApiPacer) -> Result<(bool, Option<St
                 pacer.max_per_poll,
                 pacer.min_gap.as_millis()
             );
-            let url = format!(
-                "https://api.github.com/users/{user}/repos?type=owner&per_page=100&sort=updated"
-            );
+            let url = pacer.api_url(&format!(
+                "users/{user}/repos?type=owner&per_page=100&sort=updated"
+            ));
             let repos = list_repos_paginated(&url, api, pacer)?;
             for r in repos {
                 if r.archived.unwrap_or(false) || r.fork.unwrap_or(false) {
@@ -3587,8 +3692,9 @@ fn repo_needs_runner(
 ) -> Result<bool, String> {
     // Only probe "queued" first (cheaper); check in_progress only if needed for sticky.
     for status in ["queued", "in_progress"] {
-        let url =
-            format!("https://api.github.com/repos/{repo}/actions/runs?status={status}&per_page=5");
+        let url = pacer.api_url(&format!(
+            "repos/{repo}/actions/runs?status={status}&per_page=5"
+        ));
         let runs = match fetch_runs(&url, api, pacer) {
             Ok(r) => r,
             Err(e) if is_soft_api_err(&e) => {
@@ -3685,7 +3791,7 @@ fn collect_jobs_for_run(
     api: &str,
     pacer: &mut ApiPacer,
 ) -> Result<Vec<DemandJob>, String> {
-    let url = format!("https://api.github.com/repos/{repo}/actions/runs/{run_id}/jobs");
+    let url = pacer.api_url(&format!("repos/{repo}/actions/runs/{run_id}/jobs"));
     let resp = pacer
         .get(&url, api)
         .map_err(|e| format!("list jobs: {}", redact(&e)))?;
@@ -3770,9 +3876,9 @@ fn list_demand_jobs(
                 if out.len() >= max_jobs {
                     break;
                 }
-                let url = format!(
-                    "https://api.github.com/repos/{name}/actions/runs?status={status}&per_page=5"
-                );
+                let url = pacer.api_url(&format!(
+                    "repos/{name}/actions/runs?status={status}&per_page=5"
+                ));
                 let runs = match fetch_runs(&url, api, pacer) {
                     Ok(r) => r,
                     Err(e) if is_soft_api_err(&e) => {
@@ -4358,7 +4464,7 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
     // Idle timer starts only after a full prefer-list sweep of empty.
     let mut empty_streak: u32 = 0;
     let mut cli = cli.clone_for_listen();
-    let mut pacer = ApiPacer::from_cli(&cli);
+    let mut pacer = ApiPacer::from_cli(&cli, cli.http());
     let max_local = cli.pool_max_workers.min(pool.max_workers).max(1);
     // Effective partial-scan width for the empty-sweep gate (mirrors list_demand_jobs).
     let scan_width: usize = if dynamic {
@@ -5144,5 +5250,482 @@ mod robust_queue_tests {
     fn normalize_podman_started_at_iso() {
         let raw = "2026-07-21T19:52:33.909118621Z";
         assert_eq!(normalize_podman_started_at(raw), "2026-07-21 19:52:33 UTC");
+    }
+}
+
+/// Tests that drive **real HTTP** through [`HttpConfig`] — the seam added so that the
+/// registration and demand-poll paths are reachable without talking to github.com.
+///
+/// Every test here asserts on what a local server actually received. That is the point:
+/// if a call site stops going through the seam and pastes `https://api.github.com` back
+/// into a `format!`, the local server records nothing and these tests fail. They cannot
+/// pass by accident and they cannot pass while bypassed.
+#[cfg(test)]
+mod http_seam_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// A request exactly as the server saw it on the wire.
+    #[derive(Clone, Debug)]
+    struct SeenRequest {
+        method: String,
+        /// Path + query, verbatim.
+        url: String,
+        authorization: Option<String>,
+        accept: Option<String>,
+        api_version: Option<String>,
+        user_agent: Option<String>,
+    }
+
+    /// One canned reply, matched by method + exact path-with-query.
+    struct Route {
+        method: &'static str,
+        url: String,
+        status: u16,
+        body: &'static str,
+        /// Extra response headers (name, value), e.g. `Retry-After`.
+        headers: Vec<(&'static str, &'static str)>,
+    }
+
+    impl Route {
+        fn get(url: &str, status: u16, body: &'static str) -> Self {
+            Self {
+                method: "GET",
+                url: url.to_string(),
+                status,
+                body,
+                headers: Vec::new(),
+            }
+        }
+
+        fn post(url: &str, status: u16, body: &'static str) -> Self {
+            Self {
+                method: "POST",
+                url: url.to_string(),
+                status,
+                body,
+                headers: Vec::new(),
+            }
+        }
+
+        fn header(mut self, name: &'static str, value: &'static str) -> Self {
+            self.headers.push((name, value));
+            self
+        }
+    }
+
+    /// Status returned for a request no route matched. Deliberately *not* one of the
+    /// codes [`is_soft_api_err`] swallows, so an unrouted request surfaces loudly
+    /// instead of being mistaken for "no work queued".
+    const UNROUTED: u16 = 599;
+
+    /// A synchronous loopback HTTP server (tiny_http) that serves a fixed route table
+    /// and records every request.
+    struct TestServer {
+        base: String,
+        seen: Arc<Mutex<Vec<SeenRequest>>>,
+        server: Arc<tiny_http::Server>,
+        joiner: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl TestServer {
+        fn start(routes: Vec<Route>) -> Self {
+            let server =
+                Arc::new(tiny_http::Server::http("127.0.0.1:0").expect("bind loopback port"));
+            let addr = server
+                .server_addr()
+                .to_ip()
+                .expect("loopback listener has an IP address");
+            let base = format!("http://{addr}");
+            let seen: Arc<Mutex<Vec<SeenRequest>>> = Arc::new(Mutex::new(Vec::new()));
+
+            let srv = Arc::clone(&server);
+            let sink = Arc::clone(&seen);
+            let joiner = std::thread::spawn(move || {
+                for req in srv.incoming_requests() {
+                    let record = {
+                        // `HeaderField::equiv` compares against a `&'static str`.
+                        let header = |name: &'static str| -> Option<String> {
+                            req.headers()
+                                .iter()
+                                .find(|h| h.field.equiv(name))
+                                .map(|h| h.value.as_str().to_string())
+                        };
+                        SeenRequest {
+                            method: req.method().as_str().to_string(),
+                            url: req.url().to_string(),
+                            authorization: header("Authorization"),
+                            accept: header("Accept"),
+                            api_version: header("X-GitHub-Api-Version"),
+                            user_agent: header("User-Agent"),
+                        }
+                    };
+
+                    let hit = routes
+                        .iter()
+                        .find(|r| r.method == record.method && r.url == record.url);
+                    let (status, body, extra) = match hit {
+                        Some(r) => (r.status, r.body, r.headers.as_slice()),
+                        None => (UNROUTED, "{\"unrouted\":true}", &[][..]),
+                    };
+                    sink.lock().expect("seen sink").push(record);
+
+                    let mut resp = tiny_http::Response::from_string(body)
+                        .with_status_code(status)
+                        .with_header(
+                            tiny_http::Header::from_bytes(
+                                &b"Content-Type"[..],
+                                &b"application/json"[..],
+                            )
+                            .expect("content-type header"),
+                        );
+                    for (name, value) in extra {
+                        resp = resp.with_header(
+                            tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes())
+                                .expect("extra header"),
+                        );
+                    }
+                    let _ = req.respond(resp);
+                }
+            });
+
+            Self {
+                base,
+                seen,
+                server,
+                joiner: Some(joiner),
+            }
+        }
+
+        /// Base URL to hand to [`HttpConfig::with_api_base`].
+        fn base(&self) -> &str {
+            &self.base
+        }
+
+        fn seen(&self) -> Vec<SeenRequest> {
+            self.seen.lock().expect("seen sink").clone()
+        }
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            self.server.unblock();
+            if let Some(j) = self.joiner.take() {
+                let _ = j.join();
+            }
+        }
+    }
+
+    /// Config pointed at `server`, with timeouts short enough that a wedged server
+    /// fails the test in seconds rather than `HTTP_TIMEOUT`.
+    fn test_http(server: &TestServer) -> HttpConfig {
+        HttpConfig::with_api_base(server.base()).with_timeout(Duration::from_secs(5))
+    }
+
+    /// Redirect host-wide registration-pace state (see [`reg_pace_paths`]) into a
+    /// private directory. Without this the tests would read and mutate the real
+    /// hourly registration budget of any listener running on the same machine.
+    fn isolate_runtime_dir() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let dir = std::env::temp_dir().join(format!("ghar-http-seam-{}", std::process::id()));
+            let _ = fs::create_dir_all(&dir);
+            std::env::set_var("XDG_RUNTIME_DIR", &dir);
+        });
+    }
+
+    fn cli_for(args: &[&str]) -> Cli {
+        let mut argv = vec!["gha-runner-ctl"];
+        argv.extend_from_slice(args);
+        Cli::try_parse_from(argv).expect("test CLI parses")
+    }
+
+    fn assert_github_headers(req: &SeenRequest, token: &str) {
+        assert_eq!(
+            req.authorization.as_deref(),
+            Some(format!("Bearer {token}").as_str()),
+            "Authorization must reach the wire unchanged"
+        );
+        assert_eq!(req.accept.as_deref(), Some("application/vnd.github+json"));
+        assert_eq!(req.api_version.as_deref(), Some("2022-11-28"));
+        assert_eq!(
+            req.user_agent.as_deref(),
+            Some(UA),
+            "the seam must still stamp the crate UA"
+        );
+    }
+
+    /// The default config must rebuild the *exact* strings that were hardcoded before
+    /// the seam existed. This is the no-behaviour-change proof: if `api_url` ever
+    /// composes differently (double slash, missing slash, changed host), production
+    /// requests change and this fails.
+    #[test]
+    fn default_config_reproduces_the_previously_hardcoded_urls() {
+        let http = HttpConfig::github();
+        assert_eq!(http.api_base(), "https://api.github.com");
+        assert_eq!(http.api_url("user"), "https://api.github.com/user");
+        assert_eq!(
+            registration_api_for_repo("owner/repo", &http),
+            "https://api.github.com/repos/owner/repo/actions/runners/registration-token"
+        );
+        assert_eq!(
+            http.api_url("orgs/acme/actions/runners/registration-token"),
+            "https://api.github.com/orgs/acme/actions/runners/registration-token"
+        );
+        assert_eq!(
+            http.api_url("repos/owner/repo/actions/runs?status=queued&per_page=5"),
+            "https://api.github.com/repos/owner/repo/actions/runs?status=queued&per_page=5"
+        );
+        assert_eq!(
+            http.api_url("repos/owner/repo/actions/runs/42/jobs"),
+            "https://api.github.com/repos/owner/repo/actions/runs/42/jobs"
+        );
+        assert_eq!(
+            http.api_url("orgs/acme/repos?per_page=100&type=all"),
+            "https://api.github.com/orgs/acme/repos?per_page=100&type=all"
+        );
+        assert_eq!(
+            http.api_url("users/tzervas/repos?type=owner&per_page=100&sort=updated"),
+            "https://api.github.com/users/tzervas/repos?type=owner&per_page=100&sort=updated"
+        );
+        // Production always resolves to the GitHub defaults today.
+        assert_eq!(cli_for(&["--repo", "owner/repo"]).http(), http);
+    }
+
+    /// A base with a trailing slash must not produce `//` — the join has exactly one
+    /// separator regardless of how the base was written.
+    #[test]
+    fn api_base_join_is_slash_normalised() {
+        let http = HttpConfig::with_api_base("https://example.test/api/v4/");
+        assert_eq!(http.api_base(), "https://example.test/api/v4");
+        assert_eq!(
+            http.api_url("/user/runners"),
+            "https://example.test/api/v4/user/runners"
+        );
+        assert_eq!(
+            http.api_url("user/runners"),
+            "https://example.test/api/v4/user/runners"
+        );
+    }
+
+    /// Drives `registration_token()` — a real POST over a real socket.
+    ///
+    /// Covers the success mint and the rate-limited path, in that order and in one
+    /// test, because both share the host-wide pace lock and must not race.
+    #[test]
+    fn registration_token_posts_through_the_seam() {
+        isolate_runtime_dir();
+
+        let server = TestServer::start(vec![
+            Route::post(
+                "/repos/owner/repo/actions/runners/registration-token",
+                201,
+                "{\"token\":\"AAAA1111BBBB2222\"}",
+            ),
+            Route::post(
+                "/orgs/acme/actions/runners/registration-token",
+                403,
+                "{\"message\":\"rate limited\"}",
+            )
+            .header("Retry-After", "1"),
+        ]);
+        let http = test_http(&server);
+
+        // --- repo scope, success -------------------------------------------------
+        let cli = cli_for(&[
+            "--scope",
+            "repo",
+            "--repo",
+            "owner/repo",
+            "--reg-min-gap-secs",
+            "1",
+            "--reg-max-per-hour",
+            "500",
+        ]);
+        let token =
+            registration_token(&cli, "pat-repo", &http).expect("registration token is minted");
+        assert_eq!(token, "AAAA1111BBBB2222");
+
+        // --- org scope, 403 + Retry-After ---------------------------------------
+        let org_cli = cli_for(&[
+            "--scope",
+            "org",
+            "--owner",
+            "acme",
+            "--reg-min-gap-secs",
+            "1",
+            "--reg-max-per-hour",
+            "500",
+        ]);
+        let err = registration_token(&org_cli, "pat-org", &http)
+            .expect_err("403 must surface as an error");
+        assert!(err.contains("403"), "unexpected error text: {err}");
+
+        // --- what actually went over the wire ------------------------------------
+        let seen = server.seen();
+        assert_eq!(
+            seen.len(),
+            2,
+            "expected exactly the two registration POSTs, got {seen:?}"
+        );
+
+        assert_eq!(seen[0].method, "POST");
+        assert_eq!(
+            seen[0].url, "/repos/owner/repo/actions/runners/registration-token",
+            "repo scope must POST the repo-scoped registration path"
+        );
+        assert_github_headers(&seen[0], "pat-repo");
+
+        assert_eq!(seen[1].method, "POST");
+        assert_eq!(
+            seen[1].url, "/orgs/acme/actions/runners/registration-token",
+            "org scope must POST the org-scoped registration path"
+        );
+        assert_github_headers(&seen[1], "pat-org");
+    }
+
+    /// Drives the demand poll (`repo_needs_runner`) end to end: the runs listing and
+    /// the per-run jobs listing, both issued through `ApiPacer`'s seam.
+    #[test]
+    fn demand_poll_gets_runs_and_jobs_through_the_seam() {
+        let server = TestServer::start(vec![
+            Route::get(
+                "/repos/owner/repo/actions/runs?status=queued&per_page=5",
+                200,
+                "{\"workflow_runs\":[{\"id\":42}]}",
+            ),
+            Route::get(
+                "/repos/owner/repo/actions/runs/42/jobs",
+                200,
+                "{\"jobs\":[{\"name\":\"build\",\"status\":\"queued\",\
+                  \"labels\":[\"self-hosted\",\"linux\",\"podman\"]}]}",
+            ),
+        ]);
+
+        let cli = cli_for(&[
+            "--scope",
+            "repo",
+            "--repo",
+            "owner/repo",
+            "--api-min-gap-ms",
+            "50",
+            "--api-max-per-poll",
+            "8",
+        ]);
+        let mut pacer = ApiPacer::from_cli(&cli, test_http(&server));
+        pacer.begin_poll();
+
+        let needs = repo_needs_runner(&cli, "owner/repo", "pat-demand", &mut pacer)
+            .expect("demand poll succeeds");
+        assert!(needs, "a queued self-hosted job must be reported as demand");
+
+        let seen = server.seen();
+        assert_eq!(
+            seen.len(),
+            2,
+            "expected the runs GET then the jobs GET, got {seen:?}"
+        );
+        assert_eq!(seen[0].method, "GET");
+        assert_eq!(
+            seen[0].url,
+            "/repos/owner/repo/actions/runs?status=queued&per_page=5"
+        );
+        assert_github_headers(&seen[0], "pat-demand");
+
+        assert_eq!(seen[1].method, "GET");
+        assert_eq!(seen[1].url, "/repos/owner/repo/actions/runs/42/jobs");
+        assert_github_headers(&seen[1], "pat-demand");
+
+        // The pacer counted both calls against the per-poll budget.
+        assert_eq!(pacer.calls_this_poll, 2);
+    }
+
+    /// A queued job whose labels do not match must NOT wake the listener — and the
+    /// listener must then also probe `in_progress`. Exercises a second, distinct
+    /// demand request shape through the same seam.
+    #[test]
+    fn demand_poll_probes_in_progress_when_queued_does_not_match() {
+        let server = TestServer::start(vec![
+            Route::get(
+                "/repos/owner/repo/actions/runs?status=queued&per_page=5",
+                200,
+                "{\"workflow_runs\":[{\"id\":7}]}",
+            ),
+            // ubuntu-latest only: no self-hosted/podman baseline, so no demand.
+            Route::get(
+                "/repos/owner/repo/actions/runs/7/jobs",
+                200,
+                "{\"jobs\":[{\"name\":\"lint\",\"status\":\"queued\",\
+                  \"labels\":[\"ubuntu-latest\"]}]}",
+            ),
+            Route::get(
+                "/repos/owner/repo/actions/runs?status=in_progress&per_page=5",
+                200,
+                "{\"workflow_runs\":[]}",
+            ),
+        ]);
+
+        let cli = cli_for(&[
+            "--scope",
+            "repo",
+            "--repo",
+            "owner/repo",
+            "--api-min-gap-ms",
+            "50",
+            "--api-max-per-poll",
+            "8",
+        ]);
+        let mut pacer = ApiPacer::from_cli(&cli, test_http(&server));
+        pacer.begin_poll();
+
+        let needs = repo_needs_runner(&cli, "owner/repo", "pat-demand", &mut pacer)
+            .expect("demand poll succeeds");
+        assert!(
+            !needs,
+            "ubuntu-latest jobs must not wake a self-hosted runner"
+        );
+
+        let urls: Vec<String> = server.seen().into_iter().map(|r| r.url).collect();
+        assert_eq!(
+            urls,
+            vec![
+                "/repos/owner/repo/actions/runs?status=queued&per_page=5",
+                "/repos/owner/repo/actions/runs/7/jobs",
+                "/repos/owner/repo/actions/runs?status=in_progress&per_page=5",
+            ]
+        );
+    }
+
+    /// `get_user_login_from_token` is the third seam call site; prove it too resolves
+    /// its URL from the config rather than a literal.
+    #[test]
+    fn user_login_lookup_goes_through_the_seam() {
+        let server = TestServer::start(vec![Route::get("/user", 200, "{\"login\":\"tzervas\"}")]);
+
+        let login = get_user_login_from_token("pat-user", &test_http(&server))
+            .expect("login resolves from the test server");
+        assert_eq!(login, "tzervas");
+
+        let seen = server.seen();
+        assert_eq!(
+            seen.len(),
+            1,
+            "expected exactly one GET /user, got {seen:?}"
+        );
+        assert_eq!(seen[0].method, "GET");
+        assert_eq!(seen[0].url, "/user");
+        assert_github_headers(&seen[0], "pat-user");
+    }
+
+    /// Guard for the guard: if the seam were bypassed the local server would simply
+    /// see nothing, so confirm that "server saw nothing" is in fact a failing state
+    /// for the assertions above — an unrouted request is not silently tolerated.
+    #[test]
+    fn unrouted_requests_are_not_soft_errors() {
+        assert!(
+            !is_soft_api_err(&format!("status code {UNROUTED}")),
+            "the unrouted status must not be swallowed by the demand poll's soft-error filter, \
+             otherwise a bypassed seam could look like 'no demand' instead of a test failure"
+        );
     }
 }
