@@ -119,7 +119,7 @@ Full matrix, systemd, containers/VMs for testing: **[docs/HOST_PLATFORMS.md](doc
 
 1. `--full-auto`: Detects cwd git checkout → repo scope, else defaults to personal user batch. Prepares the Podman snapshot if missing, then starts the listener (interval 180s, idle 500s).
 2. `--auto` / `detect`: Infer `owner/repo` from the current checkout (`gh repo view` / `git remote`).
-3. Secret handling: Prefer GCM (`git credential fill`), `gh auth token`, config file, or a masked interactive prompt. Raw `ghp_` / `github_pat_` patterns on the CLI argv are blocked (history/process leaks). Tokens may also be supplied via `GH_TOKEN` / `GITHUB_TOKEN` env (accepted by design; avoid if your environment logs env vars). **GitHub App auth (0.4.0+, opt-in):** set `GHA_APP_ID` + `GHA_APP_INSTALLATION_ID` + `GHA_APP_PRIVATE_KEY` to mint short-lived installation tokens (installation tokens scale with installation size; measured **12,500 req/hour** on this personal-account installation (all repos) vs. a classic PAT's 5,000/hour) instead — see [docs/GITHUB_APP_AUTH.md](docs/GITHUB_APP_AUTH.md).
+3. Secret handling: Prefer GCM (`git credential fill`), `gh auth token`, config file, or a masked interactive prompt. Raw `ghp_` / `github_pat_` patterns (and inline PEM key material) on the CLI argv are blocked (history/process leaks). Tokens may also be supplied via `GH_TOKEN` / `GITHUB_TOKEN` env (accepted by design; avoid if your environment logs env vars). **GitHub App auth (0.4.0+, opt-in):** `--app-id`/`GHA_APP_ID` + `--app-private-key`/`GHA_APP_PRIVATE_KEY` (`--app-installation-id`/`GHA_APP_INSTALLATION_ID` optional — auto-discovered) mint short-lived installation tokens instead (installation tokens scale with installation size; measured **12,500 req/hour** on this personal-account installation (all repos) vs. a classic PAT's 5,000/hour — always check the live figure, e.g. via `doctor`, rather than assuming a number). The key accepts `secret:<group>/<key>` (retrieved from the vault directly), `file:<path>`, or a bare path — never inline PEM. Run `gha-runner-ctl doctor` to check which auth path is active, the App's identity/installation/permissions, and the live rate-limit budget, without ever printing a secret. See [docs/GITHUB_APP_AUTH.md](docs/GITHUB_APP_AUTH.md).
 4. Git Credential Manager (GCM): Optional install assist on Debian/Ubuntu; store/retrieve PAT without pasting into shell history.
 5. Visibility filters: `--public-only` (default when unset), `--private-only`, or `--all-repos`.
 6. Scopes: `repo` | `user` (batch personal) | `org` (org-level registration).
@@ -232,6 +232,9 @@ gha-runner-ctl down
 | `status` | Scope, container state, registration details |
 | `detect` | Print resolved registration target without starting |
 | `listen` | Poll for demand; up/down; with `scope=user`, re-target per repo |
+| `warm` | Batch-register retain runners for an allowlist (paced registration-token POSTs) |
+| `recover` | Free orphan pool claims + exited workers; never touches the GitHub Actions queue |
+| `doctor` | Check auth without other flags: active credential path, GitHub App identity/installation/permissions, live rate limit. No secrets printed. See [docs/GITHUB_APP_AUTH.md](docs/GITHUB_APP_AUTH.md) |
 
 Global flags (selection): `--scope`, `--repo`, `--owner`, `--user`, `--auto`, `--full-auto`, `--mode ephemeral|retain`, `--public-only` / `--private-only` / `--all-repos`, `--skip-host-update` (prepare), `GHA_WAKE_TOKEN` + `listen --wake-port`.
 

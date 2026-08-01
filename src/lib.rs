@@ -28,6 +28,7 @@ pub use pool::{
 
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -366,6 +367,29 @@ pub struct Cli {
     /// job arch labels at spawn; CLI/env override applies to single-container `up`.
     #[arg(long, env = "GHA_PLATFORM", global = true)]
     platform: Option<String>,
+
+    /// GitHub App ID for installation-token auth (an alternative to GH_TOKEN/PAT with a
+    /// much higher, installation-scoped rate limit). Requires --app-private-key too.
+    /// See docs/GITHUB_APP_AUTH.md. Setting only some App-auth flags is a hard error,
+    /// not a silent fall-back to GH_TOKEN — run `doctor` to check what's configured.
+    #[arg(long, env = "GHA_APP_ID", global = true)]
+    app_id: Option<String>,
+
+    /// GitHub App installation id. Optional: when omitted (with --app-id and
+    /// --app-private-key set), it is auto-discovered via `GET /app/installations` —
+    /// picking an owner-matched installation if `--owner`/`--user`/`--repo`'s owner
+    /// disambiguates, else the sole installation, else failing with the list of
+    /// candidates. See `doctor` and docs/GITHUB_APP_AUTH.md.
+    #[arg(long, env = "GHA_APP_INSTALLATION_ID", global = true)]
+    app_installation_id: Option<String>,
+
+    /// GitHub App private key: `secret:<group>/<key>` (recommended — retrieved from the
+    /// vault via the `secret` CLI, decrypted only into a 0600 tmpfs file for the span of
+    /// a signing operation), `file:<path>`, or a bare filesystem path. Never inline PEM
+    /// content — that is refused outright (readable via `/proc/<pid>/environ`, leaks
+    /// into shell history / env dumps / CI logs, can't be chmod-restricted).
+    #[arg(long, env = "GHA_APP_PRIVATE_KEY", global = true)]
+    app_private_key: Option<String>,
 }
 
 impl Cli {
@@ -395,6 +419,38 @@ impl Cli {
             .as_ref()
             .or(self.prefer_repos.as_ref())
             .cloned()
+    }
+
+    /// Build a GitHub App auth config from the already-clap-resolved `--app-*` fields
+    /// (flag beats env, exactly like every other option — clap did that resolution when
+    /// it parsed `Cli`, so this just reads the fields; it never touches `std::env::var`
+    /// itself). `Ok(None)` means "nothing App-auth-shaped is set, use GH_TOKEN/PAT."
+    /// `Err` means App auth was *attempted* but is incomplete or invalid — callers must
+    /// treat that as a hard failure, not a silent fall-back (see `appauth` module docs).
+    fn app_auth_config(&self) -> Result<Option<appauth::AppAuthConfig>, String> {
+        appauth::resolve_app_auth_config(|k| match k {
+            "GHA_APP_ID" => self.app_id.clone(),
+            "GHA_APP_INSTALLATION_ID" => self.app_installation_id.clone(),
+            "GHA_APP_PRIVATE_KEY" => self.app_private_key.clone(),
+            _ => None,
+        })
+    }
+
+    /// Best-effort owner login to disambiguate App-auth installation auto-discovery:
+    /// `--owner` (org scope), else `--user` (user scope), else the owner half of
+    /// `--repo owner/name`. `None` when nothing is resolved yet (e.g. `doctor` run with
+    /// no scope flags at all) — auto-discovery still works via the sole-installation
+    /// fallback, it just can't disambiguate multiple installations without this.
+    fn app_auth_owner_hint(&self) -> Option<String> {
+        self.owner
+            .clone()
+            .or_else(|| self.user.clone())
+            .or_else(|| {
+                self.repo
+                    .as_ref()
+                    .and_then(|r| r.split('/').next())
+                    .map(str::to_string)
+            })
     }
 }
 
@@ -448,6 +504,14 @@ pub enum Cmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Check auth configuration without printing secrets: which credential path is
+    /// active (GitHub App vs GH_TOKEN/PAT/gh/GCM/config/interactive), App identity +
+    /// installation + granted permissions when App auth is configured, and the live
+    /// `GET /rate_limit` budget. A separate command (not folded into `status`, which
+    /// reports container/volume/registration state and requires a resolved scope) so
+    /// it runs with no other flags and exits non-zero with actionable text per failed
+    /// check — the thing to run first when a repo/user says jobs aren't picking up.
+    Doctor,
 }
 
 /// Dump troubleshooting context after a failure (no secrets).
@@ -618,11 +682,33 @@ pub fn prevent_raw_token_args() {
                 std::process::exit(127);
             }
         }
+        // Same rationale, for App private key material: `--app-private-key` only ever
+        // accepts `secret:<group>/<key>`, `file:<path>`, or a bare path — inline PEM on
+        // argv would land in /proc/<pid>/cmdline and shell history just like a raw PAT.
+        if arg.contains("-----BEGIN") {
+            eprintln!(
+                "gha-runner-ctl ERROR: inline PEM key material detected in command line arguments!"
+            );
+            eprintln!("--app-private-key only accepts secret:<group>/<key>, file:<path>, or a bare path — never inline key content.");
+            eprintln!("\nTo scrub this command from your shell history:");
+            eprintln!("  - In Bash: history -d $(history | tail -n 2 | head -n 1 | awk '{{print $1}}') (or edit ~/.bash_history)");
+            eprintln!("  - In Zsh:  fc -W && fc -R (or edit ~/.zsh_history)");
+            std::process::exit(127);
+        }
     }
 }
 
 pub fn run() -> Result<(), String> {
     let mut cli = Cli::parse();
+
+    // `doctor` is a read-only diagnostic and deliberately bypasses scope resolution/
+    // validation (which requires --repo/--owner/--user or --auto): it should run with
+    // no other flags at all, since its whole point is "check auth before anything else
+    // needs a resolved target."
+    if matches!(cli.cmd, Some(Cmd::Doctor)) {
+        return doctor(&cli);
+    }
+
     resolve_cli(&mut cli)?;
     validate_cli(&cli)?;
 
@@ -682,6 +768,7 @@ pub fn run() -> Result<(), String> {
         }
         Cmd::Warm { gap_secs, start } => warm(&cli, gap_secs, start),
         Cmd::Recover { prune_exited, json } => recover(&cli, prune_exited, json),
+        Cmd::Doctor => doctor(&cli),
     }
 }
 
@@ -756,7 +843,7 @@ fn resolve_cli(cli: &mut Cli) -> Result<(), String> {
     if cli.scope == Scope::User && cli.user.is_none() {
         let u = if let Ok(login) = gh_login() {
             login
-        } else if let Ok(tok) = github_token() {
+        } else if let Ok(tok) = github_token(cli) {
             get_user_login_from_token(&tok)?
         } else {
             return Err("Could not resolve authenticated user login. Please log in using 'gh auth login' or provide a token.".into());
@@ -1619,27 +1706,59 @@ fn prompt_token_interactively() -> Option<String> {
     }
 }
 
-fn github_token() -> Result<String, String> {
-    // GitHub App auth (opt-in, additive): only engages when GHA_APP_ID,
-    // GHA_APP_INSTALLATION_ID, and GHA_APP_PRIVATE_KEY are all set. Once fully
-    // configured it is authoritative — a mint failure is a hard error, not a
-    // silent fall-through to the PAT path below. See src/appauth.rs.
-    if let Some(cfg) = appauth::app_auth_config_from_env() {
-        return appauth::installation_token(&cfg);
+/// Which credential path produced a token — reported by `doctor`, otherwise
+/// discarded. Never carries the token itself.
+enum TokenSource {
+    GithubApp,
+    EnvVar(&'static str),
+    GitCredentialHelper,
+    GhCli,
+    ConfigFile,
+    Interactive,
+}
+
+impl fmt::Display for TokenSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TokenSource::GithubApp => write!(f, "GitHub App installation token"),
+            TokenSource::EnvVar(name) => write!(f, "{name} environment variable"),
+            TokenSource::GitCredentialHelper => write!(f, "git credential helper (GCM)"),
+            TokenSource::GhCli => write!(f, "gh CLI (`gh auth token`)"),
+            TokenSource::ConfigFile => write!(f, "config file"),
+            TokenSource::Interactive => write!(f, "interactive prompt"),
+        }
+    }
+}
+
+fn github_token(cli: &Cli) -> Result<String, String> {
+    github_token_with_source(cli).map(|(t, _)| t)
+}
+
+fn github_token_with_source(cli: &Cli) -> Result<(String, TokenSource), String> {
+    // GitHub App auth (opt-in, additive): only engages when --app-id/GHA_APP_ID and
+    // --app-private-key/GHA_APP_PRIVATE_KEY are both set (installation id is optional
+    // — see src/appauth.rs auto-discovery). `Ok(None)` means nothing App-auth-shaped
+    // is configured at all — fall through to the PAT chain below unchanged. Any other
+    // outcome (`Ok(Some(cfg))` or `Err`) is authoritative: a mint failure or a partial/
+    // invalid config is a hard error, never a silent fall-through to the PAT path,
+    // since that could mask a real misconfiguration or mint against the wrong identity.
+    if let Some(cfg) = cli.app_auth_config()? {
+        let token = appauth::installation_token(&cfg, cli.app_auth_owner_hint().as_deref())?;
+        return Ok((token, TokenSource::GithubApp));
     }
 
     // 1. Try env variables
     for key in ["GH_TOKEN", "GITHUB_TOKEN"] {
         if let Ok(t) = std::env::var(key) {
             if !t.is_empty() {
-                return Ok(t);
+                return Ok((t, TokenSource::EnvVar(key)));
             }
         }
     }
 
     // 2. Try GCM or git credential helper
     if let Some(t) = get_token_from_git_credential() {
-        return Ok(t);
+        return Ok((t, TokenSource::GitCredentialHelper));
     }
 
     // 3. Try GH CLI
@@ -1652,7 +1771,7 @@ fn github_token() -> Result<String, String> {
         if out.status.success() {
             let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if !t.is_empty() {
-                return Ok(t);
+                return Ok((t, TokenSource::GhCli));
             }
         }
     }
@@ -1661,7 +1780,7 @@ fn github_token() -> Result<String, String> {
     if let Some(cfg) = load_config() {
         if let Some(t) = cfg.github_token {
             if !t.is_empty() {
-                return Ok(t);
+                return Ok((t, TokenSource::ConfigFile));
             }
         }
     }
@@ -1706,7 +1825,7 @@ fn github_token() -> Result<String, String> {
                     }
                 }
             }
-            return Ok(t);
+            return Ok((t, TokenSource::Interactive));
         }
     }
 
@@ -1873,9 +1992,15 @@ impl ApiPacer {
                         self.note_rate_limited(retry_after, reset);
                         return Err(format!("status code {status} (rate limited)"));
                     }
-                    return Err(format!("status code {status}"));
+                    return Err(format!(
+                        "status code {status}{}",
+                        FORBIDDEN_NOT_RATE_LIMIT_HINT
+                    ));
                 }
-                if status == 401 || status == 404 {
+                if status == 401 {
+                    return Err(format!("status code {status}{}", UNAUTHORIZED_HINT));
+                }
+                if status == 404 {
                     return Err(format!("status code {status}"));
                 }
                 if !(200..300).contains(&status) {
@@ -1905,12 +2030,34 @@ impl ApiPacer {
                     self.note_rate_limited(retry_after, reset);
                     return Err(format!("status code {code} (rate limited)"));
                 }
+                if code == 403 {
+                    return Err(format!(
+                        "status code {code}{}",
+                        FORBIDDEN_NOT_RATE_LIMIT_HINT
+                    ));
+                }
+                if code == 401 {
+                    return Err(format!("status code {code}{}", UNAUTHORIZED_HINT));
+                }
                 Err(format!("status code {code}"))
             }
             Err(e) => Err(redact(&e.to_string())),
         }
     }
 }
+
+/// Appended to a 403 that `api_status_is_hard_rate_limit` ruled out — this is
+/// deliberately a *different* failure from a rate limit and must not be conflated with
+/// one: a scope 403 means the credential doesn't cover this repo (GitHub App
+/// `repository_selection`, or a PAT's granted scopes), and no amount of backing off
+/// will fix it, unlike a rate limit which resolves on its own.
+const FORBIDDEN_NOT_RATE_LIMIT_HINT: &str = " (not a rate limit — the credential's \
+     installation/token scope likely doesn't cover this repo; run `doctor` to check \
+     the GitHub App's repository_selection or the PAT's scopes)";
+
+/// Appended to a bare 401 from a demand-poll GET.
+const UNAUTHORIZED_HINT: &str = " (credential rejected — expired/revoked token, rotated \
+     App key, or wrong App id; run `doctor` to check)";
 
 /// True when GitHub indicates a hard API rate limit (not a soft permission 403).
 fn api_status_is_hard_rate_limit(status: u16, remaining: Option<u32>, body: Option<&str>) -> bool {
@@ -2402,7 +2549,7 @@ fn warm(cli: &Cli, gap_secs: u64, start: bool) -> Result<(), String> {
             }
         } else {
             // Mint token only to prove registration rights (still paced); do not start.
-            let api = github_token()?;
+            let api = github_token(&unit)?;
             match registration_token(&unit, &api) {
                 Ok(_) => eprintln!("warm: token mint OK for {repo} (not starting)"),
                 Err(e) => eprintln!("warm: token mint failed for {repo}: {}", redact(&e)),
@@ -2870,7 +3017,7 @@ fn up(cli: &Cli) -> Result<(), String> {
         );
         write_env_file(&env_path, "REUSE", cli)?;
     } else {
-        let api = github_token()?;
+        let api = github_token(cli)?;
         let reg = registration_token(cli, &api)?;
         write_env_file(&env_path, &reg, cli)?;
         drop(reg);
@@ -3087,6 +3234,147 @@ fn status(cli: &Cli) -> Result<(), String> {
     println!("mode: {:?}", cli.mode);
     println!("labels: {}", cli.labels);
     Ok(())
+}
+
+// --- doctor / auth-check -------------------------------------------------------
+
+#[derive(Deserialize)]
+struct RateLimitResponse {
+    resources: RateLimitResources,
+}
+
+#[derive(Deserialize)]
+struct RateLimitResources {
+    core: RateLimitDetail,
+}
+
+#[derive(Deserialize)]
+struct RateLimitDetail {
+    limit: u32,
+    remaining: u32,
+}
+
+/// `GET /rate_limit` for whatever token is active. This is the live figure `doctor`
+/// prints — never a compiled-in constant (installation limits scale with installation
+/// size; a classic PAT is a flat 5,000/hour; neither is safe to hardcode here).
+fn rate_limit_http(token: &str) -> Result<RateLimitDetail, String> {
+    let resp = http_agent()
+        .get("https://api.github.com/rate_limit")
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("Accept", "application/vnd.github+json")
+        .set("X-GitHub-Api-Version", "2022-11-28")
+        .call()
+        .map_err(|e| format!("GET /rate_limit failed: {}", redact(&e.to_string())))?;
+    let status = resp.status();
+    if !(200..300).contains(&status) {
+        return Err(format!("GET /rate_limit failed: HTTP {status}"));
+    }
+    resp.into_json::<RateLimitResponse>()
+        .map(|b| b.resources.core)
+        .map_err(|e| format!("GET /rate_limit response parse failed: {e}"))
+}
+
+/// `gha-runner-ctl doctor`: report which auth path is active and its live health,
+/// without ever printing a token, JWT, or key. See `Cmd::Doctor` for why this is a
+/// separate command from `status`. Each check prints `[PASS]`/`[FAIL]`/`[INFO]` with
+/// actionable text on failure; returns `Err` (non-zero exit) if anything failed.
+fn doctor(cli: &Cli) -> Result<(), String> {
+    println!("gha-runner-ctl doctor");
+    println!("======================");
+    let mut any_fail = false;
+
+    match cli.app_auth_config() {
+        Ok(Some(cfg)) => {
+            println!("[PASS] auth path: GitHub App (app_id={})", cfg.app_id);
+            match appauth::doctor_report(&cfg, cli.app_auth_owner_hint().as_deref()) {
+                Ok(report) => {
+                    println!(
+                        "[PASS] app: {} (id={}, slug={})",
+                        report.app_name.as_deref().unwrap_or("(name unavailable)"),
+                        report.app_id,
+                        report.app_slug.as_deref().unwrap_or("?")
+                    );
+                    println!(
+                        "[PASS] installation: id={} account={} repository_selection={}",
+                        report.installation_id,
+                        report.account_login,
+                        report.repository_selection.as_deref().unwrap_or("?")
+                    );
+                    let perms_str = if report.permissions.is_empty() {
+                        "(none reported)".to_string()
+                    } else {
+                        report
+                            .permissions
+                            .iter()
+                            .map(|(k, v)| format!("{k}={v}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+                    println!("[PASS] permissions granted: {perms_str}");
+                    let missing = appauth::missing_permissions(&report.permissions);
+                    if missing.is_empty() {
+                        println!(
+                            "[PASS] permissions: cover the documented set (actions:read, \
+                             administration:write, metadata:read)"
+                        );
+                    } else {
+                        let slug = report.app_slug.as_deref().unwrap_or("<app-slug>");
+                        println!(
+                            "[FAIL] permissions: missing/under-scoped: {} — fix at \
+                             https://github.com/settings/apps/{slug}/permissions, then \
+                             approve the update on the account it's installed on",
+                            missing.join(", ")
+                        );
+                        any_fail = true;
+                    }
+                }
+                Err(e) => {
+                    println!("[FAIL] app auth: {}", redact(&e));
+                    any_fail = true;
+                }
+            }
+        }
+        Ok(None) => {
+            println!(
+                "[INFO] auth path: not using GitHub App auth (--app-id/GHA_APP_ID and/or \
+                 --app-private-key/GHA_APP_PRIVATE_KEY not set)"
+            );
+        }
+        Err(e) => {
+            println!("[FAIL] app auth configuration: {}", redact(&e));
+            any_fail = true;
+        }
+    }
+
+    match github_token_with_source(cli) {
+        Ok((token, source)) => {
+            println!("[PASS] token acquired via {source}");
+            match rate_limit_http(&token) {
+                Ok(rl) => {
+                    println!(
+                        "[PASS] rate limit (core, live): {}/{} remaining",
+                        rl.remaining, rl.limit
+                    );
+                }
+                Err(e) => {
+                    println!("[FAIL] rate limit check: {}", redact(&e));
+                    any_fail = true;
+                }
+            }
+        }
+        Err(e) => {
+            println!("[FAIL] token acquisition: {}", redact(&e));
+            any_fail = true;
+        }
+    }
+
+    println!("======================");
+    if any_fail {
+        Err("doctor: one or more checks failed (see [FAIL] lines above)".to_string())
+    } else {
+        println!("all checks passed");
+        Ok(())
+    }
 }
 
 // --- Demand ------------------------------------------------------------------
@@ -4405,7 +4693,7 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
             }
         }
 
-        let api = match github_token() {
+        let api = match github_token(&cli) {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("listen: auth: {}", redact(&e));
@@ -4656,7 +4944,7 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
 
             // Vertical size for single worker from first matching job name if any
             if need {
-                if let Ok(api2) = github_token() {
+                if let Ok(api2) = github_token(&cli) {
                     if let Ok(jobs) = list_demand_jobs(&cli, &api2, &mut pacer, 1) {
                         if let Some(j) = jobs.first() {
                             let tier = size_for_job(&j.job_name, &j.labels, cli.gpu);
@@ -4775,6 +5063,9 @@ impl Cli {
             public_only: self.public_only,
             private_only: self.private_only,
             all_repos: self.all_repos,
+            app_id: self.app_id.clone(),
+            app_installation_id: self.app_installation_id.clone(),
+            app_private_key: self.app_private_key.clone(),
         }
     }
 }
@@ -4832,6 +5123,9 @@ struct CliSnap {
     public_only: bool,
     private_only: bool,
     all_repos: bool,
+    app_id: Option<String>,
+    app_installation_id: Option<String>,
+    app_private_key: Option<String>,
 }
 
 fn cli_snapshot(cli: &Cli) -> CliSnap {
@@ -4888,6 +5182,9 @@ fn cli_snapshot(cli: &Cli) -> CliSnap {
         public_only: cli.public_only,
         private_only: cli.private_only,
         all_repos: cli.all_repos,
+        app_id: cli.app_id.clone(),
+        app_installation_id: cli.app_installation_id.clone(),
+        app_private_key: cli.app_private_key.clone(),
     }
 }
 
@@ -4947,6 +5244,9 @@ fn snap_to_cli(s: &CliSnap) -> Cli {
         public_only: s.public_only,
         private_only: s.private_only,
         all_repos: s.all_repos,
+        app_id: s.app_id.clone(),
+        app_installation_id: s.app_installation_id.clone(),
+        app_private_key: s.app_private_key.clone(),
     }
 }
 
@@ -5049,6 +5349,13 @@ fn wake_server(port: u16, snap: CliSnap, token: String) {
 #[cfg(test)]
 mod robust_queue_tests {
     use super::*;
+
+    /// Guards every test below that reads or writes the process-wide `GHA_APP_ID` /
+    /// `GHA_APP_INSTALLATION_ID` / `GHA_APP_PRIVATE_KEY` env vars. `std::env::set_var`
+    /// is process-global and Rust runs tests on multiple threads by default, so without
+    /// this a test asserting "none of these are set" can observe a sibling test's var
+    /// mid-flight. Every test in that group takes this lock for its whole body.
+    static APP_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn lock_is_stale_grace_protects_mid_creation_and_live_pid() {
@@ -5153,5 +5460,135 @@ mod robust_queue_tests {
     fn normalize_podman_started_at_iso() {
         let raw = "2026-07-21T19:52:33.909118621Z";
         assert_eq!(normalize_podman_started_at(raw), "2026-07-21 19:52:33 UTC");
+    }
+
+    // --- App-auth CLI surface: flag-vs-env precedence, matches every other option ---
+    //
+    // These mutate the process-wide GHA_APP_* env vars, which is inherently racy
+    // against any *other* test reading the same names — but nothing else in this
+    // binary does (they're unique to App auth), so this follows existing precedent
+    // (e.g. `dynamic_pool`'s GHA_POOL_* env writes) rather than needing extra machinery.
+    // Each test clears what it set so it doesn't leak into a neighbor.
+
+    #[test]
+    fn cli_app_id_flag_beats_env_and_env_is_used_when_flag_absent() {
+        // Both assertions mutate the same process-wide GHA_APP_ID var, so they live in
+        // one test (guaranteed sequential within a single thread) rather than two —
+        // splitting them would race any other test/thread reading GHA_APP_ID mid-run.
+        let _guard = APP_ENV_TEST_LOCK.lock().unwrap();
+        use clap::Parser as _;
+
+        std::env::set_var("GHA_APP_ID", "111111");
+        let flag_wins =
+            Cli::try_parse_from(["gha-runner-ctl", "--app-id", "222222", "status"]).unwrap();
+        assert_eq!(
+            flag_wins.app_id.as_deref(),
+            Some("222222"),
+            "an explicit --app-id must win over GHA_APP_ID, exactly like every other flag"
+        );
+
+        let env_used = Cli::try_parse_from(["gha-runner-ctl", "status"]).unwrap();
+        assert_eq!(env_used.app_id.as_deref(), Some("111111"));
+
+        std::env::remove_var("GHA_APP_ID");
+    }
+
+    #[test]
+    fn cli_app_installation_id_and_private_key_flags_and_env_both_populate_cli() {
+        let _guard = APP_ENV_TEST_LOCK.lock().unwrap();
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from([
+            "gha-runner-ctl",
+            "--app-id",
+            "4451176",
+            "--app-installation-id",
+            "150429495",
+            "--app-private-key",
+            "secret:runner/gha-app-key",
+            "status",
+        ])
+        .unwrap();
+        assert_eq!(cli.app_id.as_deref(), Some("4451176"));
+        assert_eq!(cli.app_installation_id.as_deref(), Some("150429495"));
+        assert_eq!(
+            cli.app_private_key.as_deref(),
+            Some("secret:runner/gha-app-key")
+        );
+
+        std::env::set_var("GHA_APP_PRIVATE_KEY", "file:/etc/gha/key.pem");
+        let cli_env = Cli::try_parse_from(["gha-runner-ctl", "status"]).unwrap();
+        std::env::remove_var("GHA_APP_PRIVATE_KEY");
+        assert_eq!(
+            cli_env.app_private_key.as_deref(),
+            Some("file:/etc/gha/key.pem")
+        );
+    }
+
+    #[test]
+    fn cli_app_installation_id_is_optional() {
+        let _guard = APP_ENV_TEST_LOCK.lock().unwrap();
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from([
+            "gha-runner-ctl",
+            "--app-id",
+            "1",
+            "--app-private-key",
+            "file:/k.pem",
+            "status",
+        ])
+        .unwrap();
+        assert_eq!(cli.app_installation_id, None);
+    }
+
+    #[test]
+    fn cli_app_auth_config_partial_is_a_hard_error_naming_the_missing_flag() {
+        let _guard = APP_ENV_TEST_LOCK.lock().unwrap();
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from(["gha-runner-ctl", "--app-id", "123456", "status"]).unwrap();
+        let err = cli.app_auth_config().unwrap_err();
+        assert!(err.contains("app-private-key"), "{err}");
+    }
+
+    #[test]
+    fn cli_app_auth_config_none_set_falls_back_silently() {
+        let _guard = APP_ENV_TEST_LOCK.lock().unwrap();
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from(["gha-runner-ctl", "status"]).unwrap();
+        assert!(cli.app_auth_config().unwrap().is_none());
+    }
+
+    #[test]
+    fn cli_app_auth_owner_hint_prefers_owner_then_user_then_repo() {
+        use clap::Parser as _;
+        let by_owner = Cli::try_parse_from([
+            "gha-runner-ctl",
+            "--owner",
+            "org-owner",
+            "--user",
+            "user-login",
+            "--repo",
+            "repo-owner/name",
+            "status",
+        ])
+        .unwrap();
+        assert_eq!(by_owner.app_auth_owner_hint().as_deref(), Some("org-owner"));
+
+        let by_user =
+            Cli::try_parse_from(["gha-runner-ctl", "--user", "user-login", "status"]).unwrap();
+        assert_eq!(by_user.app_auth_owner_hint().as_deref(), Some("user-login"));
+
+        let by_repo =
+            Cli::try_parse_from(["gha-runner-ctl", "--repo", "repo-owner/name", "status"]).unwrap();
+        assert_eq!(by_repo.app_auth_owner_hint().as_deref(), Some("repo-owner"));
+
+        let none = Cli::try_parse_from(["gha-runner-ctl", "status"]).unwrap();
+        assert_eq!(none.app_auth_owner_hint(), None);
+    }
+
+    #[test]
+    fn doctor_subcommand_parses() {
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from(["gha-runner-ctl", "doctor"]).unwrap();
+        assert!(matches!(cli.cmd, Some(Cmd::Doctor)));
     }
 }
