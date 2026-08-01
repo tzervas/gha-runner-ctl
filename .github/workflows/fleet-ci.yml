@@ -143,7 +143,7 @@ jobs:
   gate:
     # Single aggregate required check for fleet-ci. Passes only if every needed job
     # succeeded or was legitimately skipped (rust/python/noop are mutually exclusive by
-    # stack detection). Runs on ubuntu-latest — it does no fleet work, so keeping it off
+    # stack detection). Runs self-hosted per fleet policy — it does no heavy work, so it
     # the self-hosted pool means the required check still reports promptly when the fleet
     # is saturated.
     name: gate

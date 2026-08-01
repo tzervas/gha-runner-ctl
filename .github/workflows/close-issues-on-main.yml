@@ -2,9 +2,9 @@
 # Feature PRs target **dev** and must leave issues open (use Refs #n).
 # Epics close only when a main-bound PR includes Closes #<epic>.
 #
-# Housekeeping runs on ubuntu-latest, NOT the self-hosted Podman fleet: it is
+# Housekeeping runs on the self-hosted fleet like everything else. It is
 # pure GitHub-API bookkeeping with no product build, so it must not consume
-# merge-blocking runner capacity. gh is preinstalled on ubuntu-latest, so the
+# not merge-blocking. `gh` must be present in the work image for this to run, so the
 # old sudo-based bootstrap (which the hardened rootless-podman runner forbids —
 # "no new privileges" is set) is gone; that bootstrap caused the prior 3/3 failures.
 name: close-issues-on-main

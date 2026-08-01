@@ -11,7 +11,7 @@
 #     were closed off-main. Epic detection: label exactly `epic`, a label prefixed `epic:`/
 #     `epic/`, or a title beginning `[Epic]`. (Deliberately does not match `epicurean` etc.)
 #
-# Runs on ubuntu-latest (pure API bookkeeping — must not consume self-hosted fleet capacity).
+# Pure API bookkeeping. Runs self-hosted per fleet policy (see header note below).
 name: reopen-issues-closed-off-main
 
 on:
@@ -26,7 +26,7 @@ permissions:
 
 jobs:
   # Always-green gate so a run whose reopen job is skipped never concludes "failure with zero
-  # jobs". Cheap on ubuntu-latest — no fleet load (the reason the old self-hosted gate was wrong).
+  # jobs". Cheap either way; runs self-hosted per fleet policy — no cloud fallback exists.
   gate:
     name: gate
     runs-on: [self-hosted, linux, x64, podman]
