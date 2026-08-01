@@ -201,6 +201,24 @@ pub fn size_for_job(job_name: &str, labels: &[String], force_gpu: bool) -> SizeT
             SizeTier::Large
         };
     }
+    // Bare `test` / `mutants` are Rust COMPILE jobs on this fleet, not light checks.
+    // aphelion-scribe-{daemon,core,cli,runner} name their cargo build+test job exactly
+    // "test", and cargo-mutants names its job "mutants". Both were reaching Medium (via
+    // the "test" needle below) or the catch-all, which after the memory rebalance puts a
+    // full `cargo test` + `cargo build --release` — two private git deps plus rusqlite
+    // `bundled`, i.e. the entire SQLite C amalgamation — back onto 4g. That is the exact
+    // configuration that produced the historic exit-137 OOM kills, so it must not be
+    // reachable by a job whose only sin is a short name.
+    //
+    // Matched on boundaries, not substrings: a bare `"test"` needle would also swallow
+    // "pytest"/"latest". Caught in review on #107 — the catch-all was checked, this list
+    // was not.
+    if matches!(name.as_str(), "test" | "mutants")
+        || name.starts_with("test ")
+        || name_contains_any(&name, &["build + test", "build+test", "build-and-test"])
+    {
+        return SizeTier::Large;
+    }
     // Medium-default non-Rust test/build (pytest, generic ci)
     //
     // NOTE: the bare "ci" needle here is a known-loose substring match — it fires on
@@ -995,6 +1013,30 @@ pub fn plan_scale(input: &ScaleInput) -> ScalePlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression guard for grok's review catch on #107: the scribe repos name their
+    /// cargo build+test job exactly "test", and cargo-mutants names its job "mutants".
+    /// Both previously reached Medium/the catch-all, which after the memory rebalance
+    /// would have put a full cargo compile back on 4g — the historic exit-137 floor.
+    #[test]
+    fn bare_test_and_mutants_are_large_not_medium() {
+        for n in [
+            "test",
+            "mutants",
+            "Build + test",
+            "build-and-test",
+            "test (ubuntu)",
+        ] {
+            assert_eq!(
+                size_for_job(n, &[], false),
+                SizeTier::Large,
+                "{n:?} must be Large — it is a Rust compile job on this fleet"
+            );
+        }
+        // Boundary check: these must NOT be swept up by the promotion.
+        assert_ne!(size_for_job("pytest", &[], false), SizeTier::Large);
+        assert_ne!(size_for_job("latest-docs", &[], false), SizeTier::Large);
+    }
 
     #[test]
     fn tier_gitleaks_micro() {
