@@ -285,7 +285,45 @@ fn name_contains_any(name: &str, needles: &[&str]) -> bool {
 /// remainder (floor 0.25c/256 MiB) when the pool is tight, so small hosts
 /// degrade gracefully. Caps: xlarge ≤ 20 CPU / 28 GiB; gpu ≤ 8 CPU / 16 GiB
 /// host-side (device is separate).
+///
+/// Per-tier override: `GHA_TIER_<TIER>` as `<cpus>:<memory>`, e.g.
+/// `GHA_TIER_LARGE=6:12g`. Unset tiers keep the defaults below.
+///
+/// Why tunable rather than fixed: the right shape depends on the pool's
+/// cpu:memory ratio, which is per-host. The defaults were chosen when the pool
+/// was MEMORY-bound (`free_left=2.00c/0MiB` — cores free, memory exhausted).
+/// A CPU-bound host sees the exact inverse and wants smaller per-job CPU:
+/// homelab at 48c/86g runs `large` (12c) only 4-wide while 26 GiB sits idle, so
+/// a 111-job queue drains at a quarter of the rate its memory budget could
+/// support. Halving `large` CPU roughly doubles concurrency, and cargo does not
+/// scale linearly past ~8 cores, so per-job cost is well below the gain.
+fn tier_override(tier: SizeTier) -> Option<(String, String)> {
+    let key = format!("GHA_TIER_{}", tier.as_str().to_ascii_uppercase());
+    let raw = std::env::var(&key).ok()?;
+    match parse_tier_override(&raw) {
+        Some(v) => Some(v),
+        None => {
+            eprintln!("pool: ignoring malformed {key}={raw} (want <cpus>:<memory>, e.g. 6:12g)");
+            None
+        }
+    }
+}
+
+/// Pure parser, so the validation is testable without mutating process env
+/// (which races under parallel test execution).
+fn parse_tier_override(raw: &str) -> Option<(String, String)> {
+    let (c, m) = raw.split_once(':')?;
+    let (c, m) = (c.trim(), m.trim());
+    if m.is_empty() || c.parse::<f64>().map(|v| v <= 0.0).unwrap_or(true) {
+        return None;
+    }
+    Some((c.to_string(), m.to_string()))
+}
+
 pub fn resources_for_tier(tier: SizeTier) -> (String, String) {
+    if let Some(v) = tier_override(tier) {
+        return v;
+    }
     match tier {
         // Lint/secrets scans (gitleaks, ruff, fmt…) — cheap, but no longer starved at 0.25c.
         SizeTier::Micro => ("1".into(), "1g".into()),
@@ -1042,6 +1080,37 @@ pub fn plan_scale(input: &ScaleInput) -> ScalePlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tier_override_parses_cpus_and_memory() {
+        assert_eq!(
+            parse_tier_override("6:12g"),
+            Some(("6".into(), "12g".into()))
+        );
+        assert_eq!(
+            parse_tier_override(" 0.5 : 512m "),
+            Some(("0.5".into(), "512m".into())),
+            "fractional cpus and whitespace must both be accepted"
+        );
+    }
+
+    /// Malformed input must fall back to the default tier, never reach podman.
+    /// A bad --cpus flag fails the container at spawn, which looks like capacity
+    /// loss rather than a config typo.
+    #[test]
+    fn tier_override_rejects_malformed_input() {
+        for bad in [
+            "12",     // no separator
+            "12g",    // memory in the cpu slot, no separator
+            ":12g",   // missing cpus
+            "6:",     // missing memory
+            "0:8g",   // zero cpus
+            "-2:8g",  // negative cpus
+            "abc:8g", // non-numeric cpus
+        ] {
+            assert_eq!(parse_tier_override(bad), None, "should reject {bad:?}");
+        }
+    }
 
     /// A missing flag file means "run normally". This is the fail-safe direction:
     /// losing the file must never wedge a host into permanent pause.
