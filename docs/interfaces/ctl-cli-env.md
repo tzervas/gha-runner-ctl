@@ -67,10 +67,17 @@ those units are migrated — dropping it early breaks every host on next restart
 | Method / path | Auth | Action |
 |---------------|------|--------|
 | `GET /health` | None | `200 ok` |
-| `POST /wake` | `Authorization: Bearer <token>` or `X-Wake-Token: <token>` | Runs `up` |
+| `POST /wake` | `Authorization: Bearer <token>` or `X-Wake-Token: <token>` | Runs `up`, **unless quiesced** (see below) → `503` |
 | `POST /sleep` | Same | Runs `down --rm` |
 
 Token compare is constant-time; secret case preserved (see `wake_request_line_authorized`).
+
+`POST /wake` honors `GHA_QUIESCE_FILE` the same as the tick loop: while quiesced it
+does not call `up`, responds `503 Service Unavailable` with a `Retry-After` header
+(set to the listen poll interval) and a body explaining no runner was started, and
+logs the refusal to stderr. This closes the gap where the wake-port thread — spawned
+by `listen` but running independently of its tick loop — was the one path that could
+still admit work during a quiesced drain.
 
 ## Global flags and environment
 
@@ -118,7 +125,7 @@ All global options accept the same name as env var (clap `env =`); boolean env v
 | `--priority-repos` | `GHA_PRIORITY_REPOS` | CSV `owner/repo` | — | Polled **every tick before** RR (hot queues) |
 | `--listen-min-interval` | `GHA_LISTEN_MIN_INTERVAL` | u64 | `45` | Floor for `scope=user` listen poll interval |
 | `--pool-scan-per-tick` | `GHA_POOL_SCAN_PER_TICK` | u32 | `12` | Max non-priority repos scanned per tick in dynamic pool |
-| — | `GHA_QUIESCE_FILE` | path | `<pool dir>/quiesce` | Flag file; while it exists `listen` admits **no new work**. In-flight jobs finish, workers are still reaped, no GitHub API calls are made. Create to pause, delete to resume — no restart, no signal, no PID lookup. A **directory** at this path is ignored. |
+| — | `GHA_QUIESCE_FILE` | path | `<pool dir>/quiesce` | Flag file; while it exists `listen` admits **no new work** — including via `POST /wake` if `--wake-port` is set (see Wake HTTP below). In-flight jobs finish, workers are still reaped, no GitHub API calls are made. Create to pause, delete to resume — no restart, no signal, no PID lookup. A **directory** at this path is ignored. |
 | `--reap-stale-secs` | `GHA_REAP_STALE_SECS` | u64 | `3600` | On listen start (ephemeral): stop+rm unclaimed workers older than N; `0` disables |
 | `--tick-log` | `GHA_TICK_LOG` | path / `auto` / `off` | `auto` | JSONL tick metrics; `auto` → `$XDG_DATA_HOME/gha-runner-ctl/logs/listen-ticks.jsonl` |
 | `--api-min-gap-ms` | `GHA_API_MIN_GAP_MS` | u64 | `1000` | Clamped **50–60000** in pacer |
