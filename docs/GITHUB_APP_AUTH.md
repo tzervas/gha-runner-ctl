@@ -23,6 +23,68 @@ measured on the `tzervas` personal-account installation (all repositories,
 installation size — always check the live figure with `gha-runner-ctl doctor` or
 `GET /rate_limit` rather than assuming a number; this tool never hardcodes one either.
 
+## Permissions — and why the scope you register at matters
+
+The permission set `doctor` requires depends on `--scope`. There is exactly one
+difference between the two sets, and it is the difference between a credential that can
+mint runner tokens and a credential that can also **delete every repository it can see**.
+
+| `--scope` | token-minting permission | what else that permission grants |
+|---|---|---|
+| `repo`, `user` | `administration: write` | repo settings, collaborators, branch protection, transfer, **deletion** |
+| `org` | `organization_self_hosted_runners: write` | nothing else |
+
+Both sets also require `actions: read` and `metadata: read`, which are genuinely narrow.
+
+### Why `repo`/`user` scope needs `administration:write`
+
+Not by choice. `POST /repos/{owner}/{repo}/actions/runners/registration-token` requires
+`administration: write`, and GitHub publishes **no** narrower user-scoped alternative.
+The narrow permission — `organization_self_hosted_runners` — exists only for
+organizations.
+
+So on a personal account the credential **cannot be narrowed, only confined**: keep it
+doing one job, install it on as few repositories as possible, and give every other job
+its own App. Understand what you are accepting: an App installed on all repositories with
+`administration: write` can delete all of them.
+
+### The better answer: register at org scope
+
+**Create a free organization and register runners at `--scope org`.**
+
+```bash
+gha-runner-ctl listen --scope org --owner <your-org> ...
+```
+
+This is not a paid feature. Verified against the live API on a **free** organization:
+
+- `POST /orgs/{org}/actions/runners/registration-token` → returns a valid token
+- `GET /orgs/{org}/actions/runner-groups` → the `Default` group is present
+
+Only *additional* runner groups require GitHub Team or Enterprise, and those exist to
+restrict which repositories may use which runner — the opposite of what a single shared
+pool needs. If you want one runner pool serving every repo, the free tier is sufficient.
+
+What you gain:
+
+1. **One registration point for every repo in the org**, instead of per-repo registration.
+2. **No `administration: write`.** A leaked or misused installation token can no longer
+   delete repositories.
+3. **Cheaper demand discovery** — org-scoped queries cover all repos at once.
+
+What it costs: repositories must live in the organization. Transferring preserves issues,
+PRs, stars and history, and GitHub installs a redirect so existing clones keep working.
+
+### Configuring the App for org scope
+
+Set **Organization permissions → Self-hosted runners: Read and write**. Do **not** grant
+`Administration` — if it is already granted, remove it, and remember that removing a
+permission requires re-approving the installation.
+
+`doctor` checks the set matching your `--scope` and emits a `[WARN]` on `repo`/`user`
+scope pointing here, because a passing check on an over-broad credential should not read
+as unqualified success.
+
 ## CLI flags
 
 | Flag | Env var | Required | Notes |
@@ -121,6 +183,10 @@ gha-runner-ctl doctor
 [PASS] installation: id=150429495 account=tzervas repository_selection=all
 [PASS] permissions granted: actions=read, administration=write, metadata=read
 [PASS] permissions: cover the documented set (actions:read, administration:write, metadata:read)
+[WARN] scope Repo requires administration:write, which also grants repository deletion on
+       every installed repo. GitHub offers no narrower user-scoped permission. Registering
+       at --scope org instead needs only organization_self_hosted_runners:write (available
+       on the FREE organization tier) — see docs/GITHUB_APP_AUTH.md
 [PASS] token acquired via GitHub App installation token
 [PASS] rate limit (core, live): 12499/12500 remaining
 ======================

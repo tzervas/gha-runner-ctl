@@ -85,7 +85,7 @@ pub enum Mode {
     Retain,
 }
 
-#[derive(Debug, Clone, ValueEnum, PartialEq, Eq)]
+#[derive(Debug, Clone, ValueEnum, PartialEq, Eq, Copy)]
 pub enum Scope {
     /// One repository. Use with --repo or --auto.
     Repo,
@@ -3417,12 +3417,25 @@ fn doctor(cli: &Cli) -> Result<(), String> {
                             .join(", ")
                     };
                     println!("[PASS] permissions granted: {perms_str}");
-                    let missing = appauth::missing_permissions(&report.permissions);
+                    let missing = appauth::missing_permissions(&report.permissions, cli.scope);
+                    let expected =
+                        appauth::describe_permissions(appauth::expected_permissions(cli.scope));
                     if missing.is_empty() {
-                        println!(
-                            "[PASS] permissions: cover the documented set (actions:read, \
-                             administration:write, metadata:read)"
-                        );
+                        println!("[PASS] permissions: cover the documented set ({expected})");
+                        // Steer user/repo-scoped installs toward the org path: on a user
+                        // account the token-minting permission also confers repository
+                        // deletion, and no narrower alternative exists.
+                        if !matches!(cli.scope, Scope::Org) {
+                            println!(
+                                "[WARN] scope {:?} requires administration:write, which also \
+                                 grants repository deletion on every installed repo. GitHub \
+                                 offers no narrower user-scoped permission. Registering at \
+                                 --scope org instead needs only \
+                                 organization_self_hosted_runners:write (available on the FREE \
+                                 organization tier) — see docs/GITHUB_APP_AUTH.md",
+                                cli.scope
+                            );
+                        }
                     } else {
                         let slug = report.app_slug.as_deref().unwrap_or("<app-slug>");
                         println!(
@@ -5117,7 +5130,7 @@ impl Cli {
     fn clone_for_listen(&self) -> Self {
         Self {
             cmd: Some(Cmd::Status),
-            scope: self.scope.clone(),
+            scope: self.scope,
             repo: self.repo.clone(),
             owner: self.owner.clone(),
             user: self.user.clone(),
@@ -5237,7 +5250,7 @@ struct CliSnap {
 
 fn cli_snapshot(cli: &Cli) -> CliSnap {
     CliSnap {
-        scope: cli.scope.clone(),
+        scope: cli.scope,
         repo: cli.repo.clone(),
         owner: cli.owner.clone(),
         user: cli.user.clone(),
@@ -5298,7 +5311,7 @@ fn cli_snapshot(cli: &Cli) -> CliSnap {
 fn snap_to_cli(s: &CliSnap) -> Cli {
     Cli {
         cmd: Some(Cmd::Status),
-        scope: s.scope.clone(),
+        scope: s.scope,
         repo: s.repo.clone(),
         owner: s.owner.clone(),
         user: s.user.clone(),
