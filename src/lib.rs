@@ -4839,7 +4839,7 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
             return Err("wake-port requires GHA_WAKE_TOKEN (≥16 chars)".into());
         };
         let snap = cli_snapshot(cli);
-        thread::spawn(move || wake_server(port, snap, token));
+        thread::spawn(move || wake_server(port, snap, token, interval));
         eprintln!("listen: authenticated wake on 127.0.0.1:{port}");
     }
 
@@ -5514,7 +5514,69 @@ pub fn wake_request_line_authorized(line: &str, token: &str) -> bool {
     false
 }
 
-fn wake_server(port: u16, snap: CliSnap, token: String) {
+/// Route an already-authenticated wake-protocol request to its response, given
+/// the current quiesce state. Side effects (`up()`/`down()`) are taken as
+/// closures rather than called directly so this decision — in particular the
+/// quiesce gate on `POST /wake` — is unit-testable without a real container
+/// backend or TCP socket.
+///
+/// `POST /wake` used to call `up()` unconditionally. The tick loop in
+/// `listen()` checks `quiesce_active()` before every admission it makes, but
+/// `wake_server` runs on its own thread outside that loop and had no such
+/// check — the one external caller who could reach a quiesced host and still
+/// admit work during the exact drain window an operator asked to protect.
+/// Checking it here, before `admit()` runs, is what makes the documented
+/// "listen admits no new work" guarantee (docs/interfaces/ctl-cli-env.md)
+/// actually hold for wake-port hosts.
+///
+/// Returns `(status line incl. any extra headers, body)`. On refusal we
+/// return 503 + `Retry-After` — the conventional "up but not currently
+/// serving" signal, distinguishable from both success and hard failure, and
+/// it tells an automated caller when to retry instead of leaving that
+/// undocumented. The refusal is also logged so a client that ignores the
+/// body can't mistake this for a silent drop.
+fn wake_dispatch(
+    req: &str,
+    quiesced: bool,
+    retry_after_secs: u64,
+    admit: impl FnOnce() -> Result<(), String>,
+    retire: impl FnOnce() -> Result<(), String>,
+) -> (String, &'static str) {
+    if req.starts_with("POST /wake") {
+        if quiesced {
+            eprintln!(
+                "wake: refused POST /wake — quiesced ({}), no runner started",
+                crate::pool::quiesce_path().display()
+            );
+            return (
+                format!("503 Service Unavailable\r\nRetry-After: {retry_after_secs}"),
+                "quiesced: admission paused, no runner started\n",
+            );
+        }
+        return match admit() {
+            Ok(()) => ("200 OK".to_string(), "up\n"),
+            Err(e) => {
+                eprintln!("wake: {}", redact(&e));
+                ("500".to_string(), "error\n")
+            }
+        };
+    }
+    if req.starts_with("POST /sleep") {
+        return match retire() {
+            Ok(()) => ("200 OK".to_string(), "down\n"),
+            Err(e) => {
+                eprintln!("sleep: {}", redact(&e));
+                ("500".to_string(), "error\n")
+            }
+        };
+    }
+    if req.starts_with("GET /health") {
+        return ("200 OK".to_string(), "ok\n");
+    }
+    ("404".to_string(), "use POST /wake or POST /sleep\n")
+}
+
+fn wake_server(port: u16, snap: CliSnap, token: String, retry_after_secs: u64) {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::Arc;
@@ -5547,27 +5609,13 @@ fn wake_server(port: u16, snap: CliSnap, token: String) {
             continue;
         }
         let cli = snap_to_cli(&snap);
-        let (code, body) = if req.starts_with("POST /wake") {
-            match up(&cli) {
-                Ok(()) => ("200 OK", "up\n"),
-                Err(e) => {
-                    eprintln!("wake: {}", redact(&e));
-                    ("500", "error\n")
-                }
-            }
-        } else if req.starts_with("POST /sleep") {
-            match down(&cli, true) {
-                Ok(()) => ("200 OK", "down\n"),
-                Err(e) => {
-                    eprintln!("sleep: {}", redact(&e));
-                    ("500", "error\n")
-                }
-            }
-        } else if req.starts_with("GET /health") {
-            ("200 OK", "ok\n")
-        } else {
-            ("404", "use POST /wake or POST /sleep\n")
-        };
+        let (code, body) = wake_dispatch(
+            &req,
+            crate::pool::quiesce_active(),
+            retry_after_secs,
+            || up(&cli),
+            || down(&cli, true),
+        );
         let _ = write!(
             s,
             "HTTP/1.1 {code}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -5820,6 +5868,73 @@ mod robust_queue_tests {
         use clap::Parser as _;
         let cli = Cli::try_parse_from(["gha-runner-ctl", "doctor"]).unwrap();
         assert!(matches!(cli.cmd, Some(Cmd::Doctor)));
+    }
+
+    /// The defect this guards: `POST /wake` used to call `up()` unconditionally,
+    /// bypassing the quiesce flag entirely — the tick loop in `listen()` is the
+    /// *only* place that ever checked `quiesce_active()`, and `wake_server` runs
+    /// on its own thread outside that loop. A drain window is exactly when an
+    /// external wake call is most likely: something outside the fleet still
+    /// thinks the host is up and pokes it.
+    ///
+    /// `admit` increments a counter instead of touching a real container
+    /// backend — the point of `wake_dispatch` taking closures is that this needs
+    /// no Docker/Podman, no GitHub token, and no filesystem quiesce flag; the
+    /// quiesce state is passed straight in as `quiesced: true`.
+    #[test]
+    fn wake_dispatch_refuses_admission_while_quiesced() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let admit_calls = AtomicUsize::new(0);
+        let (status, body) = wake_dispatch(
+            "POST /wake HTTP/1.1\r\n\r\n",
+            /* quiesced = */ true,
+            /* retry_after_secs = */ 45,
+            || {
+                admit_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+            || panic!("retire (down) must not run for a /wake request"),
+        );
+        assert_eq!(
+            admit_calls.load(Ordering::SeqCst),
+            0,
+            "a quiesced /wake must never invoke admit() — no runner may start"
+        );
+        assert!(
+            status.starts_with("503"),
+            "quiesced /wake must answer 503 Service Unavailable, got {status:?}"
+        );
+        assert!(
+            status.contains("Retry-After: 45"),
+            "503 must carry the Retry-After hint so callers know when to retry, got {status:?}"
+        );
+        assert!(
+            body.contains("quiesced"),
+            "body must explicitly say no work was admitted, got {body:?}"
+        );
+    }
+
+    /// Symmetric check: with quiesce OFF, `POST /wake` must still admit exactly
+    /// once. Without this, a fix to the bug above could overcorrect into always
+    /// refusing (which would also "pass" a test that only checked the quiesced
+    /// case) and silently break wake-on-demand for every non-quiesced host.
+    #[test]
+    fn wake_dispatch_admits_once_when_not_quiesced() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let admit_calls = AtomicUsize::new(0);
+        let (status, body) = wake_dispatch(
+            "POST /wake HTTP/1.1\r\n\r\n",
+            /* quiesced = */ false,
+            30,
+            || {
+                admit_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+            || panic!("retire (down) must not run for a /wake request"),
+        );
+        assert_eq!(admit_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(status, "200 OK");
+        assert_eq!(body, "up\n");
     }
 }
 
