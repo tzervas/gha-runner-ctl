@@ -103,6 +103,36 @@ jobs:
           CUR=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
           echo "current=$CUR" >> "$GITHUB_OUTPUT"
 
+          # Resolve the package name (crates.io identity) and every [[bin]] name
+          # straight from Cargo.toml, once, here — every later step reads these
+          # outputs instead of pasting the name again. This is the fix for the
+          # class of bug #114 shipped: the crates.io preflight, `cargo update -p`,
+          # and the release archive all had the pre-rename name hardcoded, so
+          # renaming the crate left three dangling references that nothing
+          # caught. A literal can go stale; a value read from Cargo.toml cannot.
+          PKG=$(awk '
+            /^\[package\]/ { insec=1; next }
+            /^\[/          { insec=0 }
+            insec && /^name[[:space:]]*=/ { print; exit }
+          ' Cargo.toml | sed -E 's/^name[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/')
+          BINS=$(awk '
+            /^\[\[bin\]\]/ { insec=1; next }
+            /^\[/          { insec=0 }
+            insec && /^name[[:space:]]*=/ { print; insec=0 }
+          ' Cargo.toml | sed -E 's/^name[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/')
+          PRIMARY_BIN=$(printf '%s\n' "$BINS" | head -n1)
+
+          # Fail loud, not open: an empty name here would silently turn into
+          # "crates.io/api/v1/crates//$VER" or "tar -czf ... -C target/release"
+          # with no file argument — either reads as success on some code path.
+          # Cargo.toml's shape changing is exactly the scenario this guards.
+          [ -n "$PKG" ]         || { echo "::error::could not resolve [package].name from Cargo.toml"; exit 1; }
+          [ -n "$PRIMARY_BIN" ] || { echo "::error::could not resolve any [[bin]].name from Cargo.toml"; exit 1; }
+
+          echo "pkg=$PKG" >> "$GITHUB_OUTPUT"
+          echo "primary_bin=$PRIMARY_BIN" >> "$GITHUB_OUTPUT"
+          echo "bins=$(printf '%s' "$BINS" | tr '\n' ' ' | sed 's/[[:space:]]*$//')" >> "$GITHUB_OUTPUT"
+
           if [ "$BUMP" = "none" ]; then
             NEW="$CUR"
           else
@@ -119,8 +149,8 @@ jobs:
           fi
           echo "new=$NEW"     >> "$GITHUB_OUTPUT"
           echo "tag=v$NEW"    >> "$GITHUB_OUTPUT"
-          printf '### Release plan\n\n- current: `%s`\n- releasing: `%s`\n- tag: `v%s`\n- dry run: `%s`\n' \
-            "$CUR" "$NEW" "$NEW" "${{ inputs.dry_run }}" >> "$GITHUB_STEP_SUMMARY"
+          printf '### Release plan\n\n- package: `%s`\n- binaries: `%s`\n- current: `%s`\n- releasing: `%s`\n- tag: `v%s`\n- dry run: `%s`\n' \
+            "$PKG" "$BINS" "$CUR" "$NEW" "$NEW" "${{ inputs.dry_run }}" >> "$GITHUB_STEP_SUMMARY"
 
       # ── preflight: report what already exists, so every later step can skip precisely ──
       - name: Preflight — what already exists
@@ -129,6 +159,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.ver.outputs.tag }}
           VER: ${{ steps.ver.outputs.new }}
+          PKG: ${{ steps.ver.outputs.pkg }}
         run: |
           set -euo pipefail
           git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1 \
@@ -137,10 +168,13 @@ jobs:
 
           # crates.io: distinguish "already published" from "could not check". An
           # unreachable registry must NOT read as "not published" — that would attempt a
-          # publish that then fails late, after tagging.
+          # publish that then fails late, after tagging. $PKG comes from Cargo.toml
+          # (resolved in the previous step), never a literal — a hardcoded name here is
+          # exactly what made this check permanently read "not published" after #114
+          # renamed the crate: the old name 404s forever regardless of real state.
           CODE=$(curl -s -o /tmp/cr.json -w '%{http_code}' \
                  -H 'User-Agent: gha-runner-ctl-release' \
-                 "https://crates.io/api/v1/crates/gha-runner-ctl/$VER" || echo 000)
+                 "https://crates.io/api/v1/crates/$PKG/$VER" || echo 000)
           case "$CODE" in
             200) C=yes ;;
             404) C=no ;;
@@ -148,15 +182,38 @@ jobs:
           esac
 
           { echo "tag_exists=$T"; echo "release_exists=$R"; echo "crate_published=$C"; } >> "$GITHUB_OUTPUT"
-          printf -- '- tag exists: `%s`\n- release exists: `%s`\n- crate published: `%s`\n' \
-            "$T" "$R" "$C" >> "$GITHUB_STEP_SUMMARY"
+          printf -- '- tag exists: `%s`\n- release exists: `%s`\n- crate published (`%s`): `%s`\n' \
+            "$T" "$R" "$PKG" "$C" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Refuse to proceed on an unknown registry state
         if: steps.pre.outputs.crate_published == 'unknown' && inputs.publish_crate
+        env:
+          VER: ${{ steps.ver.outputs.new }}
+          PKG: ${{ steps.ver.outputs.pkg }}
         run: |
-          echo "::error::Could not determine whether $VER is on crates.io (registry unreachable)."
+          echo "::error::Could not determine whether $PKG $VER is on crates.io (registry unreachable or returned an unexpected status)."
           echo "Unknown is not the same as not-published. Refusing to tag before a publish that may fail."
           exit 1
+
+      - name: Guard — main's ruleset would reject the version-bump push
+        # release-dispatch's "Commit the version bump" step pushes straight to main.
+        # If main requires PRs (this repo's ruleset does — see issue #99), that push
+        # is rejected by GH013 *after* build+test+package already ran, wasting the
+        # run. Ask the ruleset API directly (no admin scope needed) and fail before
+        # any of that work starts. Unprotected mains, and bump=none (which never
+        # pushes), are unaffected.
+        if: ${{ !inputs.dry_run && inputs.bump != 'none' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          RULES=$(gh api "repos/${{ github.repository }}/rules/branches/main")
+          if printf '%s' "$RULES" | grep -q '"type":"pull_request"'; then
+            echo "::error::main is protected by a ruleset requiring pull requests (see issue #99)."
+            echo "::error::bump=${{ inputs.bump }} would push the version-bump commit directly to main and be rejected (GH013) after build+test+package already ran."
+            echo "::error::Land the version bump through a normal PR instead, then re-dispatch this workflow with bump=none."
+            exit 1
+          fi
 
       # ── build ──────────────────────────────────────────────────────────────────────────
       - name: Build and test
@@ -171,11 +228,29 @@ jobs:
         id: pkg
         env:
           VER: ${{ steps.ver.outputs.new }}
+          PRIMARY_BIN: ${{ steps.ver.outputs.primary_bin }}
+          BINS: ${{ steps.ver.outputs.bins }}
         run: |
           set -euo pipefail
           mkdir -p dist
-          A="dist/gha-runner-ctl-${VER}-x86_64-unknown-linux-gnu.tar.gz"
-          tar -czf "$A" -C target/release gha-runner-ctl
+          A="dist/${PRIMARY_BIN}-${VER}-x86_64-unknown-linux-gnu.tar.gz"
+
+          # Ship every binary Cargo.toml declares, not just whichever one was true
+          # when this step was last hand-edited. Deliberately: the compat binary
+          # (currently `gha-runner-ctl`) is kept for one minor cycle so deployed
+          # systemd units (gha-runner-ctl@cpu.service) keep working — see the
+          # comment on that [[bin]] entry in Cargo.toml. Dropping it from the
+          # archive the moment the crate is renamed would break every host on its
+          # next reinstall from a release tarball, even though the binary still
+          # builds. Ship both; retire the compat entry (and this stops being a
+          # multi-binary archive) once the fleet's units are updated.
+          for b in $BINS; do
+            [ -x "target/release/$b" ] || { echo "::error::expected binary target/release/$b (from Cargo.toml [[bin]]) was not produced by the build"; exit 1; }
+          done
+          # shellcheck disable=SC2086 -- $BINS is a space-separated list of binary
+          # names resolved from Cargo.toml, not a path; word-splitting is intended.
+          tar -czf "$A" -C target/release $BINS
+
           sha256sum "$A" > "dist/SHA256SUMS-${VER}.txt"
           echo "archive=$A" >> "$GITHUB_OUTPUT"
           echo "sums=dist/SHA256SUMS-${VER}.txt" >> "$GITHUB_OUTPUT"
@@ -192,12 +267,13 @@ jobs:
         env:
           NEW: ${{ steps.ver.outputs.new }}
           CUR: ${{ steps.ver.outputs.current }}
+          PKG: ${{ steps.ver.outputs.pkg }}
         run: |
           set -euo pipefail
           [ "$NEW" = "$CUR" ] && { echo "already at $NEW — nothing to bump"; exit 0; }
           sed -i "0,/^version = \"$CUR\"/s//version = \"$NEW\"/" Cargo.toml
           [ -f .cz.toml ] && sed -i "s/^version = \"$CUR\"/version = \"$NEW\"/" .cz.toml || true
-          cargo update -p gha-runner-ctl --precise "$NEW" 2>/dev/null || cargo check --quiet
+          cargo update -p "$PKG" --precise "$NEW" 2>/dev/null || cargo check --quiet
           # Identity is required for a commit AND for an annotated tag. Self-hosted runners
           # have none; hosted ones do not either. Set it locally, never --global.
           git config user.name  "github-actions[bot]"
@@ -210,11 +286,12 @@ jobs:
         if: ${{ !inputs.dry_run && steps.pre.outputs.tag_exists == 'no' }}
         env:
           TAG: ${{ steps.ver.outputs.tag }}
+          PRIMARY_BIN: ${{ steps.ver.outputs.primary_bin }}
         run: |
           set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "$TAG" -m "gha-runner-ctl $TAG"
+          git tag -a "$TAG" -m "$PRIMARY_BIN $TAG"
           git push "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" "$TAG"
 
       - name: GitHub release
@@ -224,10 +301,11 @@ jobs:
           TAG: ${{ steps.ver.outputs.tag }}
           A: ${{ steps.pkg.outputs.archive }}
           S: ${{ steps.pkg.outputs.sums }}
+          PRIMARY_BIN: ${{ steps.ver.outputs.primary_bin }}
         run: |
           set -euo pipefail
           gh release view "$TAG" >/dev/null 2>&1 \
-            || gh release create "$TAG" --title "gha-runner-ctl $TAG" --generate-notes
+            || gh release create "$TAG" --title "$PRIMARY_BIN $TAG" --generate-notes
           # --clobber makes asset upload idempotent on re-run.
           gh release upload "$TAG" "$A" "$S" --clobber
 

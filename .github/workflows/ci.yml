@@ -83,6 +83,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  guard-release-refs:
+    # Catches the bug class #114 shipped: a crate/binary rename that leaves the
+    # release workflow pointed at the old name (see scripts/check-release-workflow-
+    # refs.sh for the full history). Cheap and toolchain-free, so it runs on every
+    # push/PR rather than only when someone remembers to dispatch a release.
+    name: guard-release-refs
+    runs-on: [self-hosted, linux, x64, podman]
+    steps:
+      - uses: actions/checkout@v7
+      - name: No dangling crate/binary name references in release tooling
+        run: bash scripts/check-release-workflow-refs.sh
+
   ci:
     uses: tzervas/ap-workflows/.github/workflows/reusable-rust-ci.yml@80c61fe4a6dd35bc3dbf8db3abfee0ce20a4284a
     with:
