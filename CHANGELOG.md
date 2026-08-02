@@ -1,5 +1,50 @@
 ## Unreleased
 
+### Fixed — pool reclaimed freshly-spawned workers before GitHub could dispatch a job (#127)
+
+The dynamic-pool scale planner (`plan_scale` in `src/pool.rs`) reclaimed any
+`running && !busy` ephemeral worker immediately under the `post-job-exit`
+scale-in path, with no age check. `busy=0` is ambiguous: it's true both for a
+worker whose job genuinely finished *and* for one that was never dispatched a
+job at all. Live evidence: workers were torn down ~42s after `up` — well
+inside the time GitHub needs to schedule a job onto a newly-registered
+runner — leaving queue depth flat at 3 across 22+ minutes with zero jobs
+claimed.
+
+Fixed by adding a grace window: a `running && !busy` worker is now reclaimable
+only when it carries a positive completion signal, or has been running at
+least `GHA_POOL_SPAWN_GRACE_SECS` (default `90`, chosen with margin over the
+40-70s observed churn) since spawn. Age comes from the container's actual
+start time (`podman inspect .State.StartedAt`); unknown age fails closed
+(never reclaimed without proof). A worker whose job genuinely finishes
+quickly is unaffected — in ephemeral mode the runner process exits as the
+container's PID 1, the container stops, and the existing `reap_pool_workers`
+sweep (every tick, independent of this grace window) reclaims it promptly, so
+completed workers never leak capacity waiting out the window.
+
+Also extended the wrong-repo preempt fallback (used when `ephemeral_post_job_exit`
+is off) with the same eligibility gate, and made grace-protected idle workers
+count as covering demand on their own repo so the planner doesn't double-spawn
+while a freshly-spawned worker is still waiting to be dispatched.
+
+Tests added in `src/pool.rs` (`issue127_*`) reproduce the churn against
+pre-fix code — reverting `post_job_exit_eligible` to unconditional `true`
+(the prior behavior) fails 3 of the 5 new tests, all in the "not reclaimed
+within grace window" direction; the other 2 (prompt reclaim of a genuinely
+completed worker, and eventual reclaim once grace expires) continue to pass
+either way, as expected, since pre-fix code over-reclaims rather than
+under-reclaims.
+
+Note on PR #97 (`feat/retain-mode-worker-reuse`, open/draft): that PR ties
+`ephemeral_post_job_exit` to `GHA_MODE` (currently hardcoded `true` at the
+`listen()` call site) so `GHA_MODE=retain` workers aren't swept by this same
+mechanism. It is a real, independent fix for a different bug — retain-mode
+idle workers being torn down between jobs — and does not touch the grace/
+eligibility question at all: with or without #97, a default (ephemeral-mode)
+worker hits `ephemeral_post_job_exit=true` and needs this grace window. This
+change does not modify or supersede #97's call site; the two are additive and
+can land in either order.
+
 ### Changed — rebalance per-tier memory grants and lower the sizing catch-all (memory-bound pool)
 
 Real controller output under load showed the pool memory-bound, not CPU-bound:

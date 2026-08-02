@@ -700,6 +700,19 @@ pub struct WorkerSnapshot {
     /// Repo this worker is registered/claimed for (`owner/name`), when known.
     /// Ephemeral user-batch workers only serve that one repo until retargeted.
     pub repo: Option<String>,
+    /// Seconds since this worker's container was (re)started, when known.
+    /// `None` means the age could not be determined (inspect failed / racing
+    /// creation) — treated as **not** past the grace window, fail-safe: we
+    /// never reclaim a worker whose age we cannot prove (issue #127).
+    pub age_secs: Option<u64>,
+    /// Positive job-completion signal, independent of `busy`. True only when
+    /// there is direct evidence the assigned job's run is over — e.g. the
+    /// runner's `Runner.Listener` process has exited, or the Actions API
+    /// reports the run/attempt complete. `busy == false` alone must NEVER set
+    /// this: a freshly-spawned worker that has not yet been dispatched a job
+    /// also has `busy == false`, and the two states are not the same thing
+    /// (issue #127 — "busy=0" collapsing "never started" into "finished").
+    pub job_completed: bool,
 }
 
 /// True when the worker is known to be executing a job (not merely online/idle).
@@ -709,6 +722,38 @@ pub struct WorkerSnapshot {
 #[inline]
 pub fn is_busy(worker: &WorkerSnapshot) -> bool {
     worker.busy
+}
+
+/// Default grace window (seconds since container start) during which a
+/// `running && !busy` worker may NOT be reclaimed as "post job exit" absent a
+/// positive completion signal. Sized against live evidence (issue #127): the
+/// pool was observed reclaiming freshly-spawned, never-dispatched workers
+/// 40-70s after `up`, well before GitHub could schedule a job onto them. 90s
+/// gives clean margin over the worst observed case.
+pub const DEFAULT_SPAWN_GRACE_SECS: u64 = 90;
+
+/// Whether a `running && !busy` worker may be treated as "finished its job"
+/// for reclaim purposes.
+///
+/// This is the fix for issue #127: `busy == false` is ambiguous by itself —
+/// it is true both for a worker whose job genuinely finished *and* for one
+/// that was never dispatched a job at all. The two must never be
+/// conflated. A worker is eligible only when:
+///   * it carries a positive completion signal (`job_completed`), which is
+///     age-independent — a job that finished in 5s must still be reclaimed
+///     promptly, not held for the full grace window (that would leak
+///     capacity, the inverse bug); or
+///   * it has been running at least `grace_secs` since spawn, at which point
+///     "never assigned yet" stops being a plausible explanation for
+///     `busy == false` and it is safe to recycle the slot.
+///
+/// Unknown age (`None`) fails closed: never eligible without proof.
+#[inline]
+pub fn post_job_exit_eligible(worker: &WorkerSnapshot, grace_secs: u64) -> bool {
+    if worker.job_completed {
+        return true;
+    }
+    matches!(worker.age_secs, Some(age) if age >= grace_secs)
 }
 
 /// How many consecutive **empty** demand ticks are required before the idle
@@ -769,10 +814,16 @@ pub struct ScaleInput {
     /// Anti-storm: max new spawns this tick.
     pub max_spawn_per_tick: u32,
     /// CTL-1 primary (Claude): ephemeral workers must exit when idle after a job.
-    /// When true, every `running && !busy` worker is scale-in candidate — pinning
-    /// is fixed by construction (no warm idle retain). Wrong-repo preempt remains
-    /// the fallback when this flag is false.
+    /// When true, every `running && !busy` worker **that is also
+    /// [`post_job_exit_eligible`]** is a scale-in candidate — pinning is fixed
+    /// by construction (no warm idle retain), without reclaiming a worker that
+    /// simply has not been dispatched a job yet. Wrong-repo preempt remains the
+    /// fallback when this flag is false.
     pub ephemeral_post_job_exit: bool,
+    /// Grace window (seconds since spawn) protecting a freshly-spawned,
+    /// never-assigned worker from being misread as "post job exit" merely
+    /// because `busy == false` (issue #127). See [`post_job_exit_eligible`].
+    pub spawn_grace_secs: u64,
 }
 
 /// One planned worker spin-up.
@@ -816,6 +867,7 @@ impl Default for ScaleInput {
             idle_expired: false,
             max_spawn_per_tick: DEFAULT_MAX_SPAWN_PER_TICK,
             ephemeral_post_job_exit: false,
+            spawn_grace_secs: DEFAULT_SPAWN_GRACE_SECS,
         }
     }
 }
@@ -835,8 +887,12 @@ impl Default for ScaleInput {
 ///   (local job signal) are never scaled in — demand emptiness alone is not
 ///   enough when the prefer-list is only partially scanned.
 /// * **Post-job exit (CTL-1 primary):** when `ephemeral_post_job_exit`, every idle
-///   worker is reclaimed immediately (with or without demand). Fixes pinning by
-///   construction — a worker that exits after one job cannot stick to a repo.
+///   worker that is [`post_job_exit_eligible`] is reclaimed immediately (with or
+///   without demand). Fixes pinning by construction — a worker that exits after
+///   one job cannot stick to a repo. An idle worker still inside its
+///   `spawn_grace_secs` window (and without a positive completion signal) is
+///   protected — `busy == false` right after spawn means "never dispatched a
+///   job", not "already finished" (issue #127).
 /// * **Preempt (CTL-1 fallback):** when post-job exit is off and demand exists,
 ///   idle workers claimed for a **different** repo cannot serve it under
 ///   repo-scoped ephemeral registration. Reclaim them so the next tick can spawn
@@ -857,12 +913,26 @@ pub fn plan_scale(input: &ScaleInput) -> ScalePlan {
     let used_slots: std::collections::HashSet<u32> = input.workers.iter().map(|w| w.slot).collect();
     let occupied_local = used_slots.len() as u32;
 
-    // All provably-idle running workers (busy never included).
+    // All provably-idle running workers (busy never included) that are also
+    // eligible for reclaim — i.e. `busy == false` is not merely "never
+    // assigned a job yet" (issue #127: a freshly-spawned worker has
+    // `running && !busy` too, indistinguishable from "finished" by that flag
+    // alone). See [`post_job_exit_eligible`].
     let idle_workers: Vec<String> = input
         .workers
         .iter()
-        .filter(|w| w.running && !is_busy(w))
+        .filter(|w| w.running && !is_busy(w) && post_job_exit_eligible(w, input.spawn_grace_secs))
         .map(|w| w.worker_id.clone())
+        .collect();
+    // Idle workers still inside their spawn grace window — protected from
+    // reclaim, but also not yet "available capacity"; they count as covering
+    // demand on their own repo below so the planner does not double-spawn
+    // while GitHub has not yet had a chance to dispatch to them.
+    let grace_protected_idle: std::collections::HashSet<&str> = input
+        .workers
+        .iter()
+        .filter(|w| w.running && !is_busy(w) && !post_job_exit_eligible(w, input.spawn_grace_secs))
+        .map(|w| w.worker_id.as_str())
         .collect();
 
     // --- Idle scale-IN: no demand ---
@@ -914,11 +984,14 @@ pub fn plan_scale(input: &ScaleInput) -> ScalePlan {
     let demand_repos: std::collections::HashSet<&str> =
         input.jobs.iter().map(|j| j.repo.as_str()).collect();
 
-    // Idle wrong-repo (fallback when post-job exit is off).
+    // Idle wrong-repo (fallback when post-job exit is off). Same eligibility
+    // gate as post-job-exit reclaim: a freshly-spawned worker still inside its
+    // grace window has not been dispatched a job yet, so its current repo
+    // claim (if any) is not yet provably stale (issue #127).
     let preempt_idle_wrong_repo: Vec<String> = input
         .workers
         .iter()
-        .filter(|w| w.running && !is_busy(w))
+        .filter(|w| w.running && !is_busy(w) && post_job_exit_eligible(w, input.spawn_grace_secs))
         .filter(|w| match w.repo.as_deref() {
             Some(r) => !demand_repos.contains(r),
             None => false,
@@ -927,7 +1000,10 @@ pub fn plan_scale(input: &ScaleInput) -> ScalePlan {
         .collect();
 
     // Capacity that can serve current demand:
-    // - post-job exit: only **busy** workers cover (idle will exit this tick)
+    // - post-job exit: **busy** workers cover, and so do idle workers still
+    //   inside their spawn grace window (they have not been reclaimed and
+    //   may yet take the job) — only *eligible* idle workers are excluded,
+    //   since those are the ones about to be torn down this tick.
     // - otherwise: known claim on a demand repo (busy or idle), or unknown claim
     // Busy workers on a *known wrong* repo do not cover but stay protected.
     let covering_local = input
@@ -935,8 +1011,9 @@ pub fn plan_scale(input: &ScaleInput) -> ScalePlan {
         .iter()
         .filter(|w| {
             if input.ephemeral_post_job_exit {
-                // Idle exits; only active jobs cover. Claimed-not-running mid-spawn
-                // still covers so we do not double-spawn into the same claim.
+                // Idle exits; only active jobs and grace-protected idlers cover.
+                // Claimed-not-running mid-spawn still covers so we do not
+                // double-spawn into the same claim.
                 if is_busy(w) {
                     return match w.repo.as_deref() {
                         Some(r) => demand_repos.contains(r),
@@ -949,7 +1026,13 @@ pub fn plan_scale(input: &ScaleInput) -> ScalePlan {
                         None => true,
                     };
                 }
-                return false; // idle running → not covering
+                if grace_protected_idle.contains(w.worker_id.as_str()) {
+                    return match w.repo.as_deref() {
+                        Some(r) => demand_repos.contains(r),
+                        None => true,
+                    };
+                }
+                return false; // idle running, eligible → not covering (about to be reclaimed)
             }
             if !w.running && !is_busy(w) {
                 return match w.repo.as_deref() {
@@ -1583,6 +1666,12 @@ mod tests {
         assert_eq!(plan.desired_count, 8); // clamped by max_local_workers=8
     }
 
+    // Default test workers are "long since spawned" (age far past the default
+    // grace window) — these helpers model the *general* idle/reclaim cases the
+    // existing suite exercises, not the issue #127 spawn-race scenario, which
+    // gets its own explicit fixtures below (`fresh_worker` / `completed_worker`).
+    const LONG_AGO_SECS: u64 = 10 * DEFAULT_SPAWN_GRACE_SECS;
+
     fn worker(slot: u32, running: bool, busy: bool) -> WorkerSnapshot {
         WorkerSnapshot {
             slot,
@@ -1591,6 +1680,8 @@ mod tests {
             running,
             busy,
             repo: None,
+            age_secs: Some(LONG_AGO_SECS),
+            job_completed: false,
         }
     }
 
@@ -1602,6 +1693,38 @@ mod tests {
             running,
             busy,
             repo: Some(repo.into()),
+            age_secs: Some(LONG_AGO_SECS),
+            job_completed: false,
+        }
+    }
+
+    /// A worker spawned `secs_ago` seconds ago, never assigned a job
+    /// (`busy=false`, no completion signal) — models issue #127's race.
+    fn fresh_worker(slot: u32, repo: &str, secs_ago: u64) -> WorkerSnapshot {
+        WorkerSnapshot {
+            slot,
+            worker_id: format!("runner-w{slot}"),
+            container: format!("ctl-w{slot}"),
+            running: true,
+            busy: false,
+            repo: Some(repo.into()),
+            age_secs: Some(secs_ago),
+            job_completed: false,
+        }
+    }
+
+    /// A worker whose job has genuinely finished (positive completion
+    /// signal), regardless of how little time has passed since spawn.
+    fn completed_worker(slot: u32, repo: &str, secs_ago: u64) -> WorkerSnapshot {
+        WorkerSnapshot {
+            slot,
+            worker_id: format!("runner-w{slot}"),
+            container: format!("ctl-w{slot}"),
+            running: true,
+            busy: false,
+            repo: Some(repo.into()),
+            age_secs: Some(secs_ago),
+            job_completed: true,
         }
     }
 
@@ -1729,6 +1852,161 @@ mod tests {
         assert!(plan.spawns.is_empty());
         assert_eq!(plan.scale_in, vec!["runner-w0".to_string()]);
         assert!(plan.notes.contains("post-job-exit"), "notes={}", plan.notes);
+    }
+
+    // -------------------------------------------------------------------
+    // Issue #127: a freshly-spawned, never-assigned worker has `busy ==
+    // false` for exactly the same reason a genuinely-finished worker does.
+    // The planner must not conflate the two. These tests reproduce the live
+    // churn (worker reclaimed ~42s after spawn, before GitHub could dispatch
+    // a job) against the *pre-fix* code: with the eligibility gate removed
+    // (i.e. reverting `post_job_exit_eligible` to `true`), both of the "not
+    // reclaimed" assertions below fail — see PR description for the revert
+    // check.
+    // -------------------------------------------------------------------
+
+    /// A worker spawned 10s ago (well inside the 90s default grace window),
+    /// never dispatched a job, with no other demand: must NOT be reclaimed.
+    /// Pre-fix, `ephemeral_post_job_exit` alone reclaimed every idle running
+    /// worker with no age check at all — this is the exact 42s-after-`up`
+    /// churn from issue #127.
+    #[test]
+    fn issue127_fresh_never_assigned_worker_not_reclaimed_no_demand() {
+        let input = ScaleInput {
+            jobs: Vec::new(),
+            workers: vec![fresh_worker(0, "tzervas/aphelion-scribe-core", 10)],
+            idle_expired: false,
+            ephemeral_post_job_exit: true,
+            ..ScaleInput::default()
+        };
+        let plan = plan_scale(&input);
+        assert!(
+            plan.scale_in.is_empty(),
+            "freshly-spawned worker reclaimed within grace window: {}",
+            plan.notes
+        );
+    }
+
+    /// Same freshly-spawned worker, but now under demand pressure for its own
+    /// repo: it must still not be reclaimed (it may yet take the job), and no
+    /// duplicate spawn should be planned for the same repo while it is
+    /// covering.
+    #[test]
+    fn issue127_fresh_never_assigned_worker_not_reclaimed_under_demand() {
+        let jobs = vec![DemandSignal {
+            job_name: "test".into(),
+            labels: vec!["self-hosted".into()],
+            repo: "tzervas/aphelion-scribe-core".into(),
+        }];
+        let input = ScaleInput {
+            jobs,
+            workers: vec![fresh_worker(0, "tzervas/aphelion-scribe-core", 10)],
+            free_cpus: 14.0,
+            free_memory_mib: 12_288,
+            host_claim_count: 1,
+            idle_expired: false,
+            ephemeral_post_job_exit: true,
+            ..ScaleInput::default()
+        };
+        let plan = plan_scale(&input);
+        assert!(
+            !plan.scale_in.contains(&"runner-w0".to_string()),
+            "freshly-spawned worker reclaimed under demand within grace window: {}",
+            plan.notes
+        );
+        assert!(
+            plan.spawns.is_empty(),
+            "must not double-spawn while grace-protected worker covers demand: {}",
+            plan.notes
+        );
+    }
+
+    /// A worker whose job genuinely completed (positive completion signal),
+    /// only 5s after spawn: must still be reclaimed promptly. Proves the fix
+    /// does not introduce the inverse bug (holding finished workers for the
+    /// full grace window would leak capacity).
+    #[test]
+    fn issue127_completed_worker_reclaimed_promptly_despite_being_fresh() {
+        let input = ScaleInput {
+            jobs: Vec::new(),
+            workers: vec![completed_worker(0, "tzervas/aphelion-scribe-core", 5)],
+            idle_expired: false,
+            ephemeral_post_job_exit: true,
+            ..ScaleInput::default()
+        };
+        let plan = plan_scale(&input);
+        assert_eq!(
+            plan.scale_in,
+            vec!["runner-w0".to_string()],
+            "genuinely-completed worker not reclaimed: {}",
+            plan.notes
+        );
+    }
+
+    /// Once a never-assigned worker ages past the grace window, it becomes
+    /// fair game for reclaim (the mechanism must not leak capacity forever
+    /// on a worker GitHub never dispatches to).
+    #[test]
+    fn issue127_never_assigned_worker_reclaimed_after_grace_expires() {
+        let input = ScaleInput {
+            jobs: Vec::new(),
+            workers: vec![fresh_worker(
+                0,
+                "tzervas/aphelion-scribe-core",
+                DEFAULT_SPAWN_GRACE_SECS + 1,
+            )],
+            idle_expired: false,
+            ephemeral_post_job_exit: true,
+            ..ScaleInput::default()
+        };
+        let plan = plan_scale(&input);
+        assert_eq!(
+            plan.scale_in,
+            vec!["runner-w0".to_string()],
+            "worker past grace window with no job never reclaimed: {}",
+            plan.notes
+        );
+    }
+
+    /// Unknown age (inspect failed / racing creation) fails closed — never
+    /// reclaimed absent proof of age or a completion signal.
+    #[test]
+    fn issue127_unknown_age_fails_closed_not_reclaimed() {
+        let mut w = fresh_worker(0, "tzervas/aphelion-scribe-core", 0);
+        w.age_secs = None;
+        let input = ScaleInput {
+            jobs: Vec::new(),
+            workers: vec![w],
+            idle_expired: false,
+            ephemeral_post_job_exit: true,
+            ..ScaleInput::default()
+        };
+        let plan = plan_scale(&input);
+        assert!(
+            plan.scale_in.is_empty(),
+            "unknown-age worker reclaimed without proof: {}",
+            plan.notes
+        );
+    }
+
+    /// Direct unit coverage of the eligibility predicate itself.
+    #[test]
+    fn post_job_exit_eligible_unit() {
+        assert!(!post_job_exit_eligible(
+            &fresh_worker(0, "r", 10),
+            DEFAULT_SPAWN_GRACE_SECS
+        ));
+        assert!(post_job_exit_eligible(
+            &fresh_worker(0, "r", DEFAULT_SPAWN_GRACE_SECS),
+            DEFAULT_SPAWN_GRACE_SECS
+        ));
+        assert!(post_job_exit_eligible(
+            &completed_worker(0, "r", 0),
+            DEFAULT_SPAWN_GRACE_SECS
+        ));
+        let mut w = fresh_worker(0, "r", 0);
+        w.age_secs = None;
+        assert!(!post_job_exit_eligible(&w, DEFAULT_SPAWN_GRACE_SECS));
     }
 
     /// Idle scale-in: no jobs + idle_expired → tear down **idle** running pool workers.
