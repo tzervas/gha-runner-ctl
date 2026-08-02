@@ -815,14 +815,14 @@ pub struct ScaleInput {
     pub max_spawn_per_tick: u32,
     /// CTL-1 primary (Claude): ephemeral workers must exit when idle after a job.
     /// When true, every `running && !busy` worker **that is also
-    /// [`post_job_exit_eligible`]** is a scale-in candidate — pinning is fixed
+    /// `post_job_exit_eligible`** is a scale-in candidate — pinning is fixed
     /// by construction (no warm idle retain), without reclaiming a worker that
     /// simply has not been dispatched a job yet. Wrong-repo preempt remains the
     /// fallback when this flag is false.
     pub ephemeral_post_job_exit: bool,
     /// Grace window (seconds since spawn) protecting a freshly-spawned,
     /// never-assigned worker from being misread as "post job exit" merely
-    /// because `busy == false` (issue #127). See [`post_job_exit_eligible`].
+    /// because `busy == false` (issue #127). See `post_job_exit_eligible`.
     pub spawn_grace_secs: u64,
 }
 
@@ -887,7 +887,7 @@ impl Default for ScaleInput {
 ///   (local job signal) are never scaled in — demand emptiness alone is not
 ///   enough when the prefer-list is only partially scanned.
 /// * **Post-job exit (CTL-1 primary):** when `ephemeral_post_job_exit`, every idle
-///   worker that is [`post_job_exit_eligible`] is reclaimed immediately (with or
+///   worker that is `post_job_exit_eligible` is reclaimed immediately (with or
 ///   without demand). Fixes pinning by construction — a worker that exits after
 ///   one job cannot stick to a repo. An idle worker still inside its
 ///   `spawn_grace_secs` window (and without a positive completion signal) is
@@ -917,7 +917,7 @@ pub fn plan_scale(input: &ScaleInput) -> ScalePlan {
     // eligible for reclaim — i.e. `busy == false` is not merely "never
     // assigned a job yet" (issue #127: a freshly-spawned worker has
     // `running && !busy` too, indistinguishable from "finished" by that flag
-    // alone). See [`post_job_exit_eligible`].
+    // alone). See `post_job_exit_eligible`.
     let idle_workers: Vec<String> = input
         .workers
         .iter()
