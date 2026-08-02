@@ -3422,19 +3422,13 @@ fn doctor(cli: &Cli) -> Result<(), String> {
                         appauth::describe_permissions(appauth::expected_permissions(cli.scope));
                     if missing.is_empty() {
                         println!("[PASS] permissions: cover the documented set ({expected})");
-                        // Steer user/repo-scoped installs toward the org path: on a user
-                        // account the token-minting permission also confers repository
-                        // deletion, and no narrower alternative exists.
+                        // Only personal (user/repo-scoped) installs get this.
+                        // An org install is already on the narrow permission and
+                        // must not be nagged toward a migration it has done.
                         if !matches!(cli.scope, Scope::Org) {
-                            println!(
-                                "[WARN] scope {:?} requires administration:write, which also \
-                                 grants repository deletion on every installed repo. GitHub \
-                                 offers no narrower user-scoped permission. Registering at \
-                                 --scope org instead needs only \
-                                 organization_self_hosted_runners:write (available on the FREE \
-                                 organization tier) — see docs/GITHUB_APP_AUTH.md",
-                                cli.scope
-                            );
+                            for line in appauth::personal_scope_advisory() {
+                                println!("{line}");
+                            }
                         }
                     } else {
                         let slug = report.app_slug.as_deref().unwrap_or("<app-slug>");

@@ -1120,6 +1120,48 @@ pub(crate) fn expected_permissions(scope: crate::Scope) -> &'static [(&'static s
     }
 }
 
+/// Advisory emitted by `doctor` for **personal (user/repo) scope only**.
+///
+/// Deliberately not shown for `--scope org`: an org installation already holds
+/// the narrow permission, and nagging it toward a migration it has completed
+/// would be noise.
+///
+/// This is guidance, not a failure. Personal scope works — it just cannot be
+/// least-privilege, because GitHub provides no narrow user-scoped alternative.
+pub(crate) fn personal_scope_advisory() -> Vec<String> {
+    vec![
+        "[WARN] personal-account scope: this App holds administration:write, which also grants"
+            .to_string(),
+        "       repository DELETION on every repo it is installed on. That is not a".to_string(),
+        "       misconfiguration here — GitHub publishes no narrower user-scoped permission for"
+            .to_string(),
+        "       minting runner registration tokens, so the credential can only be confined."
+            .to_string(),
+        "".to_string(),
+        "       To eliminate it entirely, register at organization scope instead:".to_string(),
+        "         1. Create an organization — the FREE tier is sufficient. Org-level runner"
+            .to_string(),
+        "            registration and the Default runner group are both available on it;"
+            .to_string(),
+        "            only ADDITIONAL runner groups require a paid plan, and those exist to"
+            .to_string(),
+        "            restrict which repos may use which runner — the opposite of one".to_string(),
+        "            shared pool.".to_string(),
+        "         2. Move your repositories into it. Transfer preserves issues, PRs, stars and"
+            .to_string(),
+        "            history and installs a redirect so existing clones keep working; forking or"
+            .to_string(),
+        "            mirror-pushing works too if you want to keep the originals in place."
+            .to_string(),
+        "         3. Create a GitHub App OWNED BY THE ORG with Organization permissions ->"
+            .to_string(),
+        "            Self-hosted runners: Read and write. Do NOT grant Administration.".to_string(),
+        "         4. Re-run with --scope org --owner <your-org>.".to_string(),
+        "".to_string(),
+        "       Full walkthrough: docs/GITHUB_APP_AUTH.md".to_string(),
+    ]
+}
+
 /// Human-readable rendering of a permission set, for `doctor` output.
 pub(crate) fn describe_permissions(set: &[(&str, &str)]) -> String {
     set.iter()
@@ -1779,6 +1821,41 @@ mod tests {
         assert!(
             missing.iter().any(|m| m.starts_with("metadata:read")),
             "{missing:?}"
+        );
+    }
+
+    #[test]
+    fn advisory_is_personal_scope_only_and_names_the_free_org_path() {
+        let a = personal_scope_advisory().join("\n");
+        // Must state the actual risk, not a vague nudge.
+        assert!(
+            a.contains("administration:write"),
+            "must name the permission"
+        );
+        assert!(
+            a.to_lowercase().contains("deletion"),
+            "must state what it grants"
+        );
+        // Must not read as a misconfiguration — personal scope is legitimate.
+        assert!(
+            a.contains("not a") && a.contains("misconfiguration"),
+            "must clarify this is unavoidable, not user error"
+        );
+        // Must give the concrete migration path, all four steps.
+        assert!(a.contains("FREE"), "must say the org tier is free");
+        assert!(a.contains("Transfer"), "must mention transfer");
+        assert!(
+            a.contains("fork") || a.contains("mirror-push"),
+            "must offer alternatives"
+        );
+        assert!(
+            a.contains("Self-hosted runners"),
+            "must name the org permission"
+        );
+        assert!(a.contains("--scope org"), "must give the flag");
+        assert!(
+            a.contains("Do NOT grant Administration"),
+            "must warn against re-granting the very permission being eliminated"
         );
     }
 
