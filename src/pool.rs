@@ -311,12 +311,23 @@ fn tier_override(tier: SizeTier) -> Option<(String, String)> {
 
 /// Pure parser, so the validation is testable without mutating process env
 /// (which races under parallel test execution).
+///
+/// The memory side is validated with the *same* [`parse_memory_mib`] that the
+/// spawn path uses, not just an emptiness check. Without this, a value like
+/// `6:0g` or `6:abc` passed the old (weaker) check, then silently failed
+/// `parse_memory_mib` two call-layers downstream where the caller does
+/// `.unwrap_or(2048)` with no log line — an override that looks accepted here
+/// (no "ignoring malformed" message) but actually degrades every worker of
+/// that tier to a flat 2 GiB. That is the "config typo presented as capacity
+/// loss" failure this function exists to prevent; it must be caught here,
+/// where we can still log which key and value were rejected.
 fn parse_tier_override(raw: &str) -> Option<(String, String)> {
     let (c, m) = raw.split_once(':')?;
     let (c, m) = (c.trim(), m.trim());
-    if m.is_empty() || c.parse::<f64>().map(|v| v <= 0.0).unwrap_or(true) {
+    if c.parse::<f64>().map(|v| v <= 0.0).unwrap_or(true) {
         return None;
     }
+    parse_memory_mib(m)?;
     Some((c.to_string(), m.to_string()))
 }
 
@@ -594,8 +605,30 @@ pub fn quiesce_active() -> bool {
 ///
 /// A directory does NOT count: a stray `mkdir` should not silently wedge the
 /// fleet into a paused state that looks identical to a deliberate one.
+///
+/// Fail-safe on stat error: `Path::is_file()` collapses every `stat` outcome
+/// down to a bare bool via `.unwrap_or(false)` — "genuinely absent" (`ENOENT`)
+/// and "could not tell" (permission denied, missing/unmounted parent dir,
+/// stale NFS handle, any other I/O error) are indistinguishable and both read
+/// as "not quiesced". For a flag whose entire job is to stop admission before
+/// a restart, that is the wrong default: it means the one time the probe is
+/// unreliable is exactly the time this silently behaves as if nothing were
+/// wrong and keeps admitting work — the orphaned-container failure this
+/// feature exists to prevent. Only a confirmed-absent file should mean
+/// "run normally"; every other stat error fails toward pausing, and is logged
+/// so it doesn't masquerade as a quiet, healthy tick.
 pub fn quiesce_active_at(path: &Path) -> bool {
-    path.is_file()
+    match fs::metadata(path) {
+        Ok(m) => m.is_file(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            eprintln!(
+                "pool: quiesce probe error on {} ({e}) — failing safe, treating as quiesced",
+                path.display()
+            );
+            true
+        }
+    }
 }
 
 /// Shrink request to fit remaining budget (never below min). Returns None if cannot fit min.
@@ -1112,6 +1145,27 @@ mod tests {
         }
     }
 
+    /// The memory side must be validated as strictly as the cpu side. Before
+    /// this test, only `m.is_empty()` was checked here, so `6:0g`/`6:abc`
+    /// passed `parse_tier_override` (no "ignoring malformed" log), then
+    /// silently failed the *real* `parse_memory_mib` two call-layers
+    /// downstream, where the caller does `.unwrap_or(2048)` with no logging
+    /// at all. That is a silently-degraded tier (flat 2 GiB regardless of
+    /// which tier was overridden) with zero operator-visible signal — the
+    /// exact "config typo presented as capacity loss" this feature's own
+    /// doc comment says it wants to avoid.
+    #[test]
+    fn tier_override_rejects_malformed_memory() {
+        for bad in [
+            "6:0g",  // zero memory parses as a *quantity* but is not usable
+            "6:abc", // non-numeric memory
+            "6:-5g", // negative memory
+            "6:0",   // zero, bare units
+        ] {
+            assert_eq!(parse_tier_override(bad), None, "should reject {bad:?}");
+        }
+    }
+
     /// A missing flag file means "run normally". This is the fail-safe direction:
     /// losing the file must never wedge a host into permanent pause.
     #[test]
@@ -1147,6 +1201,25 @@ mod tests {
         std::fs::create_dir_all(d.join("quiesce")).unwrap();
         assert!(!quiesce_active_at(&d.join("quiesce")));
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A stat error that is NOT "confirmed absent" must fail toward pausing,
+    /// not toward normal admission. `Path::is_file()` alone cannot express
+    /// this distinction (it folds every error into `false`), which is exactly
+    /// how a permission error or an unmounted parent directory would silently
+    /// read as "not quiesced" and keep admitting work through the one window
+    /// this flag exists to close. A NUL byte in the path is a portable,
+    /// privilege-independent way to force `fs::metadata` to fail with
+    /// something other than `NotFound` (`InvalidInput`), without relying on
+    /// dropping privileges (this suite may run as root, where permission bits
+    /// are bypassed and would not otherwise reproduce the error path).
+    #[test]
+    fn quiesce_probe_error_other_than_not_found_fails_safe() {
+        let bogus = PathBuf::from("/tmp/gha-quiesce-\0-invalid");
+        assert!(
+            quiesce_active_at(&bogus),
+            "a stat error that isn't confirmed-absent must be treated as quiesced"
+        );
     }
 
     /// Regression guard for grok's review catch on #107: the scribe repos name their
