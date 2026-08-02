@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -285,7 +285,56 @@ fn name_contains_any(name: &str, needles: &[&str]) -> bool {
 /// remainder (floor 0.25c/256 MiB) when the pool is tight, so small hosts
 /// degrade gracefully. Caps: xlarge ≤ 20 CPU / 28 GiB; gpu ≤ 8 CPU / 16 GiB
 /// host-side (device is separate).
+///
+/// Per-tier override: `GHA_TIER_<TIER>` as `<cpus>:<memory>`, e.g.
+/// `GHA_TIER_LARGE=6:12g`. Unset tiers keep the defaults below.
+///
+/// Why tunable rather than fixed: the right shape depends on the pool's
+/// cpu:memory ratio, which is per-host. The defaults were chosen when the pool
+/// was MEMORY-bound (`free_left=2.00c/0MiB` — cores free, memory exhausted).
+/// A CPU-bound host sees the exact inverse and wants smaller per-job CPU:
+/// homelab at 48c/86g runs `large` (12c) only 4-wide while 26 GiB sits idle, so
+/// a 111-job queue drains at a quarter of the rate its memory budget could
+/// support. Halving `large` CPU roughly doubles concurrency, and cargo does not
+/// scale linearly past ~8 cores, so per-job cost is well below the gain.
+fn tier_override(tier: SizeTier) -> Option<(String, String)> {
+    let key = format!("GHA_TIER_{}", tier.as_str().to_ascii_uppercase());
+    let raw = std::env::var(&key).ok()?;
+    match parse_tier_override(&raw) {
+        Some(v) => Some(v),
+        None => {
+            eprintln!("pool: ignoring malformed {key}={raw} (want <cpus>:<memory>, e.g. 6:12g)");
+            None
+        }
+    }
+}
+
+/// Pure parser, so the validation is testable without mutating process env
+/// (which races under parallel test execution).
+///
+/// The memory side is validated with the *same* [`parse_memory_mib`] that the
+/// spawn path uses, not just an emptiness check. Without this, a value like
+/// `6:0g` or `6:abc` passed the old (weaker) check, then silently failed
+/// `parse_memory_mib` two call-layers downstream where the caller does
+/// `.unwrap_or(2048)` with no log line — an override that looks accepted here
+/// (no "ignoring malformed" message) but actually degrades every worker of
+/// that tier to a flat 2 GiB. That is the "config typo presented as capacity
+/// loss" failure this function exists to prevent; it must be caught here,
+/// where we can still log which key and value were rejected.
+fn parse_tier_override(raw: &str) -> Option<(String, String)> {
+    let (c, m) = raw.split_once(':')?;
+    let (c, m) = (c.trim(), m.trim());
+    if c.parse::<f64>().map(|v| v <= 0.0).unwrap_or(true) {
+        return None;
+    }
+    parse_memory_mib(m)?;
+    Some((c.to_string(), m.to_string()))
+}
+
 pub fn resources_for_tier(tier: SizeTier) -> (String, String) {
+    if let Some(v) = tier_override(tier) {
+        return v;
+    }
     match tier {
         // Lint/secrets scans (gitleaks, ruff, fmt…) — cheap, but no longer starved at 0.25c.
         SizeTier::Micro => ("1".into(), "1g".into()),
@@ -524,11 +573,62 @@ fn pool_state_path() -> PathBuf {
     if let Ok(p) = std::env::var("GHA_POOL_STATE") {
         return PathBuf::from(p);
     }
+    pool_dir().join("state.json")
+}
+
+fn pool_dir() -> PathBuf {
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
         .unwrap_or_else(|| PathBuf::from("/tmp"));
-    base.join("gha-runner-ctl/pool/state.json")
+    base.join("gha-runner-ctl/pool")
+}
+
+/// Path to the quiesce flag file. Its presence means "admit no new work".
+///
+/// A file rather than a signal: it survives a supervisor restart, is trivially
+/// inspectable by an operator or a deploy script, and needs no PID discovery.
+/// Override with `GHA_QUIESCE_FILE`.
+pub fn quiesce_path() -> PathBuf {
+    if let Ok(p) = std::env::var("GHA_QUIESCE_FILE") {
+        return PathBuf::from(p);
+    }
+    pool_dir().join("quiesce")
+}
+
+/// True while admission is paused. Cheap enough to call every tick.
+pub fn quiesce_active() -> bool {
+    quiesce_active_at(&quiesce_path())
+}
+
+/// Pure form, so the predicate is testable without mutating process env.
+///
+/// A directory does NOT count: a stray `mkdir` should not silently wedge the
+/// fleet into a paused state that looks identical to a deliberate one.
+///
+/// Fail-safe on stat error: `Path::is_file()` collapses every `stat` outcome
+/// down to a bare bool via `.unwrap_or(false)` — "genuinely absent" (`ENOENT`)
+/// and "could not tell" (permission denied, missing/unmounted parent dir,
+/// stale NFS handle, any other I/O error) are indistinguishable and both read
+/// as "not quiesced". For a flag whose entire job is to stop admission before
+/// a restart, that is the wrong default: it means the one time the probe is
+/// unreliable is exactly the time this silently behaves as if nothing were
+/// wrong and keeps admitting work — the orphaned-container failure this
+/// feature exists to prevent. Only a confirmed-absent file should mean
+/// "run normally"; every other stat error fails toward pausing, and is logged
+/// so it doesn't masquerade as a quiet, healthy tick.
+pub fn quiesce_active_at(path: &Path) -> bool {
+    match fs::metadata(path) {
+        Ok(m) => m.is_file(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            eprintln!(
+                "pool: quiesce probe error on {} ({e}) — failing safe, treating as quiesced",
+                path.display()
+            );
+            true
+        }
+    }
 }
 
 /// Shrink request to fit remaining budget (never below min). Returns None if cannot fit min.
@@ -1013,6 +1113,114 @@ pub fn plan_scale(input: &ScaleInput) -> ScalePlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tier_override_parses_cpus_and_memory() {
+        assert_eq!(
+            parse_tier_override("6:12g"),
+            Some(("6".into(), "12g".into()))
+        );
+        assert_eq!(
+            parse_tier_override(" 0.5 : 512m "),
+            Some(("0.5".into(), "512m".into())),
+            "fractional cpus and whitespace must both be accepted"
+        );
+    }
+
+    /// Malformed input must fall back to the default tier, never reach podman.
+    /// A bad --cpus flag fails the container at spawn, which looks like capacity
+    /// loss rather than a config typo.
+    #[test]
+    fn tier_override_rejects_malformed_input() {
+        for bad in [
+            "12",     // no separator
+            "12g",    // memory in the cpu slot, no separator
+            ":12g",   // missing cpus
+            "6:",     // missing memory
+            "0:8g",   // zero cpus
+            "-2:8g",  // negative cpus
+            "abc:8g", // non-numeric cpus
+        ] {
+            assert_eq!(parse_tier_override(bad), None, "should reject {bad:?}");
+        }
+    }
+
+    /// The memory side must be validated as strictly as the cpu side. Before
+    /// this test, only `m.is_empty()` was checked here, so `6:0g`/`6:abc`
+    /// passed `parse_tier_override` (no "ignoring malformed" log), then
+    /// silently failed the *real* `parse_memory_mib` two call-layers
+    /// downstream, where the caller does `.unwrap_or(2048)` with no logging
+    /// at all. That is a silently-degraded tier (flat 2 GiB regardless of
+    /// which tier was overridden) with zero operator-visible signal — the
+    /// exact "config typo presented as capacity loss" this feature's own
+    /// doc comment says it wants to avoid.
+    #[test]
+    fn tier_override_rejects_malformed_memory() {
+        for bad in [
+            "6:0g",  // zero memory parses as a *quantity* but is not usable
+            "6:abc", // non-numeric memory
+            "6:-5g", // negative memory
+            "6:0",   // zero, bare units
+        ] {
+            assert_eq!(parse_tier_override(bad), None, "should reject {bad:?}");
+        }
+    }
+
+    /// A missing flag file means "run normally". This is the fail-safe direction:
+    /// losing the file must never wedge a host into permanent pause.
+    #[test]
+    fn quiesce_absent_means_active_admission() {
+        let d = std::env::temp_dir().join(format!("gha-quiesce-absent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        assert!(!quiesce_active_at(&d.join("quiesce")));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn quiesce_file_pauses_admission() {
+        let d = std::env::temp_dir().join(format!("gha-quiesce-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("quiesce");
+        std::fs::write(&f, b"").unwrap();
+        assert!(quiesce_active_at(&f));
+        // Removing it resumes admission — quiesce must be reversible without a restart.
+        std::fs::remove_file(&f).unwrap();
+        assert!(!quiesce_active_at(&f));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A directory at the flag path must NOT pause the fleet. A stray mkdir
+    /// would otherwise be indistinguishable from a deliberate pause, and would
+    /// silently stop the host claiming work with no obvious cause.
+    #[test]
+    fn quiesce_directory_does_not_pause() {
+        let d = std::env::temp_dir().join(format!("gha-quiesce-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("quiesce")).unwrap();
+        assert!(!quiesce_active_at(&d.join("quiesce")));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A stat error that is NOT "confirmed absent" must fail toward pausing,
+    /// not toward normal admission. `Path::is_file()` alone cannot express
+    /// this distinction (it folds every error into `false`), which is exactly
+    /// how a permission error or an unmounted parent directory would silently
+    /// read as "not quiesced" and keep admitting work through the one window
+    /// this flag exists to close. A NUL byte in the path is a portable,
+    /// privilege-independent way to force `fs::metadata` to fail with
+    /// something other than `NotFound` (`InvalidInput`), without relying on
+    /// dropping privileges (this suite may run as root, where permission bits
+    /// are bypassed and would not otherwise reproduce the error path).
+    #[test]
+    fn quiesce_probe_error_other_than_not_found_fails_safe() {
+        let bogus = PathBuf::from("/tmp/gha-quiesce-\0-invalid");
+        assert!(
+            quiesce_active_at(&bogus),
+            "a stat error that isn't confirmed-absent must be treated as quiesced"
+        );
+    }
 
     /// Regression guard for grok's review catch on #107: the scribe repos name their
     /// cargo build+test job exactly "test", and cargo-mutants names its job "mutants".

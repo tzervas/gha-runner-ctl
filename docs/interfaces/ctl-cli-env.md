@@ -107,6 +107,7 @@ All global options accept the same name as env var (clap `env =`); boolean env v
 | `--priority-repos` | `GHA_PRIORITY_REPOS` | CSV `owner/repo` | — | Polled **every tick before** RR (hot queues) |
 | `--listen-min-interval` | `GHA_LISTEN_MIN_INTERVAL` | u64 | `45` | Floor for `scope=user` listen poll interval |
 | `--pool-scan-per-tick` | `GHA_POOL_SCAN_PER_TICK` | u32 | `12` | Max non-priority repos scanned per tick in dynamic pool |
+| — | `GHA_QUIESCE_FILE` | path | `<pool dir>/quiesce` | Flag file; while it exists `listen` admits **no new work**. In-flight jobs finish, workers are still reaped, no GitHub API calls are made. Create to pause, delete to resume — no restart, no signal, no PID lookup. A **directory** at this path is ignored. |
 | `--reap-stale-secs` | `GHA_REAP_STALE_SECS` | u64 | `3600` | On listen start (ephemeral): stop+rm unclaimed workers older than N; `0` disables |
 | `--tick-log` | `GHA_TICK_LOG` | path / `auto` / `off` | `auto` | JSONL tick metrics; `auto` → `$XDG_DATA_HOME/gha-runner-ctl/logs/listen-ticks.jsonl` |
 | `--api-min-gap-ms` | `GHA_API_MIN_GAP_MS` | u64 | `1000` | Clamped **50–60000** in pacer |
@@ -170,3 +171,26 @@ All global options accept the same name as env var (clap `env =`); boolean env v
 ## Delta since previous bulletin
 
 - **0.2.6 STABLE:** First published `ctl-cli-env.md` aligned to `src/lib.rs` clap surface, wake server, locks, and version lockstep.
+### Per-tier worker sizing
+
+`GHA_TIER_<TIER>` overrides the built-in size for one tier, as `<cpus>:<memory>`:
+
+| Var | Default | Example |
+|-----|---------|---------|
+| `GHA_TIER_MICRO` | `1:1g` | |
+| `GHA_TIER_SMALL` | `2:2g` | |
+| `GHA_TIER_MEDIUM` | `4:4g` | |
+| `GHA_TIER_LARGE` | `12:16g` | `6:12g` |
+| `GHA_TIER_XLARGE` | `20:28g` | |
+| `GHA_TIER_GPU` | `8:16g` | |
+
+Unset tiers keep their defaults; malformed values are logged and ignored rather
+than passed through to podman.
+
+Tune this when the pool is bound on one resource while the other sits idle. The
+defaults were picked for a **memory-bound** pool (`free_left=2.00c/0MiB` — cores
+free, memory gone). A **CPU-bound** pool shows the inverse
+(`free_left=0.00c/26624MiB`), and wants smaller per-job CPU so more jobs run
+concurrently. Concurrency is `min(pool_cpus/tier_cpus, pool_mem/tier_mem)` — pick
+tier sizes that make those two roughly equal, or the smaller one caps throughput
+while the other resource is wasted.
