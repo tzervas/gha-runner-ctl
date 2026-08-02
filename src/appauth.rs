@@ -1072,15 +1072,103 @@ pub(crate) fn doctor_report(
     })
 }
 
-/// The permission set documented in `docs/GITHUB_APP_AUTH.md` for repo-scoped
-/// installations: `actions:read`, `administration:write`, `metadata:read`. `doctor`
-/// flags anything short of this so a mis-scoped App fails loudly instead of as a
-/// confusing 403 mid-`listen`.
-const EXPECTED_PERMISSIONS: &[(&str, &str)] = &[
+/// Permission sets required to mint runner registration tokens, keyed by
+/// registration scope. `doctor` flags anything short of the applicable set so a
+/// mis-scoped App fails loudly instead of as a confusing 403 mid-`listen`.
+///
+/// The two sets differ in one entry, and that entry is the whole reason to prefer
+/// an organization:
+///
+/// | scope | token-minting permission | also grants |
+/// |---|---|---|
+/// | repo / user | `administration:write` | repo settings, collaborators, branch protection, transfer, **deletion** |
+/// | org | `organization_self_hosted_runners:write` | nothing else |
+///
+/// On a **user account** there is no narrow option. GitHub exposes no
+/// user-scoped equivalent of `organization_self_hosted_runners`, so minting a
+/// registration token requires `administration:write` — which also confers the
+/// ability to delete every repository the App is installed on. The credential
+/// cannot be narrowed, only confined.
+///
+/// On an **organization** the narrow permission exists and is sufficient. It is
+/// available on the **free** organization tier (verified against the live API:
+/// `POST /orgs/{org}/actions/runners/registration-token` succeeds, and the
+/// `Default` runner group is present). Only *additional* runner groups require a
+/// paid tier, and those exist to restrict which repos may use which runner — the
+/// opposite of what a single shared pool wants.
+///
+/// See `docs/GITHUB_APP_AUTH.md` for the migration path.
+pub(crate) const REPO_SCOPE_PERMISSIONS: &[(&str, &str)] = &[
     ("actions", "read"),
     ("administration", "write"),
     ("metadata", "read"),
 ];
+
+/// Org-scoped equivalent. Note `organization_self_hosted_runners` in place of
+/// `administration` — same capability, without repository deletion rights.
+pub(crate) const ORG_SCOPE_PERMISSIONS: &[(&str, &str)] = &[
+    ("actions", "read"),
+    ("organization_self_hosted_runners", "write"),
+    ("metadata", "read"),
+];
+
+/// The permission set required for `scope`.
+pub(crate) fn expected_permissions(scope: crate::Scope) -> &'static [(&'static str, &'static str)] {
+    match scope {
+        crate::Scope::Org => ORG_SCOPE_PERMISSIONS,
+        crate::Scope::Repo | crate::Scope::User => REPO_SCOPE_PERMISSIONS,
+    }
+}
+
+/// Advisory emitted by `doctor` for **personal (user/repo) scope only**.
+///
+/// Deliberately not shown for `--scope org`: an org installation already holds
+/// the narrow permission, and nagging it toward a migration it has completed
+/// would be noise.
+///
+/// This is guidance, not a failure. Personal scope works — it just cannot be
+/// least-privilege, because GitHub provides no narrow user-scoped alternative.
+pub(crate) fn personal_scope_advisory() -> Vec<String> {
+    vec![
+        "[WARN] personal-account scope: this App holds administration:write, which also grants"
+            .to_string(),
+        "       repository DELETION on every repo it is installed on. That is not a".to_string(),
+        "       misconfiguration here — GitHub publishes no narrower user-scoped permission for"
+            .to_string(),
+        "       minting runner registration tokens, so the credential can only be confined."
+            .to_string(),
+        "".to_string(),
+        "       To eliminate it entirely, register at organization scope instead:".to_string(),
+        "         1. Create an organization — the FREE tier is sufficient. Org-level runner"
+            .to_string(),
+        "            registration and the Default runner group are both available on it;"
+            .to_string(),
+        "            only ADDITIONAL runner groups require a paid plan, and those exist to"
+            .to_string(),
+        "            restrict which repos may use which runner — the opposite of one".to_string(),
+        "            shared pool.".to_string(),
+        "         2. Move your repositories into it. Transfer preserves issues, PRs, stars and"
+            .to_string(),
+        "            history and installs a redirect so existing clones keep working; forking or"
+            .to_string(),
+        "            mirror-pushing works too if you want to keep the originals in place."
+            .to_string(),
+        "         3. Create a GitHub App OWNED BY THE ORG with Organization permissions ->"
+            .to_string(),
+        "            Self-hosted runners: Read and write. Do NOT grant Administration.".to_string(),
+        "         4. Re-run with --scope org --owner <your-org>.".to_string(),
+        "".to_string(),
+        "       Full walkthrough: docs/GITHUB_APP_AUTH.md".to_string(),
+    ]
+}
+
+/// Human-readable rendering of a permission set, for `doctor` output.
+pub(crate) fn describe_permissions(set: &[(&str, &str)]) -> String {
+    set.iter()
+        .map(|(p, l)| format!("{p}:{l}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 fn permission_rank(level: &str) -> u8 {
     match level {
@@ -1096,8 +1184,11 @@ fn permission_rank(level: &str) -> u8 {
 /// covered (extra permissions beyond the expected set are not flagged as failures —
 /// `doctor` reports them separately as informational, since over-scoping isn't a
 /// functional break the way under-scoping is).
-pub(crate) fn missing_permissions(granted: &BTreeMap<String, String>) -> Vec<String> {
-    EXPECTED_PERMISSIONS
+pub(crate) fn missing_permissions(
+    granted: &BTreeMap<String, String>,
+    scope: crate::Scope,
+) -> Vec<String> {
+    expected_permissions(scope)
         .iter()
         .filter_map(|(perm, level)| {
             let have = granted.get(*perm).map(String::as_str).unwrap_or("none");
@@ -1710,7 +1801,7 @@ mod tests {
         perms.insert("actions".to_string(), "read".to_string());
         perms.insert("administration".to_string(), "write".to_string());
         perms.insert("metadata".to_string(), "read".to_string());
-        assert!(missing_permissions(&perms).is_empty());
+        assert!(missing_permissions(&perms, crate::Scope::Repo).is_empty());
     }
 
     #[test]
@@ -1720,7 +1811,7 @@ mod tests {
         // administration missing entirely; metadata under-scoped (none < read is moot
         // since it's just absent, but exercise an explicit "none" value too).
         perms.insert("metadata".to_string(), "none".to_string());
-        let missing = missing_permissions(&perms);
+        let missing = missing_permissions(&perms, crate::Scope::Repo);
         assert!(
             missing
                 .iter()
@@ -1734,12 +1825,105 @@ mod tests {
     }
 
     #[test]
+    fn advisory_is_personal_scope_only_and_names_the_free_org_path() {
+        let a = personal_scope_advisory().join("\n");
+        // Must state the actual risk, not a vague nudge.
+        assert!(
+            a.contains("administration:write"),
+            "must name the permission"
+        );
+        assert!(
+            a.to_lowercase().contains("deletion"),
+            "must state what it grants"
+        );
+        // Must not read as a misconfiguration — personal scope is legitimate.
+        assert!(
+            a.contains("not a") && a.contains("misconfiguration"),
+            "must clarify this is unavoidable, not user error"
+        );
+        // Must give the concrete migration path, all four steps.
+        assert!(a.contains("FREE"), "must say the org tier is free");
+        assert!(a.contains("Transfer"), "must mention transfer");
+        assert!(
+            a.contains("fork") || a.contains("mirror-push"),
+            "must offer alternatives"
+        );
+        assert!(
+            a.contains("Self-hosted runners"),
+            "must name the org permission"
+        );
+        assert!(a.contains("--scope org"), "must give the flag");
+        assert!(
+            a.contains("Do NOT grant Administration"),
+            "must warn against re-granting the very permission being eliminated"
+        );
+    }
+
+    #[test]
+    fn org_scope_does_not_require_administration_write() {
+        // The whole point of the org path: minting a registration token must NOT
+        // require the permission that also confers repository deletion.
+        let perms: BTreeMap<String, String> = [
+            ("actions", "read"),
+            ("organization_self_hosted_runners", "write"),
+            ("metadata", "read"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        assert!(
+            missing_permissions(&perms, crate::Scope::Org).is_empty(),
+            "org scope should be satisfied without administration:write"
+        );
+        // The same grant must FAIL repo scope, or the two sets are not really distinct.
+        assert!(
+            !missing_permissions(&perms, crate::Scope::Repo).is_empty(),
+            "repo scope must still demand administration:write"
+        );
+    }
+
+    #[test]
+    fn repo_scope_grant_is_insufficient_for_org_scope() {
+        let perms: BTreeMap<String, String> = [
+            ("actions", "read"),
+            ("administration", "write"),
+            ("metadata", "read"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        assert!(missing_permissions(&perms, crate::Scope::Repo).is_empty());
+        let missing = missing_permissions(&perms, crate::Scope::Org);
+        assert!(
+            missing
+                .iter()
+                .any(|m| m.contains("organization_self_hosted_runners")),
+            "org scope must flag the missing narrow permission, got {missing:?}"
+        );
+    }
+
+    #[test]
+    fn user_scope_shares_the_repo_permission_set() {
+        // User scope registers per-repo under the hood, so it carries the same
+        // (unavoidably broad) requirement. Asserted so a future change to one
+        // does not silently diverge from the other.
+        assert_eq!(
+            expected_permissions(crate::Scope::User),
+            expected_permissions(crate::Scope::Repo)
+        );
+        assert_ne!(
+            expected_permissions(crate::Scope::Org),
+            expected_permissions(crate::Scope::Repo)
+        );
+    }
+
+    #[test]
     fn missing_permissions_higher_than_required_still_passes() {
         let mut perms = BTreeMap::new();
         perms.insert("actions".to_string(), "write".to_string()); // higher than required read
         perms.insert("administration".to_string(), "admin".to_string());
         perms.insert("metadata".to_string(), "read".to_string());
-        assert!(missing_permissions(&perms).is_empty());
+        assert!(missing_permissions(&perms, crate::Scope::Repo).is_empty());
     }
 
     // --- real RS256 signing, no network: skipped if openssl is absent -----------
