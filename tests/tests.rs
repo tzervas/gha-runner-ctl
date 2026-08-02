@@ -1,4 +1,4 @@
-use gha_runner_ctl::*;
+use ap_runner_ctl::*;
 
 #[test]
 fn test_wake_auth_preserves_token_case() {

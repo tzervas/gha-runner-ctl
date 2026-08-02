@@ -1,4 +1,4 @@
-use gha_runner_ctl::{is_safe_repo, parse_github_remote, redact};
+use ap_runner_ctl::{is_safe_repo, parse_github_remote, redact};
 
 #[test]
 fn rejects_shell_metacharacters_in_repo() {

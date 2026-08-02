@@ -1,4 +1,8 @@
-# gha-runner-ctl
+# ap-runner-ctl
+
+> Renamed from `gha-runner-ctl`. The `gha-runner-ctl` binary still ships as a
+> compat alias for one minor cycle, and every `GHA_*` env var, data path and
+> systemd unit name is unchanged — see `docs/interfaces/ctl-cli-env.md`.
 
 <!-- FLEET-BADGES:BEGIN -->
 [![CI](https://github.com/tzervas/gha-runner-ctl/actions/workflows/fleet-ci.yml/badge.svg?branch=main)](https://github.com/tzervas/gha-runner-ctl/actions/workflows/fleet-ci.yml?query=branch%3Amain)

@@ -13,7 +13,7 @@ major_version_zero = true
 version_files = [
     "VERSION",
     "Cargo.toml:version",
-    "src/lib.rs:gha-runner-ctl/",
+    "src/lib.rs:ap-runner-ctl/",
 ]
 
 update_changelog_on_bump = true

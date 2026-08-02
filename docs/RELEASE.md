@@ -81,7 +81,7 @@ On every release bump, these must agree:
 |------|--------|
 | `VERSION` | Plain `X.Y.Z` |
 | `Cargo.toml` | `[package].version` |
-| `src/lib.rs` | `const UA: &str = "gha-runner-ctl/X.Y.Z"` |
+| `src/lib.rs` | `const UA: &str = "ap-runner-ctl/X.Y.Z"` |
 | `CHANGELOG.md` | New `## X.Y.Z` section |
 
 Commitizen (`.cz.toml`) updates `VERSION`, `Cargo.toml`, and the `UA` prefix in
