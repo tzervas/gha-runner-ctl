@@ -1301,7 +1301,7 @@ mod tests {
         assert!(plan.scale_in.is_empty());
         // Micro jobs get distinct slots 0,1,2
         let mut slots: Vec<_> = plan.spawns.iter().map(|s| s.slot).collect();
-        slots.sort();
+        slots.sort_unstable();
         assert_eq!(slots, vec![0, 1, 2]);
     }
 

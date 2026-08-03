@@ -16,6 +16,7 @@ The maintenance process ensures we never intentionally regress functionality, AP
   - `is_safe_image` performs a single pass verifying that every character matches allowed registry symbols to reject whitespace and shell metacharacters.
   - `is_safe_labels` splits and validates labels inline without heap-allocating intermediate vectors.
 - **Cargo Job & Parallelism Scaling**: Sizing configurations dynamically limit parallelism via `CARGO_BUILD_JOBS` aligned with container CPU quotas, mitigating heavy crate OOM (exit code 137) failures on multi-core hosts.
+- **Unstable Sorting of Unique/Primitive Collections**: Sorting of slots and polled repo lists uses `.sort_unstable()` instead of `.sort()`, avoiding heap allocations and speeding up hot path execution.
 
 ### 1.2 Robustness & Error Handling
 - **Concurrency Locking & Self-Healing**: Control of concurrency utilizing process locking employs RAII guards (`PoolLockGuard` and `ExclusiveLockGuard`) to guarantee lock file deletion on drop. Stale lock files from aborted or crashed processes are resolved automatically via `lock_is_stale` using active OS process existence checks, avoiding deadlock/starvation.
