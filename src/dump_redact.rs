@@ -66,6 +66,7 @@ pub enum UnsafeShape {
     Jwt,
     BearerToken,
     BasicAuthUrl,
+    SlackToken,
     HighEntropy,
 }
 
@@ -79,6 +80,7 @@ impl UnsafeShape {
             UnsafeShape::Jwt => "jwt",
             UnsafeShape::BearerToken => "bearer_token",
             UnsafeShape::BasicAuthUrl => "basic_auth_url",
+            UnsafeShape::SlackToken => "slack_token",
             UnsafeShape::HighEntropy => "high_entropy",
         }
     }
@@ -204,6 +206,22 @@ pub fn classify_value(value: &str) -> ValueVerdict {
     if is_jwt(v) {
         return ValueVerdict::Unsafe(UnsafeShape::Jwt);
     }
+    if is_slack_token(v) {
+        return ValueVerdict::Unsafe(UnsafeShape::SlackToken);
+    }
+
+    // --- Credential *embedded* in an otherwise plausible container ----------
+    // The checks above only look at the whole value. That misses a credential
+    // smuggled in as a path segment (`/var/lib/gitea/ghp_...`), a comma-list
+    // element (`repo-a,ghp_...`), or a token inside a multi-line/free-text blob
+    // (`"line one\ntoken=ghp_...\nline three"`) — every one of those still
+    // satisfies is_fs_path/classify_comma_list's *charset* check, or simply
+    // isn't the whole string, so the anchored whole-value checks above never
+    // see it. See find_embedded_credential's doc for exactly what this does and
+    // does not cover.
+    if let Some(shape) = find_embedded_credential(v) {
+        return ValueVerdict::Unsafe(shape);
+    }
 
     // --- Remaining safe-by-construction shapes ------------------------------
     if is_hostname(v) {
@@ -287,9 +305,93 @@ fn is_pem_block(v: &str) -> bool {
     v.contains("-----BEGIN ") || v.contains("PRIVATE KEY")
 }
 
+/// `Bearer <token>` — deliberately *not* anchored to the start of `v`: real-world
+/// stderr/header text this dump carries is routinely `"Authorization: Bearer <tok>"`
+/// or `"curl: ... -H 'Bearer <tok>' ..."`, so an anchored `strip_prefix` misses the
+/// header entirely and prints the token verbatim. Only the token immediately
+/// following "Bearer " (up to the next whitespace) is length-checked, so this
+/// doesn't just flag any string that happens to contain the word "Bearer" followed
+/// by a long unrelated tail.
 fn is_bearer_token(v: &str) -> bool {
-    v.strip_prefix("Bearer ")
-        .is_some_and(|rest| rest.len() >= 8 && !rest.trim().is_empty())
+    let Some(pos) = v.find("Bearer ") else {
+        return false;
+    };
+    let rest = &v[pos + "Bearer ".len()..];
+    let tail = rest.split_whitespace().next().unwrap_or("");
+    tail.len() >= 8
+}
+
+/// Slack token: `xoxb-`/`xoxp-`/`xoxa-`/`xoxr-`/`xoxs-` + a long hyphen-segmented
+/// alnum tail. Real Slack tokens are e.g. `xoxb-<team>-<id>-<secret>`.
+fn is_slack_token(v: &str) -> bool {
+    for prefix in ["xoxb-", "xoxp-", "xoxa-", "xoxr-", "xoxs-"] {
+        if let Some(rest) = v.strip_prefix(prefix) {
+            if rest.len() >= 20 && rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Delimiters that never occur *inside* any of the named credential shapes checked
+/// by [`find_embedded_credential`] (GitHub tokens are pure alnum after their
+/// prefix; fine-grained PATs add only `_`; AWS access key IDs are pure alnum; Slack
+/// tokens use only `-` internally) — so splitting on them can only ever *isolate* an
+/// embedded credential from surrounding text, never hide one by gluing it to
+/// something else.
+const EMBEDDED_SCAN_DELIMS: &[char] = &[
+    ' ', '\t', '\n', '\r', '/', ',', '=', ':', '@', '"', '\'', '{', '}', '[', ']', '(', ')', ';',
+    '?', '&', '<', '>', '|', '\\',
+];
+
+/// Scan `v` for a credential shape occurring anywhere inside it, not just as the
+/// whole value. See the call site in [`classify_value`] for why this exists.
+///
+/// Named-prefix shapes (GitHub token/PAT, AWS access key ID, Slack token) are checked
+/// on every split token unconditionally — a fixed prefix is essentially
+/// false-positive-free wherever it appears.
+///
+/// The entropy fallback is also applied per-token, but **only when `v` actually split
+/// into two or more non-empty tokens** (i.e. a delimiter fired: this is a comma-list /
+/// multi-segment path / multi-line-or-whitespace-separated blob, not a bare
+/// single-token value). That guard matters: a *whole, unsplit* value (a bare hostname,
+/// a bare image ref) is deliberately never entropy-scanned here, because real
+/// hostnames and image refs in this codebase's own tests
+/// (`runner-fleet-03.internal.example.com`, `ghcr.io/tzervas/gha-runner-ctl`) measure
+/// *above* the entropy threshold themselves — scanning an unsplit whole value would
+/// misfire on those. A *split-out piece* of a structured value is a different,
+/// narrower thing: legitimate repo-name/path-segment tokens are short (the entropy
+/// check's own `MIN_LEN=20` floor already excludes most of them) and constrained
+/// (hyphenated words, not opaque random data), which is why this narrower scan is a
+/// defensible risk/coverage trade — see module docs for the cases this still
+/// deliberately does NOT cover (a bare single-token secret with no delimiters at all,
+/// e.g. one that alone satisfies `is_hostname`'s permissive single-label charset).
+fn find_embedded_credential(v: &str) -> Option<UnsafeShape> {
+    let tokens: Vec<&str> = v
+        .split(EMBEDDED_SCAN_DELIMS)
+        .map(|raw| raw.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_'))
+        .filter(|t| !t.is_empty())
+        .collect();
+    let scan_entropy = tokens.len() > 1;
+    for token in &tokens {
+        if is_github_token(token) {
+            return Some(UnsafeShape::GithubToken);
+        }
+        if is_github_fine_grained_pat(token) {
+            return Some(UnsafeShape::GithubFineGrainedPat);
+        }
+        if is_aws_access_key_id(token) {
+            return Some(UnsafeShape::AwsAccessKeyId);
+        }
+        if is_slack_token(token) {
+            return Some(UnsafeShape::SlackToken);
+        }
+        if scan_entropy && is_high_entropy(token) {
+            return Some(UnsafeShape::HighEntropy);
+        }
+    }
+    None
 }
 
 /// `scheme://user:pass@host...` — basic auth embedded in a URL.
@@ -321,22 +423,57 @@ fn is_jwt(v: &str) -> bool {
 
 /// RFC 1123-ish hostname: dot-separated labels of alnum/hyphen, no scheme, no
 /// whitespace, no userinfo/path punctuation.
+///
+/// Closes a serious shape hole: a single alnum(+hyphen) *label* with no dot at all is
+/// structurally identical to a bare opaque secret with no recognized vendor prefix (a
+/// hex-shaped key, a generic API token) — nothing else in this module's charset-only
+/// safe-shape checks would ever apply an entropy check to it, since this function used
+/// to grant `Safe` unconditionally on charset alone. A genuine *multi-label* hostname
+/// (`runner-fleet-03.internal.example.com`) is intentionally exempted from this: this
+/// codebase's own realistic values legitimately measure above the entropy threshold
+/// themselves (see module docs), and the one allowlisted key with hostname-flavored
+/// documentation (`CONTAINER_HOST`) only ever actually holds a `unix://…`/`tcp://…`
+/// socket URI in this codebase (see `refuse_container_host_misconfig` in lib.rs) —
+/// which never reaches this function at all (`is_hostname` rejects anything containing
+/// `"://"` up front) — so a *single-label* value reaching this point is never a
+/// legitimate long descriptive hostname in current usage, making the entropy gate safe
+/// to apply there without a demonstrated false-positive case.
 fn is_hostname(v: &str) -> bool {
     if v.is_empty() || v.len() > 255 || v.contains("://") || v.contains('@') || v.contains(' ') {
         return false;
     }
     let labels: Vec<&str> = v.split('.').collect();
-    labels.iter().all(|label| {
+    let charset_ok = labels.iter().all(|label| {
         !label.is_empty()
             && label.len() <= 63
             && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
             && !label.starts_with('-')
             && !label.ends_with('-')
-    })
+    });
+    if !charset_ok {
+        return false;
+    }
+    if labels.len() == 1 && is_high_entropy(v) {
+        return false;
+    }
+    true
 }
 
 /// Plain filesystem path: absolute (`/…`) or a lone relative segment, no shell
 /// metacharacters, no URL scheme/userinfo.
+///
+/// Guards one specific shape hole: this charset (alnum + `- _ . / ~ + : space`) is a
+/// *superset* of the base64 alphabet (`A-Za-z0-9+/`), so a bare opaque secret that
+/// merely happens to start with `/` — a real, non-trivial occurrence for a uniformly
+/// random base64-ish value, since `/` is one of 64 possible leading characters —
+/// would otherwise be rubber-stamped "a path" with no entropy check ever applied
+/// (`is_fs_path` runs, and short-circuits, before the entropy fallback is reached at
+/// all). A single top-level segment (no further `/`) that is itself long and
+/// high-entropy is therefore rejected here, falling through to the real entropy
+/// check further down `classify_value`. Multi-segment paths (`/home/user/.local/bin`)
+/// are unaffected: real absolute paths with several segments routinely measure above
+/// the entropy threshold themselves (see module docs), so gating on entropy there
+/// would misclassify legitimate paths, and is deliberately not attempted here.
 fn is_fs_path(v: &str) -> bool {
     if !v.starts_with('/') {
         return false;
@@ -344,9 +481,19 @@ fn is_fs_path(v: &str) -> bool {
     if v.contains("://") || v.contains('@') || v.chars().any(|c| c.is_ascii_control()) {
         return false;
     }
-    v.chars().all(|c| {
+    let charset_ok = v.chars().all(|c| {
         c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | '~' | '+' | ':' | ' ')
-    })
+    });
+    if !charset_ok {
+        return false;
+    }
+    let mut segments = v[1..].split('/').filter(|s| !s.is_empty());
+    if let (Some(only_segment), None) = (segments.next(), segments.next()) {
+        if is_high_entropy(only_segment) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Container image reference: `[registry/]repo[:tag][@digest]`. Deliberately checked

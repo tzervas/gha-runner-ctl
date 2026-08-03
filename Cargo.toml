@@ -41,6 +41,7 @@ ureq = { version = "2.12", default-features = true, features = ["json"] }
 # in-process shim. For a crate that until now had no dev-dependencies at all and
 # forbids unsafe, that is the right supply-chain trade.
 [dev-dependencies]
+proptest = "1.11.0"
 tiny_http = "0.12"
 
 [lints.rust]
