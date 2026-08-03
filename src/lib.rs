@@ -23,7 +23,7 @@ pub use pool::{
     demand_empty_confirmed, empty_sweep_ticks, fit_to_budget, format_cpus, format_memory_mib,
     is_busy, parse_cpus_f64, parse_memory_mib, plan_scale, resources_for_tier, size_for_job,
     DemandSignal, ResourcePool, ScaleInput, ScalePlan, SizeTier, SpawnRequest, WorkerSnapshot,
-    DEFAULT_MAX_SPAWN_PER_TICK,
+    DEFAULT_MAX_SPAWN_PER_TICK, DEFAULT_SPAWN_GRACE_SECS,
 };
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -4770,6 +4770,24 @@ fn local_worker_snapshots(cli: &Cli, pool: &ResourcePool, max_local: u32) -> Vec
                 .iter()
                 .find(|c| c.container == container || c.worker_id == worker_id)
                 .and_then(|c| c.repo.clone());
+            // Age since container start — protects freshly-spawned workers from
+            // being misread as "post job exit" (issue #127). `None` when the
+            // container isn't running (age is moot; `running` alone already
+            // excludes it from reclaim) or inspect failed, which fails closed
+            // in `post_job_exit_eligible`.
+            let age_secs = if running {
+                container_started_age_secs(&container)
+            } else {
+                None
+            };
+            // No per-tick log-scraping for "listener exited" exists (and could
+            // not fire here anyway: the entrypoint execs run.sh as PID 1, so a
+            // finished listener process means the container has already exited
+            // -> `running == false` -> reaped by `reap_pool_workers` before this
+            // snapshot is ever built, never reaching plan_scale as `running &&
+            // !busy`). So there is no positive signal to observe for a worker
+            // that is still `running`; leave false and rely on `age_secs`.
+            let job_completed = false;
             out.push(WorkerSnapshot {
                 slot,
                 worker_id,
@@ -4777,6 +4795,8 @@ fn local_worker_snapshots(cli: &Cli, pool: &ResourcePool, max_local: u32) -> Vec
                 running,
                 busy,
                 repo,
+                age_secs,
+                job_completed,
             });
         }
     }
@@ -5003,6 +5023,14 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(DEFAULT_MAX_SPAWN_PER_TICK);
+            // Grace window protecting a freshly-spawned, never-assigned worker
+            // from being reclaimed as "post job exit" (issue #127: `busy=0`
+            // right after spawn means "never dispatched", not "already
+            // finished"). Operator-tunable for unusually slow GitHub dispatch.
+            let spawn_grace_secs = std::env::var("GHA_POOL_SPAWN_GRACE_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(DEFAULT_SPAWN_GRACE_SECS);
 
             let signals: Vec<DemandSignal> = filtered
                 .iter()
@@ -5030,6 +5058,7 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
                 idle_expired,
                 max_spawn_per_tick: max_spawn,
                 ephemeral_post_job_exit: true,
+                spawn_grace_secs,
             });
 
             eprintln!(

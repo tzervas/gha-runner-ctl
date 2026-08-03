@@ -85,3 +85,22 @@ GPU listeners require `gpu` on the job; they claim **gpu** CPU+RAM from the **sa
 - Managers (`listen`) stay warm via systemd  
 - Workflows set **labels**, not raw CPU/RAM env vars  
 - Resource choices must be **justified** (compile weight, matrix width, GPU training)  
+
+### Post-job-exit reclaim vs. spawn grace (issue #127)
+
+The scale planner reclaims idle (`running && !busy`) ephemeral workers
+immediately so they can't pin a pool slot to a repo they aren't converting on
+(`post-job-exit`, see `plan_scale` in `src/pool.rs`). `busy=0` is ambiguous by
+itself, though: it's also what a **freshly-spawned, never-dispatched** worker
+looks like before GitHub has had a chance to schedule a job onto it. Reading
+that as "already finished" reclaimed workers 40-70s after `up`, before they
+could ever take a job — a total stall regardless of queue depth.
+
+The fix: a `running && !busy` worker is only reclaimable when it is
+[`post_job_exit_eligible`](../../src/pool.rs) — either it carries a positive
+completion signal, or it has been running at least `GHA_POOL_SPAWN_GRACE_SECS`
+(default `90`) since spawn. A worker whose job genuinely finishes quickly is
+still reclaimed promptly in ephemeral mode: the runner process exits (it's
+`exec`'d as the container's PID 1), the container stops, and
+`reap_pool_workers` reaps it on the very next tick — independent of the grace
+window, so completed workers never leak capacity waiting one out.
