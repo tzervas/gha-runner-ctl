@@ -11,9 +11,16 @@
 //! (default 8 CPU / 8 GiB shared across all managers).
 
 mod appauth;
+mod dump_redact;
+mod fail_closed;
 mod image_arch;
 mod pool;
 
+pub use dump_redact::{
+    classify_value, is_allowlisted_key, redact_env_dump, redact_for_dump, RedactedField,
+    UnsafeShape, ValueVerdict, DUMP_ALLOWLIST,
+};
+pub use fail_closed::{check_succeeded, fail_closed, FailClosedEvent, FailClosedTracker};
 pub use image_arch::{
     binfmt_lists_arch, binfmt_missing_error, ensure_binfmt_for_arch, extra_image_arch_labels,
     load_image_map, parse_image_map, podman_platform_args, resolve_arch_from_labels,
@@ -527,18 +534,66 @@ pub enum Cmd {
     Doctor,
 }
 
+/// Shared gate for both debug dumps: `GHA_DEBUG=1` always enables; otherwise
+/// `GHA_DEBUG_ON_ERR` unset/`1`/`true`/`yes` (default ON while stabilizing the fleet
+/// agent / rootless path) enables, `GHA_DEBUG_ON_ERR=0` silences.
+fn debug_dump_enabled() -> bool {
+    let always = env_truthy("GHA_DEBUG");
+    let on_err = match std::env::var("GHA_DEBUG_ON_ERR") {
+        Ok(v) => matches!(v.as_str(), "1" | "true" | "yes" | "YES" | ""),
+        Err(_) => true,
+    };
+    always || on_err
+}
+
+/// Keys dumped by [`debug_dump_on_error`] and [`debug_dump_fail_closed`]. Every one of
+/// these must also be an exact entry in `dump_redact::DUMP_ALLOWLIST` — see
+/// `dump_resolved_env`, which debug-asserts that on every call so a typo here fails
+/// loudly in dev/test builds rather than silently starting to print an unvetted key.
+const DEBUG_DUMP_ENV_KEYS: &[&str] = &[
+    "HOME",
+    "XDG_RUNTIME_DIR",
+    "CONTAINER_HOST",
+    "GHA_ALLOW_ROOT",
+    "GHA_SCOPE",
+    "GHA_USER",
+    "GHA_REPO",
+    "GHA_PREFER_REPOS",
+    "GHA_ALLOWLIST_REPOS",
+    "GHA_MODE",
+    "GHA_CONTAINER",
+    "GHA_VOLUME",
+    "GHA_IMAGE",
+    "GHA_GPU",
+    "GHA_APP_ID",
+    "GHA_APP_INSTALLATION_ID",
+    "GHA_APP_PRIVATE_KEY",
+];
+
+/// Print each set env var in `keys`, redacted per [`dump_redact`] — an **allowlist** of
+/// exact key names plus a value-shape check, replacing the old `key.contains("TOKEN") ||
+/// key.contains("SECRET")` blocklist this function used to run. A blocklist only knows
+/// what it has been taught to reject; see the `dump_redact` module docs.
+fn dump_resolved_env(keys: &[&str]) {
+    for key in keys {
+        debug_assert!(
+            is_allowlisted_key(key),
+            "debug dump key {key:?} is not in dump_redact::DUMP_ALLOWLIST — add it there \
+             first so its value shape is actually validated"
+        );
+        if let Ok(v) = std::env::var(key) {
+            let field = redact_for_dump(key, &v);
+            eprintln!("{}={}", field.key, field.value);
+        }
+    }
+}
+
 /// Dump troubleshooting context after a failure (no secrets).
 ///
 /// Enabled when `GHA_DEBUG=1` or `GHA_DEBUG_ON_ERR` is unset/`1` (default on).
 /// Disable with `GHA_DEBUG_ON_ERR=0` once the stack is stable.
 pub fn debug_dump_on_error(err: &str) {
-    let always = env_truthy("GHA_DEBUG");
-    let on_err = match std::env::var("GHA_DEBUG_ON_ERR") {
-        Ok(v) => matches!(v.as_str(), "1" | "true" | "yes" | "YES" | ""),
-        // Default ON while stabilizing the fleet agent / rootless path.
-        Err(_) => true,
-    };
-    if !always && !on_err {
+    if !debug_dump_enabled() {
         return;
     }
     eprintln!("========== gha-runner-ctl DEBUG ON ERROR ==========");
@@ -551,30 +606,7 @@ pub fn debug_dump_on_error(err: &str) {
     if let Ok(cwd) = std::env::current_dir() {
         eprintln!("pwd:        {}", cwd.display());
     }
-    for key in [
-        "HOME",
-        "XDG_RUNTIME_DIR",
-        "CONTAINER_HOST",
-        "GHA_ALLOW_ROOT",
-        "GHA_SCOPE",
-        "GHA_USER",
-        "GHA_REPO",
-        "GHA_PREFER_REPOS",
-        "GHA_ALLOWLIST_REPOS",
-        "GHA_MODE",
-        "GHA_CONTAINER",
-        "GHA_VOLUME",
-        "GHA_IMAGE",
-        "GHA_GPU",
-    ] {
-        if let Ok(v) = std::env::var(key) {
-            // Never dump tokens.
-            if key.contains("TOKEN") || key.contains("SECRET") {
-                continue;
-            }
-            eprintln!("{key}={v}");
-        }
-    }
+    dump_resolved_env(DEBUG_DUMP_ENV_KEYS);
     // Best-effort podman snapshot (stdout/stderr redacted).
     match Command::new("podman")
         .args([
@@ -615,6 +647,48 @@ pub fn debug_dump_on_error(err: &str) {
     }
     eprintln!("hint:       GHA_DEBUG=1 for more; GHA_DEBUG_ON_ERR=0 to silence");
     eprintln!("===================================================");
+}
+
+/// Developer debug dump for a single fail-closed decision (issue #132).
+///
+/// A fail-closed event is usually a logic or environment bug, not a transient — this
+/// prints exactly what a developer needs to tell those apart in one pass: the failing
+/// command, its real exit status and (redacted) stderr, the resolved inputs that fed
+/// the decision, and what the code assumed as a result. Same `GHA_DEBUG`/
+/// `GHA_DEBUG_ON_ERR` gate as [`debug_dump_on_error`].
+///
+/// `resolved_inputs` are dumped through the exact same [`dump_redact`] allowlist as
+/// [`debug_dump_on_error`] — an unrecognised key is printed as
+/// `***REDACTED(key_not_allowlisted)***`, never silently skipped, so a caller that
+/// passes something new finds out immediately rather than assuming it was included.
+pub fn debug_dump_fail_closed(
+    ev: &FailClosedEvent,
+    command: &str,
+    resolved_inputs: &[(&str, String)],
+) {
+    if !debug_dump_enabled() {
+        return;
+    }
+    eprintln!("========== gha-runner-ctl DEBUG (fail-closed) ==========");
+    eprintln!("check:       {}", ev.check);
+    eprintln!("object:      {}", ev.object);
+    eprintln!("assumed:     {}", ev.assumed);
+    eprintln!("consecutive: {} (since {})", ev.consecutive, ev.since);
+    eprintln!("command:     {command}");
+    // ev.reason is the real error including exit status; already redact()-scrubbed by
+    // the caller (podman()'s Err path runs subprocess stderr through it before this
+    // ever gets here) since it is free text, not a named key/value pair.
+    eprintln!("reason:      {}", ev.reason);
+    eprintln!("resolved inputs:");
+    let pairs: Vec<(&str, &str)> = resolved_inputs
+        .iter()
+        .map(|(k, v)| (*k, v.as_str()))
+        .collect();
+    for field in redact_env_dump(pairs) {
+        eprintln!("  {}={}", field.key, field.value);
+    }
+    eprintln!("hint:        GHA_DEBUG=1 for more; GHA_DEBUG_ON_ERR=0 to silence");
+    eprintln!("==========================================================");
 }
 
 fn env_truthy(key: &str) -> bool {
@@ -2465,8 +2539,15 @@ fn podman(args: &[&str]) -> Result<String, String> {
         .map_err(|e| format!("podman not runnable: {e}"))?;
     if !out.status.success() {
         let err = redact(&String::from_utf8_lossy(&out.stderr));
+        // Real exit status included (not just "failed") so a fail-closed debug dump
+        // built from this message can tell a genuine command failure apart from e.g. a
+        // signal kill — see debug_dump_fail_closed / issue #132.
+        let status = out
+            .status
+            .code()
+            .map_or_else(|| "signal".to_string(), |c| c.to_string());
         return Err(format!(
-            "podman {} failed: {}",
+            "podman {} failed (exit={status}): {}",
             args.first().unwrap_or(&"?"),
             err.trim()
         ));
@@ -2491,18 +2572,35 @@ fn container_running(name: &str) -> bool {
 ///
 /// Fail-closed: if the container is running but process inspection fails, treat
 /// as busy so we never tear down a mid-job worker under uncertainty.
+///
+/// That fail-closed decision is exactly the silent-but-correct case issue #132 is
+/// about: on its own it's harmless (the worker just isn't scaled in this tick), but a
+/// `podman top` that starts erroring on every tick means scale-in silently stops
+/// happening at all — workers pile up until the host's CPU/memory budget is exhausted,
+/// with no signal pointing at `podman top` as the cause. `fail_closed` turns that into
+/// an alertable streak; `debug_dump_fail_closed` gives a developer investigating it the
+/// real command, exit status and stderr in one pass.
 fn container_worker_busy(name: &str) -> bool {
     if !container_running(name) {
         return false;
     }
     match podman(&["top", name]) {
         Ok(out) => {
+            check_succeeded("worker_busy_probe");
             let lower = out.to_ascii_lowercase();
             // actions/runner spawns Runner.Worker (any path / casing) for the job.
             lower.contains("runner.worker")
         }
         // Cannot prove idle → not eligible for scale-in.
-        Err(_) => true,
+        Err(reason) => {
+            let ev = fail_closed("worker_busy_probe", name, "busy", &reason);
+            let inputs: Vec<(&str, String)> = DEBUG_DUMP_ENV_KEYS
+                .iter()
+                .filter_map(|&k| std::env::var(k).ok().map(|v| (k, v)))
+                .collect();
+            debug_dump_fail_closed(&ev, "podman top <container>", &inputs);
+            true
+        }
     }
 }
 
