@@ -126,14 +126,35 @@ fn test_case_insensitive_wake_auth_headers() {
     ));
 }
 
+// --- issue #132 third follow-up audit: redact() now delegates to
+// dump_redact::redact_free_text instead of an independent, weaker 8-entry prefix
+// blocklist (see redact()'s doc comment in lib.rs for why: two redactors of
+// different strength in one codebase is exactly how the round-3 finding happened —
+// debug_dump_on_error's `err` field had zero redaction of its own and relied
+// entirely on this old, weaker blocklist having been run by its one caller). The
+// tests below are updated from that old blocklist's specific placeholder text
+// ("***REDACTED***", no shape info) to the new shape-labeled placeholders
+// (`***REDACTED(<shape>)***`), and from short/unrealistic secret bodies to
+// realistic-length synthetic ones, consistent with the rest of this codebase's
+// fixtures (e.g. fail_closed.rs, dump_redact.rs).
+
 #[test]
 fn test_multiple_secret_redactions() {
-    let raw =
-        "Here are two secrets: Bearer ghp_ABC123 and another Bearer ghp_XYZ789 in the same string.";
-    let redacted_str = redact(raw);
-    assert!(!redacted_str.contains("ABC123"));
-    assert!(!redacted_str.contains("XYZ789"));
-    assert!(redacted_str.matches("***REDACTED***").count() >= 2);
+    // Realistic-length (36+ chars after the prefix) synthetic tokens — the shape
+    // check redact_free_text uses requires that length to avoid false-positiving on
+    // ordinary identifiers that merely start with "ghp_".
+    let secret1 = format!("ghp_{}", "a1B2c3D4".repeat(5));
+    let secret2 = format!("ghp_{}", "e5F6g7H8".repeat(5));
+    let raw = format!(
+        "Here are two secrets: Bearer {secret1} and another Bearer {secret2} in the same string."
+    );
+    let redacted_str = redact(&raw);
+    assert!(!redacted_str.contains(&secret1));
+    assert!(!redacted_str.contains(&secret2));
+    assert!(
+        redacted_str.matches("***REDACTED(").count() >= 2,
+        "expected 2+ shape-labeled redactions, got: {redacted_str}"
+    );
 }
 
 #[test]
@@ -193,7 +214,7 @@ struct RedactTestCase {
 fn test_redact_parameterized() {
     let test_cases = vec![RedactTestCase {
         input: "Bearer ghp_ABCDEFGHIJKLMNOPQRST",
-        expected_contains: "***REDACTED***",
+        expected_contains: "***REDACTED(",
         expected_not_contains: "ABCDEF",
     }];
 
@@ -219,7 +240,14 @@ fn test_redact_gho_prefix() {
     // Built at runtime so gitleaks does not flag a static OAuth-shaped secret.
     let input = format!("RUNNER_TOKEN={}1234567890abcdef", concat!("gh", "o_"));
     let result = redact(&input);
-    assert!(result.contains("***REDACTED***"), "got: {result}");
+    // Caught by the RUNNER_TOKEN= marker (folded into redact_free_text — issue #132
+    // third follow-up audit; see UnsafeShape::RunnerTokenEnv) since the body here
+    // (20 chars) is shorter than the 36-char minimum the named gho_ token shape
+    // requires on its own.
+    assert!(
+        result.contains("***REDACTED(runner_token_env)***"),
+        "got: {result}"
+    );
     assert!(!result.contains("12345"), "got: {result}");
 }
 

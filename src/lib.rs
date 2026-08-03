@@ -11,9 +11,16 @@
 //! (default 8 CPU / 8 GiB shared across all managers).
 
 mod appauth;
+mod dump_redact;
+mod fail_closed;
 mod image_arch;
 mod pool;
 
+pub use dump_redact::{
+    classify_value, is_allowlisted_key, redact_env_dump, redact_for_dump, redact_free_text,
+    RedactedField, UnsafeShape, ValueVerdict, DUMP_ALLOWLIST,
+};
+pub use fail_closed::{check_succeeded, fail_closed, FailClosedEvent, FailClosedTracker};
 pub use image_arch::{
     binfmt_lists_arch, binfmt_missing_error, ensure_binfmt_for_arch, extra_image_arch_labels,
     load_image_map, parse_image_map, podman_platform_args, resolve_arch_from_labels,
@@ -527,56 +534,132 @@ pub enum Cmd {
     Doctor,
 }
 
+/// Shared gate for both debug dumps: `GHA_DEBUG=1` always enables; otherwise
+/// `GHA_DEBUG_ON_ERR` unset/`1`/`true`/`yes` (default ON while stabilizing the fleet
+/// agent / rootless path) enables, `GHA_DEBUG_ON_ERR=0` silences.
+fn debug_dump_enabled() -> bool {
+    let always = env_truthy("GHA_DEBUG");
+    let on_err = match std::env::var("GHA_DEBUG_ON_ERR") {
+        Ok(v) => matches!(v.as_str(), "1" | "true" | "yes" | "YES" | ""),
+        Err(_) => true,
+    };
+    always || on_err
+}
+
+/// Keys dumped by [`debug_dump_on_error`] and [`debug_dump_fail_closed`]. Every one of
+/// these must also be an exact entry in `dump_redact::DUMP_ALLOWLIST` — see
+/// `dump_resolved_env`, which debug-asserts that on every call so a typo here fails
+/// loudly in dev/test builds rather than silently starting to print an unvetted key.
+const DEBUG_DUMP_ENV_KEYS: &[&str] = &[
+    "HOME",
+    "XDG_RUNTIME_DIR",
+    "CONTAINER_HOST",
+    "GHA_ALLOW_ROOT",
+    "GHA_SCOPE",
+    "GHA_USER",
+    "GHA_REPO",
+    "GHA_PREFER_REPOS",
+    "GHA_ALLOWLIST_REPOS",
+    "GHA_MODE",
+    "GHA_CONTAINER",
+    "GHA_VOLUME",
+    "GHA_IMAGE",
+    "GHA_GPU",
+    "GHA_APP_ID",
+    "GHA_APP_INSTALLATION_ID",
+    "GHA_APP_PRIVATE_KEY",
+];
+
+/// Print each set env var in `keys`, redacted per [`dump_redact`] — an **allowlist** of
+/// exact key names plus a value-shape check, replacing the old `key.contains("TOKEN") ||
+/// key.contains("SECRET")` blocklist this function used to run. A blocklist only knows
+/// what it has been taught to reject; see the `dump_redact` module docs.
+fn dump_resolved_env(keys: &[&str]) {
+    for key in keys {
+        debug_assert!(
+            is_allowlisted_key(key),
+            "debug dump key {key:?} is not in dump_redact::DUMP_ALLOWLIST — add it there \
+             first so its value shape is actually validated"
+        );
+        if let Ok(v) = std::env::var(key) {
+            let field = redact_for_dump(key, &v);
+            eprintln!("{}={}", field.key, field.value);
+        }
+    }
+}
+
+/// Text that has passed through [`redact_free_text`] and is therefore safe to print
+/// verbatim. Private field, single redacting constructor — no other way to build one
+/// — the same pattern as [`RedactedCommand`] and [`FailClosedEvent::redacted`], but
+/// for the general case of "any free-text field a dump function is about to print",
+/// not specifically a command string.
+///
+/// Exists because of exactly how the issue #132 third follow-up audit's finding
+/// happened: [`debug_dump_fail_closed`]'s sibling [`debug_dump_on_error`] printed its
+/// `err` parameter via a bare `eprintln!("error: {err}")` with **no** redaction of its
+/// own, relying entirely on its one caller (`main.rs`) having pre-scrubbed it — and
+/// that caller used the old, materially weaker `redact()` blocklist (now retired; see
+/// its doc comment), so an AWS-shaped secret sailed through untouched. A type that can
+/// only be constructed pre-redacted makes that specific failure mode structurally
+/// unreachable in [`write_debug_dump_on_error`] the same way [`RedactedCommand`]
+/// already made it unreachable for `command` in [`write_debug_dump_fail_closed`]: every
+/// value that function prints is this type, not `&str`, so there is no raw path left
+/// to accidentally reach for.
+struct RedactedText(String);
+
+impl RedactedText {
+    fn new(raw: &str) -> Self {
+        RedactedText(redact_free_text(raw))
+    }
+}
+
+impl fmt::Display for RedactedText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Dump troubleshooting context after a failure (no secrets).
 ///
 /// Enabled when `GHA_DEBUG=1` or `GHA_DEBUG_ON_ERR` is unset/`1` (default on).
 /// Disable with `GHA_DEBUG_ON_ERR=0` once the stack is stable.
+///
+/// Gathers `err` plus best-effort environment/subprocess context, then hands
+/// everything to `write_debug_dump_on_error` for the actual printing — that
+/// function, not this one, is what carries the redaction guarantee (issue #132 third
+/// follow-up audit): see its doc comment.
 pub fn debug_dump_on_error(err: &str) {
-    let always = env_truthy("GHA_DEBUG");
-    let on_err = match std::env::var("GHA_DEBUG_ON_ERR") {
-        Ok(v) => matches!(v.as_str(), "1" | "true" | "yes" | "YES" | ""),
-        // Default ON while stabilizing the fleet agent / rootless path.
-        Err(_) => true,
-    };
-    if !always && !on_err {
+    if !debug_dump_enabled() {
         return;
     }
-    eprintln!("========== gha-runner-ctl DEBUG ON ERROR ==========");
-    eprintln!("error:      {err}");
-    eprintln!(
-        "user:       {} euid_root={}",
-        std::env::var("USER").unwrap_or_else(|_| "?".into()),
-        effective_uid_is_root()
-    );
-    if let Ok(cwd) = std::env::current_dir() {
-        eprintln!("pwd:        {}", cwd.display());
-    }
-    for key in [
-        "HOME",
-        "XDG_RUNTIME_DIR",
-        "CONTAINER_HOST",
-        "GHA_ALLOW_ROOT",
-        "GHA_SCOPE",
-        "GHA_USER",
-        "GHA_REPO",
-        "GHA_PREFER_REPOS",
-        "GHA_ALLOWLIST_REPOS",
-        "GHA_MODE",
-        "GHA_CONTAINER",
-        "GHA_VOLUME",
-        "GHA_IMAGE",
-        "GHA_GPU",
-    ] {
-        if let Ok(v) = std::env::var(key) {
-            // Never dump tokens.
-            if key.contains("TOKEN") || key.contains("SECRET") {
-                continue;
-            }
-            eprintln!("{key}={v}");
-        }
-    }
-    // Best-effort podman snapshot (stdout/stderr redacted).
-    match Command::new("podman")
+    let user = std::env::var("USER").unwrap_or_else(|_| "?".into());
+    let euid_root = effective_uid_is_root();
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string());
+    dump_resolved_env(DEBUG_DUMP_ENV_KEYS);
+    let podman = gather_podman_dump_snapshot();
+    let mut stderr = std::io::stderr();
+    // Infallible by convention (matches every other eprintln!-based dump in this
+    // file): a broken stderr pipe should never turn a debug dump into a panic.
+    let _ = write_debug_dump_on_error(&mut stderr, err, &user, euid_root, cwd.as_deref(), &podman);
+}
+
+/// Best-effort `podman info` + `podman ps -a` snapshot, gathered separately from
+/// [`write_debug_dump_on_error`] so that function's signature stays a handful of
+/// arguments instead of one-per-subprocess-output-stream (clippy's
+/// `too_many_arguments`, and more importantly: fewer independent raw-string
+/// parameters for a future editor to accidentally interpolate directly instead of
+/// through [`RedactedText`]).
+struct PodmanDumpSnapshot {
+    stdout: Option<String>,
+    stderr: Option<String>,
+    unrunnable_err: Option<String>,
+    ps_lines: Vec<String>,
+}
+
+fn gather_podman_dump_snapshot() -> PodmanDumpSnapshot {
+    let (stdout, stderr, unrunnable_err) = match Command::new("podman")
         .args([
             "info",
             "--format",
@@ -585,18 +668,15 @@ pub fn debug_dump_on_error(err: &str) {
         .output()
     {
         Ok(o) => {
-            let s = String::from_utf8_lossy(&o.stdout);
-            let e = String::from_utf8_lossy(&o.stderr);
-            if !s.trim().is_empty() {
-                eprintln!("podman:     {}", redact(s.trim()));
-            }
-            if !o.status.success() && !e.trim().is_empty() {
-                eprintln!("podman_err: {}", redact(e.trim()));
-            }
+            let stdout = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            let stdout = (!stdout.is_empty()).then_some(stdout);
+            let stderr = (!o.status.success() && !stderr.is_empty()).then_some(stderr);
+            (stdout, stderr, None)
         }
-        Err(e) => eprintln!("podman:     not runnable ({e})"),
-    }
-    if let Ok(o) = Command::new("podman")
+        Err(e) => (None, None, Some(e.to_string())),
+    };
+    let ps_lines: Vec<String> = Command::new("podman")
         .args([
             "ps",
             "-a",
@@ -604,17 +684,183 @@ pub fn debug_dump_on_error(err: &str) {
             "{{.Names}}\t{{.Status}}\t{{.Image}}",
         ])
         .output()
-    {
-        let s = String::from_utf8_lossy(&o.stdout);
-        for (i, line) in s.lines().take(15).enumerate() {
-            if i == 0 {
-                eprintln!("--- podman ps -a (max 15) ---");
-            }
-            eprintln!("{}", redact(line));
-        }
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .take(15)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    PodmanDumpSnapshot {
+        stdout,
+        stderr,
+        unrunnable_err,
+        ps_lines,
     }
-    eprintln!("hint:       GHA_DEBUG=1 for more; GHA_DEBUG_ON_ERR=0 to silence");
-    eprintln!("===================================================");
+}
+
+/// Core of [`debug_dump_on_error`], factored out to write to any [`Write`] rather than
+/// stderr directly — the identical reasoning and pattern as
+/// [`write_debug_dump_fail_closed`] (issue #132 third follow-up audit: this is the
+/// concrete test surface that was missing for the plaintext `debug_dump_on_error`
+/// path, the gap that let the round-3 finding through).
+///
+/// EVERY parameter here is raw, caller-supplied text (an error message, subprocess
+/// stdout/stderr, a `podman ps` line, `$USER`, `$PWD`) — none of it is assumed safe.
+/// Each one is wrapped in [`RedactedText::new`] at the exact point it is written, never
+/// interpolated directly; there is no field in this function's body that reaches `w`
+/// without going through that constructor first. That is the structural guarantee this
+/// function makes testable: feed it a synthetic credential in any parameter and assert
+/// it never reaches the buffer.
+fn write_debug_dump_on_error<W: Write>(
+    w: &mut W,
+    err: &str,
+    user: &str,
+    euid_root: bool,
+    cwd: Option<&str>,
+    podman: &PodmanDumpSnapshot,
+) -> std::io::Result<()> {
+    writeln!(w, "========== gha-runner-ctl DEBUG ON ERROR ==========")?;
+    writeln!(w, "error:      {}", RedactedText::new(err))?;
+    writeln!(
+        w,
+        "user:       {} euid_root={}",
+        RedactedText::new(user),
+        euid_root
+    )?;
+    if let Some(cwd) = cwd {
+        writeln!(w, "pwd:        {}", RedactedText::new(cwd))?;
+    }
+    if let Some(s) = &podman.stdout {
+        writeln!(w, "podman:     {}", RedactedText::new(s))?;
+    }
+    if let Some(e) = &podman.stderr {
+        writeln!(w, "podman_err: {}", RedactedText::new(e))?;
+    }
+    if let Some(e) = &podman.unrunnable_err {
+        writeln!(w, "podman:     not runnable ({})", RedactedText::new(e))?;
+    }
+    for (i, line) in podman.ps_lines.iter().take(15).enumerate() {
+        if i == 0 {
+            writeln!(w, "--- podman ps -a (max 15) ---")?;
+        }
+        writeln!(w, "{}", RedactedText::new(line))?;
+    }
+    writeln!(
+        w,
+        "hint:       GHA_DEBUG=1 for more; GHA_DEBUG_ON_ERR=0 to silence"
+    )?;
+    writeln!(w, "===================================================")?;
+    Ok(())
+}
+
+/// A command string that has passed through [`redact_free_text`] and is therefore safe
+/// to print verbatim. The only way to obtain one is [`RedactedCommand::new`], which
+/// redacts on construction — no public field, no other constructor. This mirrors
+/// [`FailClosedEvent::redacted`]'s pattern: [`write_debug_dump_fail_closed`] physically
+/// cannot print a raw `command` because it never receives one, closing the gap
+/// structurally (MEDIUM-B, issue #132 second follow-up audit) rather than relying on
+/// every call site to pre-redact or on this dump remembering to call
+/// [`redact_free_text`] itself before printing.
+///
+/// `command` is caller-supplied free text describing what was run (e.g. `"podman top
+/// <container>"`) — today's single call site passes a static literal, but nothing
+/// stopped (and a future caller reasonably might build) a dynamic command string that
+/// embeds a resolved value, including one that turns out to hold a credential. Same
+/// hostile-input treatment as [`FailClosedEvent`]'s `reason` field: scanned regardless
+/// of whether the caller already redacted it.
+struct RedactedCommand(String);
+
+impl RedactedCommand {
+    fn new(raw: &str) -> Self {
+        RedactedCommand(redact_free_text(raw))
+    }
+}
+
+impl fmt::Display for RedactedCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Developer debug dump for a single fail-closed decision (issue #132).
+///
+/// A fail-closed event is usually a logic or environment bug, not a transient — this
+/// prints exactly what a developer needs to tell those apart in one pass: the failing
+/// command, its real exit status and (redacted) stderr, the resolved inputs that fed
+/// the decision, and what the code assumed as a result. Same `GHA_DEBUG`/
+/// `GHA_DEBUG_ON_ERR` gate as [`debug_dump_on_error`].
+///
+/// `resolved_inputs` are dumped through the exact same `dump_redact` allowlist as
+/// [`debug_dump_on_error`] — an unrecognised key is printed as
+/// `***REDACTED(key_not_allowlisted)***`, never silently skipped, so a caller that
+/// passes something new finds out immediately rather than assuming it was included.
+///
+/// `command` is redacted immediately via `RedactedCommand::new` (MEDIUM-B) before it
+/// ever reaches `write_debug_dump_fail_closed`.
+pub fn debug_dump_fail_closed(
+    ev: &FailClosedEvent,
+    command: &str,
+    resolved_inputs: &[(&str, String)],
+) {
+    if !debug_dump_enabled() {
+        return;
+    }
+    let mut stderr = std::io::stderr();
+    let command = RedactedCommand::new(command);
+    // Infallible by convention (matches every other eprintln!-based dump in this
+    // file): a broken stderr pipe should never turn a debug dump into a panic.
+    let _ = write_debug_dump_fail_closed(&mut stderr, ev, &command, resolved_inputs);
+}
+
+/// Core of [`debug_dump_fail_closed`], factored out to write to any [`Write`] rather
+/// than stderr directly, so the redaction guarantee ("every field printed here comes
+/// from `ev`'s already-redacted getters, never a raw field") is unit-testable against
+/// an in-memory buffer instead of only provable by inspection (issue #132 follow-up
+/// audit — this is the concrete test surface for the plaintext-dump half of HIGH-1 /
+/// HIGH-2 / MEDIUM-3, alongside [`FailClosedEvent::to_json_line`] for the WARN-event
+/// half). `command` takes [`RedactedCommand`], not `&str` (MEDIUM-B, second follow-up
+/// audit) — there is structurally no `&str` overload here for a future caller to reach
+/// for and accidentally print a raw command unredacted.
+fn write_debug_dump_fail_closed<W: Write>(
+    w: &mut W,
+    ev: &FailClosedEvent,
+    command: &RedactedCommand,
+    resolved_inputs: &[(&str, String)],
+) -> std::io::Result<()> {
+    writeln!(
+        w,
+        "========== gha-runner-ctl DEBUG (fail-closed) =========="
+    )?;
+    writeln!(w, "check:       {}", ev.check())?;
+    writeln!(w, "object:      {}", ev.object())?;
+    writeln!(w, "assumed:     {}", ev.assumed())?;
+    writeln!(w, "consecutive: {} (since {})", ev.consecutive, ev.since)?;
+    writeln!(w, "command:     {command}")?;
+    // ev.reason() is the real error including exit status. It is redacted
+    // unconditionally on construction (FailClosedEvent::redacted, via
+    // dump_redact::redact_free_text) regardless of what the caller passes — this no
+    // longer depends on the caller having pre-redacted it (issue #132 follow-up audit,
+    // HIGH-2).
+    writeln!(w, "reason:      {}", ev.reason())?;
+    writeln!(w, "resolved inputs:")?;
+    let pairs: Vec<(&str, &str)> = resolved_inputs
+        .iter()
+        .map(|(k, v)| (*k, v.as_str()))
+        .collect();
+    for field in redact_env_dump(pairs) {
+        writeln!(w, "  {}={}", field.key, field.value)?;
+    }
+    writeln!(
+        w,
+        "hint:        GHA_DEBUG=1 for more; GHA_DEBUG_ON_ERR=0 to silence"
+    )?;
+    writeln!(
+        w,
+        "=========================================================="
+    )?;
+    Ok(())
 }
 
 fn env_truthy(key: &str) -> bool {
@@ -1130,55 +1376,44 @@ pub fn is_safe_memory(s: &str) -> bool {
     )
 }
 
-pub fn redact(s: &str) -> String {
-    let mut out = s.to_string();
-    for key in [
-        "ghp_",
-        "gho_",
-        "ghu_",
-        "ghs_",
-        "ghr_",
-        "github_pat_",
-        "Bearer ",
-        "RUNNER_TOKEN=",
-    ] {
-        let mut start_search_idx = 0;
-        while start_search_idx < out.len() {
-            if let Some(offset) = out[start_search_idx..].find(key) {
-                let i = start_search_idx + offset;
-                let rest_idx = i + key.len();
-                let rest = &out[rest_idx..];
-
-                let mut chars_taken = 0;
-                let mut secret_len_bytes = 0;
-                for (idx, c) in rest.char_indices() {
-                    if chars_taken >= 200 {
-                        break;
-                    }
-                    if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') {
-                        chars_taken += 1;
-                        secret_len_bytes = idx + c.len_utf8();
-                    } else {
-                        break;
-                    }
-                }
-
-                let replacement = format!("{key}***REDACTED***");
-                out.replace_range(i..(rest_idx + secret_len_bytes), &replacement);
-                start_search_idx = i + replacement.len();
-            } else {
-                break;
-            }
-        }
-    }
-    if out.len() > 400 {
-        let mut truncate_at = 400;
-        while truncate_at > 0 && !out.is_char_boundary(truncate_at) {
+/// Truncate `s` to at most `max_bytes` (on a char boundary), appending `…` when it
+/// was cut. Pulled out of the old `redact()` blocklist scrubber so the length cap
+/// survives independently of which redaction strategy sits in front of it.
+fn truncate_for_dump(mut s: String, max_bytes: usize) -> String {
+    if s.len() > max_bytes {
+        let mut truncate_at = max_bytes;
+        while truncate_at > 0 && !s.is_char_boundary(truncate_at) {
             truncate_at -= 1;
         }
-        out = format!("{}…", &out[..truncate_at]);
+        s.truncate(truncate_at);
+        s.push('…');
     }
-    out
+    s
+}
+
+/// Free-text credential scrubber for arbitrary error/subprocess-output strings.
+///
+/// This used to be an independent 8-entry prefix blocklist (`ghp_`/`gho_`/.../`Bearer
+/// `/`RUNNER_TOKEN=`) with no length or shape check on what followed each prefix —
+/// materially weaker than [`dump_redact::redact_free_text`], which the fail-closed
+/// and plaintext-dump paths use. Having two redactors of different strength in one
+/// codebase is exactly how the issue #132 third follow-up audit's finding happened:
+/// `debug_dump_on_error`'s `err` field printed via a bare `eprintln!` with **no**
+/// redaction of its own, relying entirely on its one caller (`main.rs`) having
+/// pre-scrubbed it with this function — and this function's blocklist had no entry
+/// for the AWS-shaped secret the auditor used, so it sailed through unredacted.
+///
+/// `redact()` is now a thin shim over [`dump_redact::redact_free_text`] (retiring the
+/// old blocklist entirely — issue #132 third follow-up audit, requirement 3) plus the
+/// same 400-byte length cap the old implementation applied, so every one of this
+/// function's ~30 existing call sites across `lib.rs`/`appauth.rs` is upgraded to the
+/// stronger scanner automatically, with no per-call-site changes needed. The
+/// project-specific `RUNNER_TOKEN=` marker the old blocklist knew about that
+/// `redact_free_text` did not is now folded into `redact_free_text` itself (see
+/// `UnsafeShape::RunnerTokenEnv`), so nothing the old blocklist caught is lost by
+/// retiring it.
+pub fn redact(s: &str) -> String {
+    truncate_for_dump(redact_free_text(s), 400)
 }
 
 /// Host `/dev/null` must be a world-writable char device (1,3). A regular file
@@ -2465,8 +2700,15 @@ fn podman(args: &[&str]) -> Result<String, String> {
         .map_err(|e| format!("podman not runnable: {e}"))?;
     if !out.status.success() {
         let err = redact(&String::from_utf8_lossy(&out.stderr));
+        // Real exit status included (not just "failed") so a fail-closed debug dump
+        // built from this message can tell a genuine command failure apart from e.g. a
+        // signal kill — see debug_dump_fail_closed / issue #132.
+        let status = out
+            .status
+            .code()
+            .map_or_else(|| "signal".to_string(), |c| c.to_string());
         return Err(format!(
-            "podman {} failed: {}",
+            "podman {} failed (exit={status}): {}",
             args.first().unwrap_or(&"?"),
             err.trim()
         ));
@@ -2491,18 +2733,35 @@ fn container_running(name: &str) -> bool {
 ///
 /// Fail-closed: if the container is running but process inspection fails, treat
 /// as busy so we never tear down a mid-job worker under uncertainty.
+///
+/// That fail-closed decision is exactly the silent-but-correct case issue #132 is
+/// about: on its own it's harmless (the worker just isn't scaled in this tick), but a
+/// `podman top` that starts erroring on every tick means scale-in silently stops
+/// happening at all — workers pile up until the host's CPU/memory budget is exhausted,
+/// with no signal pointing at `podman top` as the cause. `fail_closed` turns that into
+/// an alertable streak; `debug_dump_fail_closed` gives a developer investigating it the
+/// real command, exit status and stderr in one pass.
 fn container_worker_busy(name: &str) -> bool {
     if !container_running(name) {
         return false;
     }
     match podman(&["top", name]) {
         Ok(out) => {
+            check_succeeded("worker_busy_probe");
             let lower = out.to_ascii_lowercase();
             // actions/runner spawns Runner.Worker (any path / casing) for the job.
             lower.contains("runner.worker")
         }
         // Cannot prove idle → not eligible for scale-in.
-        Err(_) => true,
+        Err(reason) => {
+            let ev = fail_closed("worker_busy_probe", name, "busy", &reason);
+            let inputs: Vec<(&str, String)> = DEBUG_DUMP_ENV_KEYS
+                .iter()
+                .filter_map(|&k| std::env::var(k).ok().map(|v| (k, v)))
+                .collect();
+            debug_dump_fail_closed(&ev, "podman top <container>", &inputs);
+            true
+        }
     }
 }
 
@@ -6526,5 +6785,679 @@ mod priority_cursor_tests {
         let (_, off) = rotate_by_cursor(&items, &p);
         assert_ne!(off, 0, "a zero-progress tick must still advance the cursor");
         let _ = fs::remove_file(&p);
+    }
+}
+
+/// Proves the plaintext fail-closed debug dump (`debug_dump_fail_closed`, tested here
+/// via its testable core, `write_debug_dump_fail_closed`, which writes to any `Write`
+/// instead of stderr directly) never prints a raw credential from `check`/`object`/
+/// `assumed`/`reason` — the second of the two output paths the issue #132 follow-up
+/// audit's HIGH-1/HIGH-2 findings named (the first, the WARN JSON event, is proven in
+/// `fail_closed::tests`). Both paths read from the same already-redacted
+/// `FailClosedEvent` getters, so these tests are really exercising that
+/// `write_debug_dump_fail_closed` does not reintroduce a leak by, say, printing a raw
+/// field it was handed directly instead of going through the getters.
+#[cfg(test)]
+mod fail_closed_debug_dump_tests {
+    use super::*;
+    use std::time::UNIX_EPOCH;
+
+    fn dump(ev: &FailClosedEvent) -> String {
+        dump_with_command(ev, "podman top <container>")
+    }
+
+    fn dump_with_command(ev: &FailClosedEvent, command: &str) -> String {
+        let mut buf: Vec<u8> = Vec::new();
+        let command = RedactedCommand::new(command);
+        write_debug_dump_fail_closed(&mut buf, ev, &command, &[]).unwrap();
+        String::from_utf8(buf).expect("dump is valid UTF-8")
+    }
+
+    #[test]
+    fn synthetic_credential_in_check_is_redacted_in_plaintext_dump() {
+        let t = FailClosedTracker::new();
+        let synthetic = format!("ghp_{}", "a1B2c3D4".repeat(5));
+        let ev = t.record(&synthetic, "obj", "referenced", "boom", UNIX_EPOCH);
+        let out = dump(&ev);
+        assert!(
+            !out.contains(&synthetic),
+            "credential leaked in dump: {out}"
+        );
+    }
+
+    #[test]
+    fn synthetic_credential_in_object_is_redacted_in_plaintext_dump() {
+        let t = FailClosedTracker::new();
+        let synthetic = "AKIAIOSFODNN7EXAMPLE";
+        let ev = t.record(
+            "image_refcount",
+            synthetic,
+            "referenced",
+            "boom",
+            UNIX_EPOCH,
+        );
+        let out = dump(&ev);
+        assert!(!out.contains(synthetic), "credential leaked in dump: {out}");
+    }
+
+    #[test]
+    fn synthetic_credential_in_assumed_is_redacted_in_plaintext_dump() {
+        let t = FailClosedTracker::new();
+        let synthetic = format!("ghp_{}", "a1B2c3D4".repeat(5));
+        let ev = t.record("image_refcount", "obj", &synthetic, "boom", UNIX_EPOCH);
+        let out = dump(&ev);
+        assert!(
+            !out.contains(&synthetic),
+            "credential leaked in dump: {out}"
+        );
+    }
+
+    /// The exact scenario the auditor confirmed live: a synthetic credential placed
+    /// in `object`, unredacted by the caller, must not reach the dump.
+    #[test]
+    fn synthetic_credential_placed_in_object_never_reaches_dump_live_repro() {
+        let t = FailClosedTracker::new();
+        let synthetic = format!("github_pat_{}", "a1B2c3D4e5".repeat(9));
+        let ev = t.record(
+            "worker_busy_probe",
+            &synthetic,
+            "busy",
+            "podman top: exit 1",
+            UNIX_EPOCH,
+        );
+        let out = dump(&ev);
+        assert!(
+            !out.contains(&synthetic),
+            "credential leaked in dump: {out}"
+        );
+    }
+
+    /// HIGH-2, mid-sentence in raw stderr, plaintext-dump side — and the diagnostic
+    /// text around it must survive (requirement 3).
+    #[test]
+    fn synthetic_credential_embedded_mid_sentence_in_reason_is_redacted_in_plaintext_dump() {
+        let t = FailClosedTracker::new();
+        let synthetic = "AKIAIOSFODNN7EXAMPLE";
+        let reason = format!(
+            "podman top failed: exit 125, cannot chdir to /home/kang, aws_key={synthetic} rejected"
+        );
+        let ev = t.record("worker_busy_probe", "worker-3", "busy", &reason, UNIX_EPOCH);
+        let out = dump(&ev);
+        assert!(!out.contains(synthetic), "credential leaked in dump: {out}");
+        assert!(
+            out.contains("podman top failed: exit 125, cannot chdir to /home/kang"),
+            "diagnostic detail must survive intact: {out}"
+        );
+    }
+
+    /// Requirement 3's literal example, end to end through the real dump writer (not
+    /// just `redact_free_text` in isolation): must appear byte-for-byte in the dump.
+    #[test]
+    fn ordinary_diagnostic_reason_survives_verbatim_in_plaintext_dump() {
+        let t = FailClosedTracker::new();
+        let reason = "podman top failed: exit 125, cannot chdir to /home/kang";
+        let ev = t.record("worker_busy_probe", "worker-3", "busy", reason, UNIX_EPOCH);
+        let out = dump(&ev);
+        assert!(
+            out.contains(&format!("reason:      {reason}")),
+            "reason line must survive intact: {out}"
+        );
+    }
+
+    // --- MEDIUM-B fix (second follow-up audit): `command` is now redacted ----------
+
+    /// Confirmed live by the auditor: a dynamically-built command string embedding a
+    /// synthetic credential used to print verbatim in the `command:` line, since
+    /// `write_debug_dump_fail_closed` printed its `command: &str` parameter with zero
+    /// redaction. `command` now goes through [`RedactedCommand::new`] (which calls
+    /// [`redact_free_text`]) before it ever reaches the writer.
+    #[test]
+    fn synthetic_credential_in_dynamically_built_command_is_redacted() {
+        let t = FailClosedTracker::new();
+        let synthetic = format!("ghp_{}", "a1B2c3D4".repeat(5));
+        let ev = t.record("worker_busy_probe", "worker-3", "busy", "boom", UNIX_EPOCH);
+        let command = format!("podman exec --env TOKEN={synthetic} worker-3 true");
+        let out = dump_with_command(&ev, &command);
+        assert!(
+            !out.contains(&synthetic),
+            "credential leaked via command field: {out}"
+        );
+        // Diagnostic value must survive: the rest of the command line is intact.
+        assert!(out.contains("podman exec --env TOKEN="));
+        assert!(out.contains("worker-3 true"));
+    }
+
+    /// A digit-free credential embedded in the command — proves the fix routes
+    /// through the same MEDIUM-A-fixed `redact_free_text`, not a separate weaker path.
+    #[test]
+    fn digit_free_synthetic_credential_in_command_is_redacted() {
+        let t = FailClosedTracker::new();
+        let secret = "QzXpLwVnTbYhSfJdMcUaEzXkNbPqRsTvWyAeGh";
+        let ev = t.record("worker_busy_probe", "worker-3", "busy", "boom", UNIX_EPOCH);
+        let command = format!("curl -H 'Authorization: Bearer {secret}' https://internal");
+        let out = dump_with_command(&ev, &command);
+        assert!(
+            !out.contains(secret),
+            "credential leaked via command field: {out}"
+        );
+    }
+
+    /// Ordinary static command text (today's single real call site) must survive
+    /// byte-for-byte — the fix must not damage diagnostic usability.
+    #[test]
+    fn ordinary_command_survives_verbatim_in_plaintext_dump() {
+        let t = FailClosedTracker::new();
+        let ev = t.record("worker_busy_probe", "worker-3", "busy", "boom", UNIX_EPOCH);
+        let out = dump_with_command(&ev, "podman top <container>");
+        assert!(
+            out.contains("command:     podman top <container>"),
+            "command line must survive intact: {out}"
+        );
+    }
+}
+
+/// Issue #132 THIRD follow-up audit: `debug_dump_on_error`'s `err` parameter (and,
+/// while sweeping the rest of the function, `user`/`pwd`/podman stdout/stderr/ps
+/// lines) printed via bare `eprintln!` with zero redaction of its own — the round-3
+/// finding, reproduced live by the auditor with an AWS-shaped secret that the old
+/// `redact()` blocklist's 8 fixed prefixes had no entry for. `write_debug_dump_on_error`
+/// is the concrete test surface for that fix, mirroring
+/// `fail_closed_debug_dump_tests` exactly: every value written here goes through
+/// `RedactedText::new` at the point of printing (see that type's doc comment), so
+/// feeding a synthetic credential into any parameter and asserting it never reaches
+/// the buffer is a direct test of the structural guarantee, not just of `redact()` in
+/// isolation.
+#[cfg(test)]
+mod debug_dump_on_error_tests {
+    use super::*;
+
+    #[allow(clippy::too_many_arguments)]
+    fn dump(
+        err: &str,
+        user: &str,
+        cwd: Option<&str>,
+        podman_stdout: Option<&str>,
+        podman_stderr: Option<&str>,
+        podman_unrunnable_err: Option<&str>,
+        ps_lines: &[String],
+    ) -> String {
+        let podman = PodmanDumpSnapshot {
+            stdout: podman_stdout.map(str::to_string),
+            stderr: podman_stderr.map(str::to_string),
+            unrunnable_err: podman_unrunnable_err.map(str::to_string),
+            ps_lines: ps_lines.to_vec(),
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        write_debug_dump_on_error(&mut buf, err, user, false, cwd, &podman).unwrap();
+        String::from_utf8(buf).expect("dump is valid UTF-8")
+    }
+
+    fn dump_err_only(err: &str) -> String {
+        dump(err, "someone", None, None, None, None, &[])
+    }
+
+    /// The auditor's exact live repro: an AWS-shaped secret (not covered by the old
+    /// `redact()` blocklist's 8 fixed prefixes) embedded in `err` must not reach the
+    /// dump, since `err` is now routed through `RedactedText::new` unconditionally —
+    /// no longer dependent on the caller (`main.rs`) having pre-redacted it.
+    #[test]
+    fn aws_shaped_secret_in_err_is_redacted_live_repro() {
+        let synthetic = "AKIAIOSFODNN7EXAMPLE";
+        let err = format!("registry auth failed: x-amz-access-key={synthetic} rejected");
+        let out = dump_err_only(&err);
+        assert!(!out.contains(synthetic), "credential leaked in dump: {out}");
+        assert!(
+            out.contains("registry auth failed:") && out.contains("rejected"),
+            "diagnostic detail must survive: {out}"
+        );
+    }
+
+    /// Same finding, but proven even when the caller does NOT pre-redact at all
+    /// (main.rs still does, as defense in depth, but this function must not depend
+    /// on that) — a GitHub token this time, to also cover the shape the old blocklist
+    /// nominally did know about, just to confirm no regression there either.
+    #[test]
+    fn github_token_in_err_is_redacted_even_without_caller_pre_redaction() {
+        let synthetic = format!("ghp_{}", "a1B2c3D4".repeat(5));
+        let err = format!("clone failed: authentication error token={synthetic}");
+        let out = dump_err_only(&err);
+        assert!(
+            !out.contains(&synthetic),
+            "credential leaked in dump: {out}"
+        );
+    }
+
+    /// A digit-free secret (MEDIUM-A shape) in `err` — proves this routes through the
+    /// same fully-fixed `redact_free_text`, not some earlier, weaker snapshot of it.
+    #[test]
+    fn digit_free_secret_in_err_is_redacted() {
+        let secret = "QzXpLwVnTbYhSfJdMcUaEzXkNbPqRsTvWyAeGh";
+        let err = format!("auth error: token {secret} rejected by upstream");
+        let out = dump_err_only(&err);
+        assert!(!out.contains(secret), "credential leaked in dump: {out}");
+        assert!(out.contains("auth error: token"));
+        assert!(out.contains("rejected by upstream"));
+    }
+
+    /// requirement 3's exact sentence must survive byte-for-byte as the `error:` line.
+    #[test]
+    fn ordinary_diagnostic_err_survives_verbatim() {
+        let err = "podman top failed: exit 125, cannot chdir to /home/kang";
+        let out = dump_err_only(err);
+        assert!(
+            out.contains(&format!("error:      {err}")),
+            "error line must survive intact: {out}"
+        );
+    }
+
+    /// `user` ($USER) is now also wrapped, closing the same class of gap for the one
+    /// other raw environment-derived field this function prints outside the
+    /// allowlisted `dump_resolved_env` path.
+    #[test]
+    fn synthetic_credential_in_user_is_redacted() {
+        let synthetic = format!("ghp_{}", "a1B2c3D4".repeat(5));
+        let out = dump("boom", &synthetic, None, None, None, None, &[]);
+        assert!(
+            !out.contains(&synthetic),
+            "credential leaked via user field: {out}"
+        );
+    }
+
+    /// `pwd` ($PWD via `current_dir()`) likewise.
+    #[test]
+    fn synthetic_credential_in_pwd_is_redacted() {
+        let synthetic = format!("ghp_{}", "a1B2c3D4".repeat(5));
+        let cwd = format!("/home/{synthetic}");
+        let out = dump("boom", "someone", Some(&cwd), None, None, None, &[]);
+        assert!(
+            !out.contains(&synthetic),
+            "credential leaked via pwd field: {out}"
+        );
+    }
+
+    /// Ordinary paths must still survive verbatim — the point is redacting
+    /// credentials, not eating every `pwd` line.
+    #[test]
+    fn ordinary_pwd_survives_verbatim() {
+        let cwd = "/home/gha-agent/gha-runner-ctl";
+        let out = dump("boom", "gha-agent", Some(cwd), None, None, None, &[]);
+        assert!(
+            out.contains(&format!("pwd:        {cwd}")),
+            "pwd line must survive intact: {out}"
+        );
+    }
+
+    /// `podman info`'s stdout/stderr streams — same shape as `debug_dump_fail_closed`'s
+    /// resolved-inputs guarantee, proven here directly for this dump's own podman
+    /// snapshot fields.
+    #[test]
+    fn synthetic_credential_in_podman_stdout_and_stderr_is_redacted() {
+        let synthetic_out = "AKIAIOSFODNN7EXAMPLE";
+        let synthetic_err = format!("gho_{}", "e5F6g7H8".repeat(5));
+        let out = dump(
+            "boom",
+            "someone",
+            None,
+            Some(&format!("rootless=true key={synthetic_out}")),
+            Some(&format!("warning token={synthetic_err}")),
+            None,
+            &[],
+        );
+        assert!(!out.contains(synthetic_out), "leaked via stdout: {out}");
+        assert!(!out.contains(&synthetic_err), "leaked via stderr: {out}");
+    }
+
+    /// The `podman: not runnable (<io error>)` branch — an `io::Error`'s `Display`
+    /// text is normally just "No such file or directory", but nothing stops a
+    /// platform/locale from putting arbitrary text there, so it goes through the same
+    /// wrapper as everything else rather than being assumed safe as a special case.
+    #[test]
+    fn synthetic_credential_in_podman_unrunnable_error_is_redacted() {
+        let synthetic = "AKIAIOSFODNN7EXAMPLE";
+        let out = dump(
+            "boom",
+            "someone",
+            None,
+            None,
+            None,
+            Some(&format!("exec failed: {synthetic}")),
+            &[],
+        );
+        assert!(!out.contains(synthetic), "credential leaked: {out}");
+    }
+
+    /// `podman ps -a` lines (container names / status / image) — a container name is
+    /// caller/operator controlled and could in principle be set to anything.
+    #[test]
+    fn synthetic_credential_in_podman_ps_line_is_redacted() {
+        let synthetic = format!("ghp_{}", "a1B2c3D4".repeat(5));
+        let lines = vec![format!(
+            "worker-{synthetic}\tUp 2 minutes\tlocalhost/img:latest"
+        )];
+        let out = dump("boom", "someone", None, None, None, None, &lines);
+        assert!(
+            !out.contains(&synthetic),
+            "credential leaked via ps line: {out}"
+        );
+    }
+
+    /// Ordinary `podman ps -a` output must survive verbatim.
+    #[test]
+    fn ordinary_podman_ps_line_survives_verbatim() {
+        let lines = vec!["gha-runner-ctl\tUp 3 hours\tlocalhost/gha-runner-ctl:latest".to_string()];
+        let out = dump("boom", "someone", None, None, None, None, &lines);
+        assert!(
+            out.contains("gha-runner-ctl\tUp 3 hours\tlocalhost/gha-runner-ctl:latest"),
+            "ps line must survive intact: {out}"
+        );
+    }
+}
+
+/// Issue #132 third follow-up audit, requirement 4: make the "every dump emission
+/// point is redacted" invariant testable, not just provable by inspection.
+///
+/// A full compiler-enforced guarantee isn't expressible in safe Rust here — nothing
+/// stops a future contributor from adding an entirely new sibling dump function with
+/// its own fresh `eprintln!`, exactly as `debug_dump_on_error` itself did relative to
+/// `debug_dump_fail_closed` (that is precisely how the round-3 finding happened: the
+/// type-level fix already applied to one sibling did nothing for the other, because
+/// the other's `eprintln!`s were never routed through it in the first place). What
+/// *is* expressible, and is checked here, is a source-level regression guard over the
+/// two known dump-writer functions: every `{}`/`{:}`-style interpolation in their
+/// `write!`/`writeln!` calls must reference either a string literal, a
+/// known-safe/typed identifier (`RedactedText`/`RedactedCommand`-derived, or a
+/// `redact_for_dump`/`redact_env_dump`-derived `field.key`/`field.value`), or a
+/// non-textual value (`bool`, an integer, a getter that returns one). This fails loud
+/// if a future edit adds a new interpolated argument to either function that isn't in
+/// the allowlist below — which is exactly the shape the round-3 bug would have had if
+/// it had been introduced as an edit to an already-covered function instead of via a
+/// brand new sibling.
+///
+/// **What this test does NOT catch** (and what a reviewer must check by hand for any
+/// change touching the dump/fail-closed subsystem):
+/// - A brand-new dump function added elsewhere in the file with its own `eprintln!`s,
+///   never routed through `write_debug_dump_on_error` / `write_debug_dump_fail_closed`
+///   at all (the actual round-3 shape). Grep for `eprintln!`/`println!` additions in
+///   `src/lib.rs`/`src/fail_closed.rs` and confirm any new one either goes through one
+///   of these two writer functions or is manifestly static/numeric text.
+/// - A parameter that's typed `RedactedText`/`RedactedCommand` but constructed from a
+///   value that was already lossily pre-processed in a way that defeats
+///   `redact_free_text` (there is no way to statically prove "this string arrived here
+///   without ever being concatenated from untrusted parts before redaction" — that's a
+///   review judgment call, not a type-level one).
+#[cfg(test)]
+mod dump_writer_source_invariant_tests {
+    use std::fs;
+
+    /// Expressions allowed to appear as a captured/interpolated value in a
+    /// `write!`/`writeln!` call in the two audited functions — as either an inline
+    /// `{ident}` capture inside the format string, or a positional argument listed
+    /// after it. Deliberately conservative: anything not obviously safe fails the
+    /// test rather than being guessed at. `RedactedText::new(...)` is matched by
+    /// prefix (any argument) rather than listed by exact call, since the constructor
+    /// itself — not its argument — is the guarantee.
+    const ALLOWLISTED_EXACT: &[&str] = &[
+        "command", // already-typed &RedactedCommand parameter (Display)
+        // FailClosedEvent getters — redacted at construction (FailClosedEvent::redacted).
+        "ev.check()",
+        "ev.object()",
+        "ev.assumed()",
+        "ev.reason()",
+        "ev.consecutive",
+        "ev.since",
+        // redact_for_dump / redact_env_dump output — allowlist + shape checked.
+        "field.key",
+        "field.value",
+        // Plain booleans — never free text.
+        "euid_root",
+    ];
+
+    fn is_allowlisted(expr: &str) -> bool {
+        let expr = expr.trim();
+        ALLOWLISTED_EXACT.contains(&expr)
+            || (expr.starts_with("RedactedText::new(") && expr.ends_with(')'))
+    }
+
+    /// Pull the body of a top-level `fn <name>` out of `src/lib.rs` by brace
+    /// counting. Good enough for this file's style (no other `fn <name>` substring
+    /// collision for either audited name, checked by the sanity-count assertion in
+    /// [`assert_all_args_allowlisted`]).
+    fn extract_fn_body(source: &str, fn_name: &str) -> String {
+        let sig = format!("fn {fn_name}");
+        let start = source
+            .find(&sig)
+            .unwrap_or_else(|| panic!("function {fn_name} not found in source"));
+        let brace_start = source[start..]
+            .find('{')
+            .map(|i| start + i)
+            .unwrap_or_else(|| panic!("no opening brace found for {fn_name}"));
+        let mut depth = 0i32;
+        for (offset, ch) in source[brace_start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return source[brace_start..=brace_start + offset].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces extracting {fn_name}");
+    }
+
+    /// Split `s` on top-level commas — i.e. commas not nested inside `()`/`[]`/`{}`
+    /// and not inside a `"..."` string literal (with `\`-escape awareness). Used to
+    /// pull a macro call's comma-separated argument list apart without a real Rust
+    /// parser.
+    fn split_top_level_commas(s: &str) -> Vec<String> {
+        let chars: Vec<char> = s.chars().collect();
+        let mut parts = Vec::new();
+        let mut depth = 0i32;
+        let mut in_string = false;
+        let mut start = 0usize;
+        let mut i = 0usize;
+        while i < chars.len() {
+            let c = chars[i];
+            if in_string {
+                if c == '\\' {
+                    i += 2;
+                    continue;
+                }
+                if c == '"' {
+                    in_string = false;
+                }
+            } else {
+                match c {
+                    '"' => in_string = true,
+                    '(' | '[' | '{' => depth += 1,
+                    ')' | ']' | '}' => depth -= 1,
+                    ',' if depth == 0 => {
+                        parts.push(chars[start..i].iter().collect::<String>());
+                        start = i + 1;
+                    }
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+        let tail: String = chars[start..].iter().collect();
+        if !tail.trim().is_empty() {
+            parts.push(tail);
+        }
+        parts.into_iter().map(|p| p.trim().to_string()).collect()
+    }
+
+    /// Inline `{ident}` captures inside a format-string literal's *contents*
+    /// (quotes already stripped). Rust's inline-capture syntax only accepts bare
+    /// identifiers/simple field access, never a call expression like
+    /// `RedactedText::new(x)` — those must be (and in this codebase are) passed as
+    /// positional trailing arguments instead, which [`macro_call_captures`] handles
+    /// separately. `{{`/`}}` escapes and `{ident:spec}` format specs are handled.
+    fn inline_captures(fmt_contents: &str) -> Vec<String> {
+        let chars: Vec<char> = fmt_contents.chars().collect();
+        let mut caps = Vec::new();
+        let mut i = 0usize;
+        while i < chars.len() {
+            if chars[i] == '{' {
+                if i + 1 < chars.len() && chars[i + 1] == '{' {
+                    i += 2;
+                    continue;
+                }
+                let start = i + 1;
+                if let Some(rel_end) = chars[start..].iter().position(|&c| c == '}') {
+                    let end = start + rel_end;
+                    let raw: String = chars[start..end].iter().collect();
+                    let ident = raw.split(':').next().unwrap_or(&raw).trim();
+                    if !ident.is_empty() {
+                        caps.push(ident.to_string());
+                    }
+                    i = end + 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        caps
+    }
+
+    /// Every `write!(`/`writeln!(` call in `body`, as (writer-arg, format-string
+    /// literal-with-quotes, positional-args) — used by
+    /// [`macro_call_captures`] to pull out everything that gets interpolated.
+    fn find_macro_calls(body: &str) -> Vec<Vec<String>> {
+        let mut calls = Vec::new();
+        let chars: Vec<char> = body.chars().collect();
+        let mut idx = 0usize;
+        while idx < chars.len() {
+            let rest: String = chars[idx..].iter().collect();
+            let next_writeln = rest.find("writeln!(");
+            let next_write = rest.find("write!(");
+            let rel = match (next_writeln, next_write) {
+                (Some(a), Some(b)) => a.min(b),
+                (Some(a), None) => a,
+                (None, Some(b)) => b,
+                (None, None) => break,
+            };
+            let call_start = idx + rel;
+            let paren_open = chars[call_start..]
+                .iter()
+                .position(|&c| c == '(')
+                .map(|i| call_start + i)
+                .expect("macro call must have an opening paren");
+            let mut depth = 0i32;
+            let mut in_string = false;
+            let mut i = paren_open;
+            let mut close = None;
+            while i < chars.len() {
+                let c = chars[i];
+                if in_string {
+                    if c == '\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if c == '"' {
+                        in_string = false;
+                    }
+                } else {
+                    match c {
+                        '"' => in_string = true,
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                close = Some(i);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                i += 1;
+            }
+            let close = close.expect("unbalanced parens in macro call");
+            let args_str: String = chars[paren_open + 1..close].iter().collect();
+            calls.push(split_top_level_commas(&args_str));
+            idx = close + 1;
+        }
+        calls
+    }
+
+    /// Every value captured/interpolated by any `write!`/`writeln!` call in `body`:
+    /// inline `{ident}` captures from the format-string literal, plus every
+    /// positional argument listed after it. (The macro's own first argument — the
+    /// writer, e.g. `w` — is never itself interpolated, so it's skipped.)
+    fn macro_call_captures(body: &str) -> Vec<String> {
+        let mut all = Vec::new();
+        for parts in find_macro_calls(body) {
+            // parts[0] = writer, parts[1] = format string literal, parts[2..] = positional args.
+            if parts.len() < 2 {
+                continue;
+            }
+            let fmt_lit = parts[1].trim();
+            let contents = fmt_lit
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .unwrap_or(fmt_lit);
+            all.extend(inline_captures(contents));
+            all.extend(parts[2..].iter().cloned());
+        }
+        all
+    }
+
+    fn assert_all_args_allowlisted(fn_name: &str, source: &str) {
+        let body = extract_fn_body(source, fn_name);
+        let captures = macro_call_captures(&body);
+        assert!(
+            captures.len() >= 4,
+            "sanity check failed: found suspiciously few captured values ({}) in {fn_name} — \
+             the extraction logic itself may be broken, not the function",
+            captures.len()
+        );
+        for expr in &captures {
+            assert!(
+                is_allowlisted(expr),
+                "{fn_name} interpolates `{expr}`, which is not in ALLOWLISTED_EXACT and is not \
+                 a RedactedText::new(...) call. If this is a genuinely pre-redacted/typed/\
+                 non-textual value, add it to the allowlist explicitly (with a comment saying \
+                 why it's safe). If it's a raw caller-supplied string, route it through \
+                 RedactedText::new(...) first — this is exactly the class of bug issue #132's \
+                 third follow-up audit closed."
+            );
+        }
+    }
+
+    #[test]
+    fn write_debug_dump_fail_closed_only_interpolates_allowlisted_values() {
+        let source = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+            .expect("read src/lib.rs");
+        assert_all_args_allowlisted("write_debug_dump_fail_closed", &source);
+    }
+
+    #[test]
+    fn write_debug_dump_on_error_only_interpolates_allowlisted_values() {
+        let source = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+            .expect("read src/lib.rs");
+        assert_all_args_allowlisted("write_debug_dump_on_error", &source);
+    }
+
+    /// Positive control: confirm the scanner actually flags a raw, unwrapped
+    /// interpolation when one is present — otherwise a scanner that (via a bug)
+    /// always passes would make the two tests above worthless. Uses a synthetic
+    /// snippet shaped exactly like the round-3 bug (`eprintln!("error: {err}")`
+    /// wrapped in a `write!` call for this synthetic case), not real source.
+    #[test]
+    fn scanner_rejects_a_raw_unwrapped_interpolation() {
+        let synthetic_body = r#"{
+    writeln!(w, "error:      {}", err)?;
+    Ok(())
+}"#;
+        let captures = macro_call_captures(synthetic_body);
+        assert_eq!(captures, vec!["err".to_string()]);
+        assert!(
+            !is_allowlisted("err"),
+            "scanner must reject a bare raw identifier — if this now passes, the \
+             allowlist/positive-control logic itself is broken"
+        );
     }
 }
