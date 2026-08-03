@@ -649,6 +649,35 @@ pub fn debug_dump_on_error(err: &str) {
     eprintln!("===================================================");
 }
 
+/// A command string that has passed through [`redact_free_text`] and is therefore safe
+/// to print verbatim. The only way to obtain one is [`RedactedCommand::new`], which
+/// redacts on construction — no public field, no other constructor. This mirrors
+/// [`FailClosedEvent::redacted`]'s pattern: [`write_debug_dump_fail_closed`] physically
+/// cannot print a raw `command` because it never receives one, closing the gap
+/// structurally (MEDIUM-B, issue #132 second follow-up audit) rather than relying on
+/// every call site to pre-redact or on this dump remembering to call
+/// [`redact_free_text`] itself before printing.
+///
+/// `command` is caller-supplied free text describing what was run (e.g. `"podman top
+/// <container>"`) — today's single call site passes a static literal, but nothing
+/// stopped (and a future caller reasonably might build) a dynamic command string that
+/// embeds a resolved value, including one that turns out to hold a credential. Same
+/// hostile-input treatment as [`FailClosedEvent`]'s `reason` field: scanned regardless
+/// of whether the caller already redacted it.
+struct RedactedCommand(String);
+
+impl RedactedCommand {
+    fn new(raw: &str) -> Self {
+        RedactedCommand(redact_free_text(raw))
+    }
+}
+
+impl fmt::Display for RedactedCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Developer debug dump for a single fail-closed decision (issue #132).
 ///
 /// A fail-closed event is usually a logic or environment bug, not a transient — this
@@ -661,6 +690,9 @@ pub fn debug_dump_on_error(err: &str) {
 /// [`debug_dump_on_error`] — an unrecognised key is printed as
 /// `***REDACTED(key_not_allowlisted)***`, never silently skipped, so a caller that
 /// passes something new finds out immediately rather than assuming it was included.
+///
+/// `command` is redacted immediately via [`RedactedCommand::new`] (MEDIUM-B) before it
+/// ever reaches [`write_debug_dump_fail_closed`].
 pub fn debug_dump_fail_closed(
     ev: &FailClosedEvent,
     command: &str,
@@ -670,9 +702,10 @@ pub fn debug_dump_fail_closed(
         return;
     }
     let mut stderr = std::io::stderr();
+    let command = RedactedCommand::new(command);
     // Infallible by convention (matches every other eprintln!-based dump in this
     // file): a broken stderr pipe should never turn a debug dump into a panic.
-    let _ = write_debug_dump_fail_closed(&mut stderr, ev, command, resolved_inputs);
+    let _ = write_debug_dump_fail_closed(&mut stderr, ev, &command, resolved_inputs);
 }
 
 /// Core of [`debug_dump_fail_closed`], factored out to write to any [`Write`] rather
@@ -681,11 +714,13 @@ pub fn debug_dump_fail_closed(
 /// an in-memory buffer instead of only provable by inspection (issue #132 follow-up
 /// audit — this is the concrete test surface for the plaintext-dump half of HIGH-1 /
 /// HIGH-2 / MEDIUM-3, alongside [`FailClosedEvent::to_json_line`] for the WARN-event
-/// half).
+/// half). `command` takes [`RedactedCommand`], not `&str` (MEDIUM-B, second follow-up
+/// audit) — there is structurally no `&str` overload here for a future caller to reach
+/// for and accidentally print a raw command unredacted.
 fn write_debug_dump_fail_closed<W: Write>(
     w: &mut W,
     ev: &FailClosedEvent,
-    command: &str,
+    command: &RedactedCommand,
     resolved_inputs: &[(&str, String)],
 ) -> std::io::Result<()> {
     writeln!(
@@ -6673,8 +6708,13 @@ mod fail_closed_debug_dump_tests {
     use std::time::UNIX_EPOCH;
 
     fn dump(ev: &FailClosedEvent) -> String {
+        dump_with_command(ev, "podman top <container>")
+    }
+
+    fn dump_with_command(ev: &FailClosedEvent, command: &str) -> String {
         let mut buf: Vec<u8> = Vec::new();
-        write_debug_dump_fail_closed(&mut buf, ev, "podman top <container>", &[]).unwrap();
+        let command = RedactedCommand::new(command);
+        write_debug_dump_fail_closed(&mut buf, ev, &command, &[]).unwrap();
         String::from_utf8(buf).expect("dump is valid UTF-8")
     }
 
@@ -6766,6 +6806,57 @@ mod fail_closed_debug_dump_tests {
         assert!(
             out.contains(&format!("reason:      {reason}")),
             "reason line must survive intact: {out}"
+        );
+    }
+
+    // --- MEDIUM-B fix (second follow-up audit): `command` is now redacted ----------
+
+    /// Confirmed live by the auditor: a dynamically-built command string embedding a
+    /// synthetic credential used to print verbatim in the `command:` line, since
+    /// `write_debug_dump_fail_closed` printed its `command: &str` parameter with zero
+    /// redaction. `command` now goes through [`RedactedCommand::new`] (which calls
+    /// [`redact_free_text`]) before it ever reaches the writer.
+    #[test]
+    fn synthetic_credential_in_dynamically_built_command_is_redacted() {
+        let t = FailClosedTracker::new();
+        let synthetic = format!("ghp_{}", "a1B2c3D4".repeat(5));
+        let ev = t.record("worker_busy_probe", "worker-3", "busy", "boom", UNIX_EPOCH);
+        let command = format!("podman exec --env TOKEN={synthetic} worker-3 true");
+        let out = dump_with_command(&ev, &command);
+        assert!(
+            !out.contains(&synthetic),
+            "credential leaked via command field: {out}"
+        );
+        // Diagnostic value must survive: the rest of the command line is intact.
+        assert!(out.contains("podman exec --env TOKEN="));
+        assert!(out.contains("worker-3 true"));
+    }
+
+    /// A digit-free credential embedded in the command — proves the fix routes
+    /// through the same MEDIUM-A-fixed `redact_free_text`, not a separate weaker path.
+    #[test]
+    fn digit_free_synthetic_credential_in_command_is_redacted() {
+        let t = FailClosedTracker::new();
+        let secret = "QzXpLwVnTbYhSfJdMcUaEzXkNbPqRsTvWyAeGh";
+        let ev = t.record("worker_busy_probe", "worker-3", "busy", "boom", UNIX_EPOCH);
+        let command = format!("curl -H 'Authorization: Bearer {secret}' https://internal");
+        let out = dump_with_command(&ev, &command);
+        assert!(
+            !out.contains(secret),
+            "credential leaked via command field: {out}"
+        );
+    }
+
+    /// Ordinary static command text (today's single real call site) must survive
+    /// byte-for-byte — the fix must not damage diagnostic usability.
+    #[test]
+    fn ordinary_command_survives_verbatim_in_plaintext_dump() {
+        let t = FailClosedTracker::new();
+        let ev = t.record("worker_busy_probe", "worker-3", "busy", "boom", UNIX_EPOCH);
+        let out = dump_with_command(&ev, "podman top <container>");
+        assert!(
+            out.contains("command:     podman top <container>"),
+            "command line must survive intact: {out}"
         );
     }
 }

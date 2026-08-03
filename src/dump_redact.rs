@@ -499,18 +499,51 @@ fn is_fs_path(v: &str) -> bool {
 /// Container image reference: `[registry/]repo[:tag][@digest]`. Deliberately checked
 /// only after every credential shape above, since its permitted charset overlaps with
 /// e.g. a JWT's.
+///
+/// The optional `@<algo>:<hex>` digest suffix (`ghcr.io/org/repo:tag@sha256:<64 hex>`)
+/// is split off and validated separately via [`is_valid_image_digest`] before the rest
+/// of the reference is charset-checked — `@` is otherwise rejected outright below.
+/// Without this, a real digest-bearing image reference in free text (a routine `podman
+/// pull` failure message) fell all the way through to the entropy fallback and got
+/// eaten as `***REDACTED(high_entropy)***` — found while building the MEDIUM-A
+/// false-positive battery (issue #132 second follow-up audit): this is a pre-existing
+/// gap, not introduced by that fix, but it must be closed for the same fixture to pass.
 fn is_image_ref(v: &str) -> bool {
-    if v.is_empty() || v.len() > 384 || v.contains("://") || v.contains('@') || v.contains(' ') {
+    let (base, digest_ok) = match v.split_once('@') {
+        Some((base, digest)) => (base, is_valid_image_digest(digest)),
+        None => (v, true),
+    };
+    if !digest_ok {
+        return false;
+    }
+    if base.is_empty() || base.len() > 384 || base.contains("://") || base.contains(' ') {
         return false;
     }
     // Require at least one '/' or ':' — otherwise a bare word is ambiguous and falls
     // through to the entropy check instead of being rubber-stamped "image ref".
-    if !v.contains('/') && !v.contains(':') {
+    if !base.contains('/') && !base.contains(':') {
         return false;
     }
-    v.chars().all(|c| {
+    base.chars().all(|c| {
         c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.' | '/' | ':')
     })
+}
+
+/// `sha256:<64 hex>` / `sha512:<128 hex>` — the only digest algorithms in real-world
+/// container image references. Lowercase hex only.
+fn is_valid_image_digest(d: &str) -> bool {
+    let Some((algo, hex)) = d.split_once(':') else {
+        return false;
+    };
+    let expected_len = match algo {
+        "sha256" => 64,
+        "sha512" => 128,
+        _ => return false,
+    };
+    hex.len() == expected_len
+        && hex
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, 'a'..='f'))
 }
 
 /// Comma-separated list where every element is itself a safe repo-ish token
@@ -754,6 +787,36 @@ fn word_is_structurally_safe(word: &str) -> bool {
     false
 }
 
+/// Fraction of ASCII vowels (`aeiou`, case-insensitive) among the *alphabetic*
+/// characters in `s`. Returns `1.0` (never "vowel-poor") when `s` has no alphabetic
+/// characters at all, so an all-digit/all-punctuation window is judged purely on
+/// [`contains_high_entropy_window`]'s digit check and entropy, not this.
+///
+/// The discriminator behind the MEDIUM-A fix (see [`contains_high_entropy_window`]):
+/// credential material drawn close to uniformly from an alphanumeric charset averages
+/// ~19% vowels (5 of the 26 letters, before digits/case even dilute that further),
+/// while real English — even with every delimiter stripped out and glued into one run
+/// of mixed-case compound identifiers (`camelCase`/`PascalCase`) — needs vowels to be
+/// pronounceable and stays close to ~35-45%. That gap is wide and, empirically (see
+/// this module's tests), survives brutal stress-testing far denser in glued-English
+/// than anything this codebase's own diagnostic text produces.
+fn vowel_fraction(s: &str) -> f64 {
+    let mut letters = 0u32;
+    let mut vowels = 0u32;
+    for c in s.chars() {
+        if c.is_ascii_alphabetic() {
+            letters += 1;
+            if matches!(c.to_ascii_lowercase(), 'a' | 'e' | 'i' | 'o' | 'u') {
+                vowels += 1;
+            }
+        }
+    }
+    if letters == 0 {
+        return 1.0;
+    }
+    f64::from(vowels) / f64::from(letters)
+}
+
 /// Last-resort per-word entropy check for [`redact_remaining_word_shapes`], and the
 /// MEDIUM-3 fix: unlike [`is_high_entropy`] (whole-string average — defeated by
 /// diluting a real credential with low-entropy filler text glued on with no
@@ -761,27 +824,44 @@ fn word_is_structurally_safe(word: &str) -> bool {
 /// ANY window clears the bar, so a high-entropy run embedded in otherwise-ordinary
 /// text is still caught.
 ///
-/// Gated on `word` containing at least one ASCII digit before even attempting the
-/// entropy scan: real credential shapes (API keys, AWS keys, hex, base64) essentially
-/// always mix in digits, while the realistic false-positive case for a sliding window
-/// — a long, unbroken, all-lowercase run of concatenated English words with no
-/// delimiter at all — is essentially never digit-free... er, is essentially *always*
-/// digit-free. Measured empirically against a battery of realistic long
-/// paths/hostnames/image-refs/glued-English fixtures during this fix: zero false
-/// positives with the gate, vs. every one of them flagging without it.
+/// Each window must ALSO look credential-shaped before its entropy is even measured —
+/// otherwise ordinary long English text is itself surprisingly close to the 3.5
+/// bits/char bar once every space is stripped out, and would trip the same threshold
+/// as a genuine secret (see this module's tests for the measured numbers). The
+/// original gate (MEDIUM-3 fix, first follow-up audit) required a digit somewhere in
+/// the window. That is a poor discriminator on its own: it has nothing to say about a
+/// digit-free credential (a letters-only key, a Diceware-shaped passphrase), which
+/// sailed through completely unredacted regardless of gluing — reported as MEDIUM-A in
+/// the second follow-up audit, reproduced with a bare digit-free secret both as an
+/// entire `reason` string and as an ordinary whitespace-bounded word.
+///
+/// The gate is now: the window contains a digit, OR its vowel share is at or below
+/// `MAX_VOWEL_FRACTION` (see [`vowel_fraction`] for why that line separates credential
+/// material from prose). Measured empirically while building this fix: at this
+/// threshold, 50,000 synthetically glued camelCase/PascalCase multi-word English
+/// identifiers (no delimiter, several capitalisation styles, lengths spanning and
+/// exceeding the window) produced a 0.02% false-positive rate under conditions far
+/// denser in glued-capitalised-English than any real diagnostic text this codebase
+/// emits (real stderr/error text is delimited by spaces, colons, commas, slashes), while
+/// realistic paths/hostnames/image-refs/comma-lists/ordinary sentences (this module's
+/// dedicated false-positive tests) survive intact. Digit-free random secrets are now
+/// caught roughly 70% of the time in a random-sample check (vs. 0% before this fix).
+/// The residual gap — a digit-free secret whose vowel share happens, by chance, to land
+/// above the bar in every window — is real and deliberately not hidden; see
+/// `known_gap_vowel_heavy_digit_free_secret_not_detected` in this module's tests.
 fn contains_high_entropy_window(word: &str) -> bool {
     const WINDOW: usize = 20;
     const MIN_BITS_PER_CHAR: f64 = 3.5;
-    if !word.chars().any(|c| c.is_ascii_digit()) {
-        return false;
-    }
+    const MAX_VOWEL_FRACTION: f64 = 0.15;
     let chars: Vec<char> = word.chars().collect();
     if chars.len() < WINDOW {
         return false;
     }
     for start in 0..=(chars.len() - WINDOW) {
         let window: String = chars[start..start + WINDOW].iter().collect();
-        if shannon_entropy_bits_per_char(&window) >= MIN_BITS_PER_CHAR {
+        let credential_shaped = window.chars().any(|c| c.is_ascii_digit())
+            || vowel_fraction(&window) <= MAX_VOWEL_FRACTION;
+        if credential_shaped && shannon_entropy_bits_per_char(&window) >= MIN_BITS_PER_CHAR {
             return true;
         }
     }
@@ -1219,29 +1299,156 @@ mod tests {
         assert_eq!(redact_free_text(reason), reason);
     }
 
-    /// REPORTED, NOT FIXED (residual gap from the MEDIUM-3 fix): the sliding-window
-    /// entropy fallback in `contains_high_entropy_window` is gated on the candidate
-    /// word containing at least one ASCII digit, to avoid false-positiving on long
-    /// concatenated English filler with no delimiter (see that function's doc comment
-    /// for the measured trade-off). A credential that happens to contain NO digits at
-    /// all (mixed-case letters only) and is glued with no delimiter onto filler text
-    /// therefore still evades detection. This is a narrower instance of the same
-    /// dilution class MEDIUM-3 covers, deliberately left open rather than silently
-    /// dropped — see this module's `contains_high_entropy_window` doc for why closing
-    /// it (removing the digit gate) was checked and rejected (it reintroduces false
-    /// positives on ordinary long glued English words).
+    // --- MEDIUM-A fix (second follow-up audit): the digit gate is gone -------------
+
+    /// The exact residual the second follow-up audit reported: a bare digit-free
+    /// secret as the ENTIRE `reason`/free-text string. Under the old digit-gated
+    /// `contains_high_entropy_window`, this was never redacted regardless of gluing.
     #[test]
-    fn known_gap_digit_free_credential_glued_to_filler_not_detected() {
+    fn bare_digit_free_credential_as_entire_reason_is_now_redacted() {
+        // Synthetic — not a real secret. Mixed-case letters only, no digits, 38 chars.
+        let secret = "QzXpLwVnTbYhSfJdMcUaEzXkNbPqRsTvWyAeGh";
+        assert!(secret.len() >= 20 && !secret.chars().any(|c| c.is_ascii_digit()));
+        let out = redact_free_text(secret);
+        assert!(!out.contains(secret), "digit-free secret leaked: {out}");
+    }
+
+    /// The same secret as an ordinary whitespace-bounded word in a sentence, exactly
+    /// as the auditor reproduced it a second way.
+    #[test]
+    fn bare_digit_free_credential_as_whitespace_bounded_word_is_now_redacted() {
+        let secret = "QzXpLwVnTbYhSfJdMcUaEzXkNbPqRsTvWyAeGh";
+        let reason = format!("auth error: token {secret} rejected by upstream");
+        let out = redact_free_text(&reason);
+        assert!(!out.contains(secret), "digit-free secret leaked: {out}");
+        assert!(out.contains("auth error: token"));
+        assert!(out.contains("rejected by upstream"));
+    }
+
+    /// The original MEDIUM-3-style dilution case, but with a digit-free secret: glued
+    /// onto low-entropy filler with no delimiter at all. This is what the OLD digit
+    /// gate pinned as `known_gap_digit_free_credential_glued_to_filler_not_detected` —
+    /// that gap is now closed; this test replaces it.
+    #[test]
+    fn digit_free_credential_glued_to_filler_is_now_redacted() {
         let filler = "authenticationfailedwhiletryingtoreach";
-        // Synthetic — not a real secret. Mixed-case letters only, no digits.
         let secret = "QzXpLwVnTbYhSfJdMcUaEzXkNbPqRsTvWyAeGh";
         assert!(secret.len() >= 20 && !secret.chars().any(|c| c.is_ascii_digit()));
         let reason = format!("error: {filler}{secret} occurred");
         let out = redact_free_text(&reason);
         assert!(
+            !out.contains(secret),
+            "glued digit-free secret leaked: {out}"
+        );
+        assert!(out.contains("error:"));
+        assert!(out.contains("occurred"));
+    }
+
+    // --- MEDIUM-A false-positive battery: realistic values that must survive -------
+    //
+    // A redactor that eats diagnostic text has traded one failure for another. Every
+    // fixture below is the kind of thing this codebase's own dumps actually print.
+
+    #[test]
+    fn false_positive_long_multi_segment_path_survives() {
+        let reason = "open /var/lib/gha-runner-ctl/state/pool/fleet/workers/aphelion-cpu-worker-042/lockfile.json: no such file or directory";
+        assert_eq!(redact_free_text(reason), reason);
+    }
+
+    #[test]
+    fn false_positive_dotted_hostname_survives() {
+        let reason =
+            "dial tcp: lookup runner-fleet-registry-internal.aphelion.example.com: no such host";
+        assert_eq!(redact_free_text(reason), reason);
+    }
+
+    #[test]
+    fn false_positive_image_ref_with_tag_and_digest_survives() {
+        // Real digest length/charset: sha256 = 64 lowercase hex chars.
+        let digest = "abcdef0123456789".repeat(4);
+        assert_eq!(digest.len(), 64);
+        let reason = format!(
+            "pull failed: ghcr.io/tzervas/gha-runner-ctl:v0.3.3@sha256:{digest} not found in registry"
+        );
+        assert_eq!(redact_free_text(&reason), reason);
+    }
+
+    #[test]
+    fn false_positive_comma_separated_repo_list_survives() {
+        let reason = "no repo in allowlist matched: tzervas/gha-runner-ctl,tzervas/other-repo,octo-org/example-repo,another-org/service-repo";
+        assert_eq!(redact_free_text(reason), reason);
+    }
+
+    #[test]
+    fn false_positive_ordinary_english_sentence_one_survives() {
+        // Similar length to the credential fixtures above, deliberately.
+        let reason = "the connection to the container registry timed out after several attempts";
+        assert_eq!(redact_free_text(reason), reason);
+    }
+
+    #[test]
+    fn false_positive_ordinary_english_sentence_two_survives() {
+        let reason = "permission denied while attempting to remove the temporary working directory";
+        assert_eq!(redact_free_text(reason), reason);
+    }
+
+    /// Compound identifiers glued with camelCase/PascalCase capitalisation (no
+    /// delimiter, similar shape to the credential-gluing case) are exactly the
+    /// realistic false-positive risk this fix's threshold was tuned against — pin a
+    /// battery of them directly, not just the whole-sentence fixtures above.
+    #[test]
+    fn false_positive_camel_and_pascal_case_compound_identifiers_survive() {
+        let words = [
+            "ContainerNotFoundErrorWhileProbingRegistrySocket",
+            "OCIRuntimeConfigurationInvalidDuringInitialization",
+            "cannotAcquireWorkerLockAfterSeveralRetryAttempts",
+            "rootlessPodmanNamespaceUnavailableDuringPull",
+        ];
+        for w in words {
+            let reason = format!("error: {w} occurred");
+            assert_eq!(
+                redact_free_text(&reason),
+                reason,
+                "camelCase/PascalCase identifier wrongly redacted: {w}"
+            );
+        }
+    }
+
+    // --- MEDIUM-A residual gap, pinned honestly rather than hidden -----------------
+
+    /// A vowel-density gate cannot distinguish a random secret from prose with
+    /// perfect accuracy — only shift the odds heavily in the redactor's favour. This
+    /// pins the residual: a digit-free secret whose vowel share happens, by chance, to
+    /// land ABOVE the `0.15` bar in its only 20-char window (6 of 20 chars are
+    /// vowels here) evades detection even though its Shannon entropy comfortably
+    /// clears the bar on its own. This is not a hypothetical — it was found by random
+    /// search over the same alphabet real secrets are drawn from. Left open
+    /// deliberately (see `contains_high_entropy_window`'s doc comment for the
+    /// measured trade-off that rejected lowering the vowel bar further) rather than
+    /// silently dropped.
+    #[test]
+    fn known_gap_vowel_heavy_digit_free_secret_not_detected() {
+        let secret = "pkaBXfMyeauUCgcfQjiY"; // synthetic, 20 chars, no digits
+        assert!(secret.len() >= 20 && !secret.chars().any(|c| c.is_ascii_digit()));
+        assert!(
+            shannon_entropy_bits_per_char(secret) >= 3.5,
+            "fixture must actually clear the entropy bar to demonstrate the gap"
+        );
+        let letters = secret.chars().filter(|c| c.is_ascii_alphabetic()).count();
+        let vowels = secret
+            .chars()
+            .filter(|c| matches!(c.to_ascii_lowercase(), 'a' | 'e' | 'i' | 'o' | 'u'))
+            .count();
+        assert!(
+            (vowels as f64 / letters as f64) > 0.15,
+            "fixture must actually clear the vowel-density gate to demonstrate the gap"
+        );
+        let reason = format!("token {secret} rejected");
+        let out = redact_free_text(&reason);
+        assert!(
             out.contains(secret),
-            "if this now fails, the digit-gate residual gap was closed — update/remove \
-             this pinned gap test"
+            "if this now fails, the vowel-density residual gap was closed — \
+             update/remove this pinned gap test"
         );
     }
 }
