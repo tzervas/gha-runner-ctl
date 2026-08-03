@@ -61,7 +61,7 @@ fn redact_enum_field(value: &str, known: &[&str]) -> String {
 /// One fail-closed decision, ready to serialize as a single structured log line.
 ///
 /// `check`/`object`/`assumed`/`reason` are private — the ONLY way to construct a
-/// `FailClosedEvent` is [`FailClosedEvent::redacted`] (used exclusively by
+/// `FailClosedEvent` is `FailClosedEvent::redacted` (used exclusively by
 /// [`FailClosedTracker::record`]), which redacts every one of them on the way in. This
 /// is deliberate: issue #132's follow-up audit found `check`/`object`/`assumed`
 /// emitted completely unredacted (no allowlist, no blocklist — HIGH-1) and `reason`'s

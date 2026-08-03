@@ -625,7 +625,7 @@ impl fmt::Display for RedactedText {
 /// Disable with `GHA_DEBUG_ON_ERR=0` once the stack is stable.
 ///
 /// Gathers `err` plus best-effort environment/subprocess context, then hands
-/// everything to [`write_debug_dump_on_error`] for the actual printing — that
+/// everything to `write_debug_dump_on_error` for the actual printing — that
 /// function, not this one, is what carries the redaction guarantee (issue #132 third
 /// follow-up audit): see its doc comment.
 pub fn debug_dump_on_error(err: &str) {
@@ -792,13 +792,13 @@ impl fmt::Display for RedactedCommand {
 /// the decision, and what the code assumed as a result. Same `GHA_DEBUG`/
 /// `GHA_DEBUG_ON_ERR` gate as [`debug_dump_on_error`].
 ///
-/// `resolved_inputs` are dumped through the exact same [`dump_redact`] allowlist as
+/// `resolved_inputs` are dumped through the exact same `dump_redact` allowlist as
 /// [`debug_dump_on_error`] — an unrecognised key is printed as
 /// `***REDACTED(key_not_allowlisted)***`, never silently skipped, so a caller that
 /// passes something new finds out immediately rather than assuming it was included.
 ///
-/// `command` is redacted immediately via [`RedactedCommand::new`] (MEDIUM-B) before it
-/// ever reaches [`write_debug_dump_fail_closed`].
+/// `command` is redacted immediately via `RedactedCommand::new` (MEDIUM-B) before it
+/// ever reaches `write_debug_dump_fail_closed`.
 pub fn debug_dump_fail_closed(
     ev: &FailClosedEvent,
     command: &str,

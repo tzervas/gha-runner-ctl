@@ -39,4 +39,12 @@ regexes = [
   # --no-git: the literals were removed from the working tree, but remain in history.
   '''BEGIN RSA PRIVATE KEY-----\\nMIIB\.\.\.''',
   '''BEGIN RSA PRIVATE KEY-----\\nabc\\n''',
+  # Synthetic redact-test fixtures in src/dump_redact.rs's inline #[cfg(test)] module,
+  # which the `tests/` path allowlist above cannot reach (same reasoning as the
+  # appauth.rs PEM placeholders above). Each is a fabricated value used only to
+  # exercise redact_free_text/classify_value; none is a live credential.
+  '''eyJhbGciOiJIUzI1NiJ9\.eyJzdWIiOiJzeW50aGV0aWMifQ\.c3ludGhldGljLXNpZ25hdHVyZQ''',
+  '''Q7z9kR2pL8xW4vN6tB1yH3sF5jD0mC7uAeZ9xK2''',
+  '''1234567890abcdef''',
+  '''abcXYZ123secret''',
 ]

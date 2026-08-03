@@ -616,7 +616,7 @@ fn is_repo_ish_token(s: &str) -> bool {
 /// 1. If the WHOLE text contains PEM material anywhere, redact the whole thing — PEM
 ///    blocks are inherently multi-line, so word-level surgery isn't practical or
 ///    meaningfully safer, and this mirrors [`classify_value`]'s existing PEM handling.
-/// 2. [`redact_prefixed_shapes`]: a substring-anywhere scan (not anchored to a token
+/// 2. `redact_prefixed_shapes`: a substring-anywhere scan (not anchored to a token
 ///    boundary) for GitHub tokens / fine-grained PATs / AWS access key IDs / Slack
 ///    tokens / `Bearer <token>` / this project's own `RUNNER_TOKEN=<value>` marker.
 ///    Fixed vendor prefixes are essentially false-positive-free wherever they
@@ -624,9 +624,9 @@ fn is_repo_ish_token(s: &str) -> bool {
 ///    with no delimiter at all (`cannotchdirtoAKIA...`) and one wrapped in shell
 ///    quoting (`-H 'Bearer <tok>'`), neither of which a delimiter-tokenizing scan
 ///    would see.
-/// 3. [`redact_remaining_word_shapes`]: a whitespace-tokenized scan of what's left, for
+/// 3. `redact_remaining_word_shapes`: a whitespace-tokenized scan of what's left, for
 ///    JWTs, basic-auth URLs, and a last-resort *sliding-window* entropy check per word
-///    (see [`contains_high_entropy_window`] for why this — not a whole-word average —
+///    (see `contains_high_entropy_window` for why this — not a whole-word average —
 ///    is what closes the MEDIUM-3 dilution gap).
 pub fn redact_free_text(text: &str) -> String {
     if is_pem_block(text) {
