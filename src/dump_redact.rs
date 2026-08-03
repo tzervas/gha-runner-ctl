@@ -541,6 +541,320 @@ fn is_repo_ish_token(s: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
 }
 
+// =====================================================================================
+// Free-text scanning — for hostile, caller-uncontrolled strings (issue #132 follow-up
+// audit, HIGH-2 / MEDIUM-3), not just named key/value pairs.
+//
+// `redact_for_dump`/`classify_value` above answer "is this whole named VALUE safe to
+// print" and redact the entire value on any suspicion — the right, simple trade for a
+// single resolved env var. `redact_free_text` answers a different question: "does this
+// free-text BLOB (subprocess stderr, a raw error message) contain a credential
+// *anywhere in it*", and redacts only the matched span, leaving the rest of the
+// diagnostic text — exit codes, paths, the actual error — byte-for-byte intact. A
+// human debugging a fail-closed decision needs that surrounding detail; a dump that
+// redacts the whole message "to be safe" is as useless as one that leaks the secret.
+// =====================================================================================
+
+/// Scan free text for credential shapes occurring ANYWHERE in the string — not just
+/// when the whole string happens to be one, and not just when a credential sits on a
+/// token boundary. Three passes, in order:
+///
+/// 1. If the WHOLE text contains PEM material anywhere, redact the whole thing — PEM
+///    blocks are inherently multi-line, so word-level surgery isn't practical or
+///    meaningfully safer, and this mirrors [`classify_value`]'s existing PEM handling.
+/// 2. [`redact_prefixed_shapes`]: a substring-anywhere scan (not anchored to a token
+///    boundary) for GitHub tokens / fine-grained PATs / AWS access key IDs / Slack
+///    tokens / `Bearer <token>`. Fixed vendor prefixes are essentially
+///    false-positive-free wherever they appear, so this catches a credential glued
+///    directly onto adjacent filler text with no delimiter at all
+///    (`cannotchdirtoAKIA...`) and one wrapped in shell quoting
+///    (`-H 'Bearer <tok>'`), neither of which a delimiter-tokenizing scan would see.
+/// 3. [`redact_remaining_word_shapes`]: a whitespace-tokenized scan of what's left, for
+///    JWTs, basic-auth URLs, and a last-resort *sliding-window* entropy check per word
+///    (see [`contains_high_entropy_window`] for why this — not a whole-word average —
+///    is what closes the MEDIUM-3 dilution gap).
+pub fn redact_free_text(text: &str) -> String {
+    if is_pem_block(text) {
+        return format!("***REDACTED({})***", UnsafeShape::PemBlock.as_str());
+    }
+    let stage1 = redact_prefixed_shapes(text);
+    redact_remaining_word_shapes(&stage1)
+}
+
+/// Length of the maximal run of chars satisfying `is_ok` starting at byte offset 0 of
+/// `s`, capped at `cap` chars. Returns `None` (no match) if that run is shorter than
+/// `min_chars`. Byte length, so the result can be used directly with `&s[..len]` /
+/// `replace_range`.
+fn maximal_run_len(
+    s: &str,
+    min_chars: usize,
+    cap: usize,
+    is_ok: impl Fn(char) -> bool,
+) -> Option<usize> {
+    let mut chars_taken = 0usize;
+    let mut byte_len = 0usize;
+    for c in s.chars() {
+        if chars_taken >= cap || !is_ok(c) {
+            break;
+        }
+        chars_taken += 1;
+        byte_len += c.len_utf8();
+    }
+    if chars_taken >= min_chars {
+        Some(byte_len)
+    } else {
+        None
+    }
+}
+
+/// Find every occurrence of any of `prefixes` in `text` and, at each one, check
+/// whether `match_body_len` recognises the chars immediately following it as a
+/// credential body. Replace exactly the matched span (`prefix` + body) with a
+/// `***REDACTED(shape)***` placeholder; leave everything else untouched. Mirrors the
+/// existing `redact()` blocklist scrubber's find/replace/continue loop shape.
+fn redact_by_marker(
+    text: &str,
+    prefixes: &[&str],
+    match_body_len: impl Fn(&str) -> Option<usize>,
+    shape: UnsafeShape,
+) -> String {
+    let mut out = text.to_string();
+    for prefix in prefixes {
+        let mut start_search = 0usize;
+        while start_search < out.len() {
+            let Some(rel) = out[start_search..].find(prefix) else {
+                break;
+            };
+            let i = start_search + rel;
+            let body_start = i + prefix.len();
+            if body_start > out.len() {
+                break;
+            }
+            let body = &out[body_start..];
+            if let Some(body_len) = match_body_len(body) {
+                let end = body_start + body_len;
+                let placeholder = format!("***REDACTED({})***", shape.as_str());
+                out.replace_range(i..end, &placeholder);
+                start_search = i + placeholder.len();
+            } else {
+                start_search = i + prefix.len();
+            }
+        }
+    }
+    out
+}
+
+/// `Bearer <token>`, substring-anywhere (not anchored to the start of a word) so
+/// `"-H 'Bearer <tok>'"` (shell-quoted, straight from a curl invocation in stderr)
+/// still gets the token redacted even though the leading `'` glues onto "Bearer" with
+/// no whitespace. Mirrors [`is_bearer_token`]'s own length rule (no charset
+/// restriction — bearer tokens are opaque).
+fn redact_bearer(text: &str) -> String {
+    let marker = "Bearer ";
+    let mut out = text.to_string();
+    let mut start_search = 0usize;
+    while start_search < out.len() {
+        let Some(rel) = out[start_search..].find(marker) else {
+            break;
+        };
+        let i = start_search + rel;
+        let body_start = i + marker.len();
+        let rest = &out[body_start..];
+        let tail = rest.split_whitespace().next().unwrap_or("");
+        if tail.len() >= 8 {
+            let end = body_start + tail.len();
+            let placeholder = format!(
+                "Bearer ***REDACTED({})***",
+                UnsafeShape::BearerToken.as_str()
+            );
+            out.replace_range(i..end, &placeholder);
+            start_search = i + placeholder.len();
+        } else {
+            start_search = i + marker.len();
+        }
+    }
+    out
+}
+
+/// Stage 2 of [`redact_free_text`]: substring-anywhere scan for every named-prefix
+/// credential shape plus `Bearer`. See module docs.
+fn redact_prefixed_shapes(text: &str) -> String {
+    let mut out = text.to_string();
+    out = redact_by_marker(
+        &out,
+        &["ghp_", "gho_", "ghs_", "ghu_", "ghr_"],
+        |s| maximal_run_len(s, 36, 200, |c| c.is_ascii_alphanumeric()),
+        UnsafeShape::GithubToken,
+    );
+    out = redact_by_marker(
+        &out,
+        &["github_pat_"],
+        |s| maximal_run_len(s, 82, 200, |c| c.is_ascii_alphanumeric() || c == '_'),
+        UnsafeShape::GithubFineGrainedPat,
+    );
+    out = redact_by_marker(
+        &out,
+        &["AKIA", "ASIA"],
+        |s| maximal_run_len(s, 16, 40, |c| c.is_ascii_uppercase() || c.is_ascii_digit()),
+        UnsafeShape::AwsAccessKeyId,
+    );
+    out = redact_by_marker(
+        &out,
+        &["xoxb-", "xoxp-", "xoxa-", "xoxr-", "xoxs-"],
+        |s| maximal_run_len(s, 20, 200, |c| c.is_ascii_alphanumeric() || c == '-'),
+        UnsafeShape::SlackToken,
+    );
+    redact_bearer(&out)
+}
+
+/// A word is treated as "safe by construction" for the purposes of skipping the
+/// sliding-window entropy fallback in [`redact_remaining_word_shapes`] only when it
+/// has genuine multi-part STRUCTURE: a real multi-*label* hostname, a real
+/// multi-*segment* path, a real image ref, a bool/int literal, or a vault/file
+/// reference. This deliberately does NOT delegate to [`is_hostname`]/[`is_fs_path`]
+/// wholesale, because those grant a *single*-label/single-segment exemption based on
+/// **whole-string** entropy ([`is_high_entropy`]) — exactly the check MEDIUM-3 showed
+/// is defeated by gluing a credential onto low-entropy filler with no delimiter
+/// (whole-string average dips below the bar even though a run inside it is clearly
+/// opaque). A single bare token reaching this function is always sent on to
+/// [`contains_high_entropy_window`] instead, which measures a sliding window rather
+/// than the whole-token average.
+fn word_is_structurally_safe(word: &str) -> bool {
+    if is_bool_literal(word) || is_int_literal(word) {
+        return true;
+    }
+    if let Some(rest) = word.strip_prefix("secret:") {
+        if looks_like_vault_group_key(rest) {
+            return true;
+        }
+    }
+    if let Some(rest) = word.strip_prefix("file:") {
+        if !rest.is_empty() && !rest.contains("://") && !rest.chars().any(char::is_whitespace) {
+            return true;
+        }
+    }
+    // Multi-*label* hostname only (`.` present) — a single label is never exempted
+    // here regardless of what is_hostname's own (dilution-vulnerable) check says.
+    if word.contains('.') && is_hostname(word) {
+        return true;
+    }
+    // Multi-*segment* path only.
+    if is_fs_path(word) {
+        let seg_count = word[1..].split('/').filter(|s| !s.is_empty()).count();
+        if seg_count >= 2 {
+            return true;
+        }
+    }
+    // is_image_ref requires a `/` or `:` by construction — never a bare single token —
+    // and never grants an entropy exemption internally, so it's safe to delegate to
+    // wholesale.
+    if is_image_ref(word) {
+        return true;
+    }
+    false
+}
+
+/// Last-resort per-word entropy check for [`redact_remaining_word_shapes`], and the
+/// MEDIUM-3 fix: unlike [`is_high_entropy`] (whole-string average — defeated by
+/// diluting a real credential with low-entropy filler text glued on with no
+/// delimiter), this slides a fixed-size window across `word` and flags it as soon as
+/// ANY window clears the bar, so a high-entropy run embedded in otherwise-ordinary
+/// text is still caught.
+///
+/// Gated on `word` containing at least one ASCII digit before even attempting the
+/// entropy scan: real credential shapes (API keys, AWS keys, hex, base64) essentially
+/// always mix in digits, while the realistic false-positive case for a sliding window
+/// — a long, unbroken, all-lowercase run of concatenated English words with no
+/// delimiter at all — is essentially never digit-free... er, is essentially *always*
+/// digit-free. Measured empirically against a battery of realistic long
+/// paths/hostnames/image-refs/glued-English fixtures during this fix: zero false
+/// positives with the gate, vs. every one of them flagging without it.
+fn contains_high_entropy_window(word: &str) -> bool {
+    const WINDOW: usize = 20;
+    const MIN_BITS_PER_CHAR: f64 = 3.5;
+    if !word.chars().any(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    let chars: Vec<char> = word.chars().collect();
+    if chars.len() < WINDOW {
+        return false;
+    }
+    for start in 0..=(chars.len() - WINDOW) {
+        let window: String = chars[start..start + WINDOW].iter().collect();
+        if shannon_entropy_bits_per_char(&window) >= MIN_BITS_PER_CHAR {
+            return true;
+        }
+    }
+    false
+}
+
+/// Stage 3 of [`redact_free_text`]: whitespace-tokenized scan of what [`redact_prefixed_shapes`]
+/// left behind, for JWTs, basic-auth URLs, and the gated sliding-window entropy
+/// fallback. Whitespace (not the wider `EMBEDDED_SCAN_DELIMS` set) is the only
+/// tokenizing delimiter here, deliberately: this function's job is to decide whether
+/// to *replace* a whole word, and replacing on every comma/slash/colon boundary would
+/// shred ordinary punctuated prose (`"exit 125, cannot chdir"`) into fragments this
+/// function would then have to reassemble byte-for-byte — whitespace is the one
+/// delimiter free text is guaranteed to actually contain between real words.
+fn redact_remaining_word_shapes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let n = text.len();
+    let mut i = 0usize;
+    while i < n {
+        let c = text[i..]
+            .chars()
+            .next()
+            .expect("i < n implies a char is present");
+        if c.is_whitespace() {
+            let start = i;
+            while i < n {
+                let c2 = text[i..]
+                    .chars()
+                    .next()
+                    .expect("i < n implies a char is present");
+                if !c2.is_whitespace() {
+                    break;
+                }
+                i += c2.len_utf8();
+            }
+            out.push_str(&text[start..i]);
+        } else {
+            let start = i;
+            while i < n {
+                let c2 = text[i..]
+                    .chars()
+                    .next()
+                    .expect("i < n implies a char is present");
+                if c2.is_whitespace() {
+                    break;
+                }
+                i += c2.len_utf8();
+            }
+            let word = &text[start..i];
+            if word.contains("REDACTED") {
+                // Already a placeholder from an earlier stage — don't re-scan our own
+                // marker text (it can itself read as high-entropy-ish).
+                out.push_str(word);
+            } else if is_jwt(word) {
+                out.push_str("***REDACTED(");
+                out.push_str(UnsafeShape::Jwt.as_str());
+                out.push_str(")***");
+            } else if is_basic_auth_url(word) {
+                out.push_str("***REDACTED(");
+                out.push_str(UnsafeShape::BasicAuthUrl.as_str());
+                out.push_str(")***");
+            } else if !word_is_structurally_safe(word) && contains_high_entropy_window(word) {
+                out.push_str("***REDACTED(");
+                out.push_str(UnsafeShape::HighEntropy.as_str());
+                out.push_str(")***");
+            } else {
+                out.push_str(word);
+            }
+        }
+    }
+    out
+}
+
 /// Last-resort catch-all: a long string with high character-level (Shannon) entropy
 /// is treated as opaque credential material even if it matches none of the named
 /// shapes above — this is what catches raw AWS secret access keys (40 base64-ish
@@ -816,5 +1130,118 @@ mod tests {
     #[test]
     fn empty_value_is_safe() {
         assert_eq!(classify_value(""), ValueVerdict::Safe);
+    }
+
+    // --- redact_free_text: issue #132 follow-up audit (HIGH-2 / MEDIUM-3 / req. 3) --
+
+    /// The exact message from requirement 3: this must survive completely intact —
+    /// none of its words match any credential shape, and none are long+diverse enough
+    /// to trip the entropy fallback, so nothing here should ever be touched.
+    #[test]
+    fn ordinary_diagnostic_message_survives_verbatim() {
+        let msg = "podman top failed: exit 125, cannot chdir to /home/kang";
+        assert_eq!(redact_free_text(msg), msg);
+    }
+
+    #[test]
+    fn multiline_stderr_with_embedded_token_redacts_only_the_token() {
+        let synthetic = format!("ghp_{}", "a1B2c3D4".repeat(5));
+        let stderr = format!(
+            "level=info msg=\"starting\"\nlevel=error msg=\"auth failed\" token={synthetic}\nlevel=info msg=\"retrying\""
+        );
+        let out = redact_free_text(&stderr);
+        assert!(!out.contains(&synthetic), "token leaked: {out}");
+        assert!(out.contains("level=info msg=\"starting\""));
+        assert!(out.contains("level=error msg=\"auth failed\" token="));
+        assert!(out.contains("level=info msg=\"retrying\""));
+    }
+
+    #[test]
+    fn credential_glued_with_no_delimiter_to_filler_is_redacted() {
+        // MEDIUM-3: whole-string average entropy of `glued` is diluted below the
+        // 3.5 bits/char bar by the low-entropy filler prefix, defeating the OLD
+        // whole-string is_high_entropy fallback — this is what the sliding-window
+        // check in contains_high_entropy_window exists to catch. The filler has to be
+        // genuinely LOW-entropy (not just ordinary English — English text is
+        // surprisingly diverse per-character and barely dilutes the average at all;
+        // this was checked empirically while building this fixture) to actually
+        // demonstrate the dilution this test is about.
+        let filler = "x".repeat(80);
+        let secret = "Q7z9kR2pL8xW4vN6tB1yH3sF5jD0mC7uAeZ9xK2"; // synthetic, 40 chars
+        let glued = format!("{filler}{secret}");
+        assert!(
+            shannon_entropy_bits_per_char(&glued) < 3.5,
+            "fixture must actually dilute below the whole-string bar to demonstrate the fix"
+        );
+        let reason = format!("error: {glued} occurred while probing");
+        let out = redact_free_text(&reason);
+        assert!(!out.contains(secret), "glued secret leaked: {out}");
+        assert!(out.contains("error:"));
+        assert!(out.contains("occurred while probing"));
+    }
+
+    #[test]
+    fn bearer_token_in_shell_quoted_stderr_is_redacted() {
+        let reason = "curl: (22) The requested URL returned error: -H 'Bearer sVvJ8kQpR2xN9tYw6cLzF1mH3dGa' failed";
+        let out = redact_free_text(reason);
+        assert!(
+            !out.contains("sVvJ8kQpR2xN9tYw6cLzF1mH3dGa"),
+            "token leaked: {out}"
+        );
+        assert!(out.contains("curl: (22) The requested URL returned error:"));
+        assert!(out.contains("failed"));
+    }
+
+    #[test]
+    fn aws_key_embedded_mid_word_with_no_delimiter_is_redacted() {
+        let reason = "denied:cannotchdirtoAKIAIOSFODNN7EXAMPLEbecausepermissions";
+        let out = redact_free_text(reason);
+        assert!(
+            !out.contains("AKIAIOSFODNN7EXAMPLE"),
+            "AWS key leaked: {out}"
+        );
+    }
+
+    #[test]
+    fn pem_block_in_reason_redacts_the_whole_text() {
+        let begin = concat!("-----BEGIN ", "PRIVATE KEY-----");
+        let end = concat!("-----END ", "PRIVATE KEY-----");
+        let reason = format!("unexpected key material:\n{begin}\nc3ludGg=\n{end}\ntrailing");
+        let out = redact_free_text(&reason);
+        assert!(!out.contains("c3ludGg="));
+        assert!(out.contains("pem_block"));
+    }
+
+    #[test]
+    fn realistic_multi_segment_paths_and_hostnames_survive_in_free_text() {
+        let reason = "connect to registry.internal.example.com:5000/v2/ failed: \
+                       open /tmp/gha-runner-ctl-worker-07/state.json: permission denied";
+        assert_eq!(redact_free_text(reason), reason);
+    }
+
+    /// REPORTED, NOT FIXED (residual gap from the MEDIUM-3 fix): the sliding-window
+    /// entropy fallback in `contains_high_entropy_window` is gated on the candidate
+    /// word containing at least one ASCII digit, to avoid false-positiving on long
+    /// concatenated English filler with no delimiter (see that function's doc comment
+    /// for the measured trade-off). A credential that happens to contain NO digits at
+    /// all (mixed-case letters only) and is glued with no delimiter onto filler text
+    /// therefore still evades detection. This is a narrower instance of the same
+    /// dilution class MEDIUM-3 covers, deliberately left open rather than silently
+    /// dropped — see this module's `contains_high_entropy_window` doc for why closing
+    /// it (removing the digit gate) was checked and rejected (it reintroduces false
+    /// positives on ordinary long glued English words).
+    #[test]
+    fn known_gap_digit_free_credential_glued_to_filler_not_detected() {
+        let filler = "authenticationfailedwhiletryingtoreach";
+        // Synthetic — not a real secret. Mixed-case letters only, no digits.
+        let secret = "QzXpLwVnTbYhSfJdMcUaEzXkNbPqRsTvWyAeGh";
+        assert!(secret.len() >= 20 && !secret.chars().any(|c| c.is_ascii_digit()));
+        let reason = format!("error: {filler}{secret} occurred");
+        let out = redact_free_text(&reason);
+        assert!(
+            out.contains(secret),
+            "if this now fails, the digit-gate residual gap was closed — update/remove \
+             this pinned gap test"
+        );
     }
 }

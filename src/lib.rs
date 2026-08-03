@@ -17,8 +17,8 @@ mod image_arch;
 mod pool;
 
 pub use dump_redact::{
-    classify_value, is_allowlisted_key, redact_env_dump, redact_for_dump, RedactedField,
-    UnsafeShape, ValueVerdict, DUMP_ALLOWLIST,
+    classify_value, is_allowlisted_key, redact_env_dump, redact_for_dump, redact_free_text,
+    RedactedField, UnsafeShape, ValueVerdict, DUMP_ALLOWLIST,
 };
 pub use fail_closed::{check_succeeded, fail_closed, FailClosedEvent, FailClosedTracker};
 pub use image_arch::{
@@ -669,26 +669,57 @@ pub fn debug_dump_fail_closed(
     if !debug_dump_enabled() {
         return;
     }
-    eprintln!("========== gha-runner-ctl DEBUG (fail-closed) ==========");
-    eprintln!("check:       {}", ev.check);
-    eprintln!("object:      {}", ev.object);
-    eprintln!("assumed:     {}", ev.assumed);
-    eprintln!("consecutive: {} (since {})", ev.consecutive, ev.since);
-    eprintln!("command:     {command}");
-    // ev.reason is the real error including exit status; already redact()-scrubbed by
-    // the caller (podman()'s Err path runs subprocess stderr through it before this
-    // ever gets here) since it is free text, not a named key/value pair.
-    eprintln!("reason:      {}", ev.reason);
-    eprintln!("resolved inputs:");
+    let mut stderr = std::io::stderr();
+    // Infallible by convention (matches every other eprintln!-based dump in this
+    // file): a broken stderr pipe should never turn a debug dump into a panic.
+    let _ = write_debug_dump_fail_closed(&mut stderr, ev, command, resolved_inputs);
+}
+
+/// Core of [`debug_dump_fail_closed`], factored out to write to any [`Write`] rather
+/// than stderr directly, so the redaction guarantee ("every field printed here comes
+/// from `ev`'s already-redacted getters, never a raw field") is unit-testable against
+/// an in-memory buffer instead of only provable by inspection (issue #132 follow-up
+/// audit — this is the concrete test surface for the plaintext-dump half of HIGH-1 /
+/// HIGH-2 / MEDIUM-3, alongside [`FailClosedEvent::to_json_line`] for the WARN-event
+/// half).
+fn write_debug_dump_fail_closed<W: Write>(
+    w: &mut W,
+    ev: &FailClosedEvent,
+    command: &str,
+    resolved_inputs: &[(&str, String)],
+) -> std::io::Result<()> {
+    writeln!(
+        w,
+        "========== gha-runner-ctl DEBUG (fail-closed) =========="
+    )?;
+    writeln!(w, "check:       {}", ev.check())?;
+    writeln!(w, "object:      {}", ev.object())?;
+    writeln!(w, "assumed:     {}", ev.assumed())?;
+    writeln!(w, "consecutive: {} (since {})", ev.consecutive, ev.since)?;
+    writeln!(w, "command:     {command}")?;
+    // ev.reason() is the real error including exit status. It is redacted
+    // unconditionally on construction (FailClosedEvent::redacted, via
+    // dump_redact::redact_free_text) regardless of what the caller passes — this no
+    // longer depends on the caller having pre-redacted it (issue #132 follow-up audit,
+    // HIGH-2).
+    writeln!(w, "reason:      {}", ev.reason())?;
+    writeln!(w, "resolved inputs:")?;
     let pairs: Vec<(&str, &str)> = resolved_inputs
         .iter()
         .map(|(k, v)| (*k, v.as_str()))
         .collect();
     for field in redact_env_dump(pairs) {
-        eprintln!("  {}={}", field.key, field.value);
+        writeln!(w, "  {}={}", field.key, field.value)?;
     }
-    eprintln!("hint:        GHA_DEBUG=1 for more; GHA_DEBUG_ON_ERR=0 to silence");
-    eprintln!("==========================================================");
+    writeln!(
+        w,
+        "hint:        GHA_DEBUG=1 for more; GHA_DEBUG_ON_ERR=0 to silence"
+    )?;
+    writeln!(
+        w,
+        "=========================================================="
+    )?;
+    Ok(())
 }
 
 fn env_truthy(key: &str) -> bool {
@@ -6624,5 +6655,117 @@ mod priority_cursor_tests {
         let (_, off) = rotate_by_cursor(&items, &p);
         assert_ne!(off, 0, "a zero-progress tick must still advance the cursor");
         let _ = fs::remove_file(&p);
+    }
+}
+
+/// Proves the plaintext fail-closed debug dump (`debug_dump_fail_closed`, tested here
+/// via its testable core, `write_debug_dump_fail_closed`, which writes to any `Write`
+/// instead of stderr directly) never prints a raw credential from `check`/`object`/
+/// `assumed`/`reason` — the second of the two output paths the issue #132 follow-up
+/// audit's HIGH-1/HIGH-2 findings named (the first, the WARN JSON event, is proven in
+/// `fail_closed::tests`). Both paths read from the same already-redacted
+/// `FailClosedEvent` getters, so these tests are really exercising that
+/// `write_debug_dump_fail_closed` does not reintroduce a leak by, say, printing a raw
+/// field it was handed directly instead of going through the getters.
+#[cfg(test)]
+mod fail_closed_debug_dump_tests {
+    use super::*;
+    use std::time::UNIX_EPOCH;
+
+    fn dump(ev: &FailClosedEvent) -> String {
+        let mut buf: Vec<u8> = Vec::new();
+        write_debug_dump_fail_closed(&mut buf, ev, "podman top <container>", &[]).unwrap();
+        String::from_utf8(buf).expect("dump is valid UTF-8")
+    }
+
+    #[test]
+    fn synthetic_credential_in_check_is_redacted_in_plaintext_dump() {
+        let t = FailClosedTracker::new();
+        let synthetic = format!("ghp_{}", "a1B2c3D4".repeat(5));
+        let ev = t.record(&synthetic, "obj", "referenced", "boom", UNIX_EPOCH);
+        let out = dump(&ev);
+        assert!(
+            !out.contains(&synthetic),
+            "credential leaked in dump: {out}"
+        );
+    }
+
+    #[test]
+    fn synthetic_credential_in_object_is_redacted_in_plaintext_dump() {
+        let t = FailClosedTracker::new();
+        let synthetic = "AKIAIOSFODNN7EXAMPLE";
+        let ev = t.record(
+            "image_refcount",
+            synthetic,
+            "referenced",
+            "boom",
+            UNIX_EPOCH,
+        );
+        let out = dump(&ev);
+        assert!(!out.contains(synthetic), "credential leaked in dump: {out}");
+    }
+
+    #[test]
+    fn synthetic_credential_in_assumed_is_redacted_in_plaintext_dump() {
+        let t = FailClosedTracker::new();
+        let synthetic = format!("ghp_{}", "a1B2c3D4".repeat(5));
+        let ev = t.record("image_refcount", "obj", &synthetic, "boom", UNIX_EPOCH);
+        let out = dump(&ev);
+        assert!(
+            !out.contains(&synthetic),
+            "credential leaked in dump: {out}"
+        );
+    }
+
+    /// The exact scenario the auditor confirmed live: a synthetic credential placed
+    /// in `object`, unredacted by the caller, must not reach the dump.
+    #[test]
+    fn synthetic_credential_placed_in_object_never_reaches_dump_live_repro() {
+        let t = FailClosedTracker::new();
+        let synthetic = format!("github_pat_{}", "a1B2c3D4e5".repeat(9));
+        let ev = t.record(
+            "worker_busy_probe",
+            &synthetic,
+            "busy",
+            "podman top: exit 1",
+            UNIX_EPOCH,
+        );
+        let out = dump(&ev);
+        assert!(
+            !out.contains(&synthetic),
+            "credential leaked in dump: {out}"
+        );
+    }
+
+    /// HIGH-2, mid-sentence in raw stderr, plaintext-dump side — and the diagnostic
+    /// text around it must survive (requirement 3).
+    #[test]
+    fn synthetic_credential_embedded_mid_sentence_in_reason_is_redacted_in_plaintext_dump() {
+        let t = FailClosedTracker::new();
+        let synthetic = "AKIAIOSFODNN7EXAMPLE";
+        let reason = format!(
+            "podman top failed: exit 125, cannot chdir to /home/kang, aws_key={synthetic} rejected"
+        );
+        let ev = t.record("worker_busy_probe", "worker-3", "busy", &reason, UNIX_EPOCH);
+        let out = dump(&ev);
+        assert!(!out.contains(synthetic), "credential leaked in dump: {out}");
+        assert!(
+            out.contains("podman top failed: exit 125, cannot chdir to /home/kang"),
+            "diagnostic detail must survive intact: {out}"
+        );
+    }
+
+    /// Requirement 3's literal example, end to end through the real dump writer (not
+    /// just `redact_free_text` in isolation): must appear byte-for-byte in the dump.
+    #[test]
+    fn ordinary_diagnostic_reason_survives_verbatim_in_plaintext_dump() {
+        let t = FailClosedTracker::new();
+        let reason = "podman top failed: exit 125, cannot chdir to /home/kang";
+        let ev = t.record("worker_busy_probe", "worker-3", "busy", reason, UNIX_EPOCH);
+        let out = dump(&ev);
+        assert!(
+            out.contains(&format!("reason:      {reason}")),
+            "reason line must survive intact: {out}"
+        );
     }
 }
