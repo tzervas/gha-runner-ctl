@@ -24,19 +24,40 @@ fn redacts_bearer() {
     assert!(!s.contains("ABCDEF"));
 }
 
+// --- issue #132 third follow-up audit: redact() now delegates to
+// dump_redact::redact_free_text instead of an independent, weaker 8-entry prefix
+// blocklist (see redact()'s doc comment in lib.rs for why: two redactors of
+// different strength in one codebase is exactly how the round-3 finding happened).
+// The tests below were pinned to that old blocklist's specific output format
+// ("ghp_***REDACTED***", no shape info, no minimum body length) and are updated here
+// to the new, stronger, shape-aware behavior — using realistic-length synthetic
+// tokens (36+ chars after the prefix, the real GitHub token shape) rather than the
+// old tests' short, unrealistic bodies, which is what the new shape check requires
+// to avoid false-positiving on ordinary identifiers that merely start with "ghp_".
+
 #[test]
-fn redacts_first_ghp_secret() {
-    // redact() currently replaces the first match per key prefix (not all occurrences).
-    let s = redact("Here is token1 ghp_ABCDEFGHIJKLMNOP and more text.");
-    assert!(!s.contains("ABCDEFGHIJKLMNOP"));
-    assert!(s.contains("ghp_***REDACTED***"));
+fn redacts_ghp_secret_with_shape_labeled_placeholder() {
+    let synthetic = format!("ghp_{}", "a1B2c3D4".repeat(5)); // 40 chars, realistic length
+    let s = redact(&format!("Here is token1 {synthetic} and more text."));
+    assert!(!s.contains(&synthetic), "credential leaked: {s}");
+    assert!(
+        s.contains("***REDACTED(github_token)***"),
+        "expected shape-labeled placeholder, got: {s}"
+    );
+    assert!(
+        s.contains("and more text."),
+        "diagnostic tail must survive: {s}"
+    );
 }
 
 #[test]
 fn redact_multi_byte_safe() {
-    let s = redact("Bearer ghp_ABC¢DEF");
-    // '¢' is multi-byte (2 bytes in UTF-8). It is not alphanumeric or [_-.],
-    // so redaction should stop right before it, and we must not slice in the middle of '¢'.
-    assert!(!s.contains("ABC"));
-    assert!(s.contains("¢DEF"));
+    // A multi-byte char ('¢', 2 bytes in UTF-8) sits directly adjacent to the
+    // credential with no delimiter at all — this must not panic (byte-boundary
+    // safety in the underlying scan) and the credential must still be redacted, with
+    // surrounding diagnostic text intact.
+    let synthetic = format!("ghp_{}", "a1B2c3D4".repeat(5));
+    let s = redact(&format!("token={synthetic}¢ trailing"));
+    assert!(!s.contains(&synthetic), "credential leaked: {s}");
+    assert!(s.contains("trailing"), "diagnostic tail must survive: {s}");
 }

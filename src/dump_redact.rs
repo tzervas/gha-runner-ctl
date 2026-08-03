@@ -1,25 +1,36 @@
-//! Allowlist-based redaction for developer debug dumps (issue #132).
+//! Redaction for developer debug dumps (issue #132) — both the allowlist-based
+//! named-value form and the free-text scanner, in one module with one strength.
 //!
-//! `lib::redact()` is a *blocklist* scrubber: it walks free-text (subprocess stderr,
-//! `podman ps` lines) looking for known bad prefixes (`ghp_`, `Bearer `, …) and cuts
-//! them out. That is the right tool for free text, where you cannot know ahead of time
-//! which substrings will appear — but it is the wrong tool for a structured dump of
-//! *named* values (env vars, resolved config), because a blocklist only knows what it
-//! has been taught to reject. It eventually misses one.
+//! This module answers two related but distinct questions:
 //!
-//! This module instead answers: "is this named value safe to print?" using an
-//! **allowlist of exact key names** (never a prefix — `GHA_*` would let
-//! `GHA_SECRET_TOKEN` straight through) *and* a check of the value's own shape,
-//! because a key being on the allowlist does not make an unexpected value safe.
-//! `GHA_APP_PRIVATE_KEY` is allowlisted because its documented, supported forms
-//! (`secret:group/key`, `file:/path`, a bare path) are safe to print — but if it ever
-//! holds inline PEM material (a caller/config bug, since the parser is supposed to
-//! reject that upstream), the value-shape check still catches and redacts it.
+//! 1. "Is this NAMED value ([`redact_for_dump`] / [`classify_value`]) safe to print?"
+//!    — using an **allowlist of exact key names** (never a prefix — `GHA_*` would let
+//!    `GHA_SECRET_TOKEN` straight through) *and* a check of the value's own shape,
+//!    because a key being on the allowlist does not make an unexpected value safe.
+//!    `GHA_APP_PRIVATE_KEY` is allowlisted because its documented, supported forms
+//!    (`secret:group/key`, `file:/path`, a bare path) are safe to print — but if it
+//!    ever holds inline PEM material (a caller/config bug, since the parser is
+//!    supposed to reject that upstream), the value-shape check still catches and
+//!    redacts it.
+//! 2. "Does this FREE-TEXT blob ([`redact_free_text`]) contain a credential
+//!    *anywhere* in it?" — subprocess stderr, `podman ps` lines, an error message —
+//!    where you cannot know ahead of time which substrings will appear, so scanning
+//!    for known credential *shapes* (not a fixed prefix list) is what's needed.
+//!
+//! `lib::redact()` used to be an independent, second implementation of (2): an
+//! 8-entry fixed-prefix blocklist with no minimum length or shape check on what
+//! followed each prefix. Having two redactors of different strength in one codebase
+//! is exactly how the issue #132 third follow-up audit's finding happened: one live
+//! path (`debug_dump_on_error`'s `err` field) had zero redaction of its own and
+//! depended entirely on its caller having pre-scrubbed it with the weaker one, which
+//! had no entry for the AWS-shaped secret the auditor used. `lib::redact()` is now a
+//! thin shim over [`redact_free_text`] (see its doc comment in `lib.rs`) — this is
+//! the ONE free-text redactor in the codebase.
 //!
 //! Every function here is pure (no I/O, no global state) so it is trivial to fuzz:
-//! feed arbitrary `(key, value)` pairs to [`redact_for_dump`] / [`classify_value`] and
-//! assert the invariant "no [`ValueVerdict::Safe`] output ever matches a known
-//! credential shape".
+//! feed arbitrary `(key, value)` pairs to [`redact_for_dump`] / [`classify_value`], or
+//! arbitrary strings to [`redact_free_text`], and assert the invariant "no output
+//! deemed safe ever matches a known credential shape".
 
 /// Env / config keys considered safe to print in a debug dump, **provided the value
 /// also passes [`classify_value`]**. Exact string match only (see module docs for why
@@ -67,6 +78,15 @@ pub enum UnsafeShape {
     BearerToken,
     BasicAuthUrl,
     SlackToken,
+    /// This project's own `RUNNER_TOKEN=<value>` marker in free text (subprocess
+    /// output, error strings). Folded in here — issue #132 third follow-up audit —
+    /// so it benefits from the same substring-anywhere / mid-sentence scanning as
+    /// every other shape, instead of living only in the old `lib::redact()`
+    /// blocklist, which is what let `debug_dump_on_error`'s `err` field print an
+    /// AWS-shaped secret byte-for-byte: two redactors of different strength, and the
+    /// weak one still wired into a live path. See module docs and `lib::redact`'s
+    /// doc comment.
+    RunnerTokenEnv,
     HighEntropy,
 }
 
@@ -81,6 +101,7 @@ impl UnsafeShape {
             UnsafeShape::BearerToken => "bearer_token",
             UnsafeShape::BasicAuthUrl => "basic_auth_url",
             UnsafeShape::SlackToken => "slack_token",
+            UnsafeShape::RunnerTokenEnv => "runner_token_env",
             UnsafeShape::HighEntropy => "high_entropy",
         }
     }
@@ -597,11 +618,12 @@ fn is_repo_ish_token(s: &str) -> bool {
 ///    meaningfully safer, and this mirrors [`classify_value`]'s existing PEM handling.
 /// 2. [`redact_prefixed_shapes`]: a substring-anywhere scan (not anchored to a token
 ///    boundary) for GitHub tokens / fine-grained PATs / AWS access key IDs / Slack
-///    tokens / `Bearer <token>`. Fixed vendor prefixes are essentially
-///    false-positive-free wherever they appear, so this catches a credential glued
-///    directly onto adjacent filler text with no delimiter at all
-///    (`cannotchdirtoAKIA...`) and one wrapped in shell quoting
-///    (`-H 'Bearer <tok>'`), neither of which a delimiter-tokenizing scan would see.
+///    tokens / `Bearer <token>` / this project's own `RUNNER_TOKEN=<value>` marker.
+///    Fixed vendor prefixes are essentially false-positive-free wherever they
+///    appear, so this catches a credential glued directly onto adjacent filler text
+///    with no delimiter at all (`cannotchdirtoAKIA...`) and one wrapped in shell
+///    quoting (`-H 'Bearer <tok>'`), neither of which a delimiter-tokenizing scan
+///    would see.
 /// 3. [`redact_remaining_word_shapes`]: a whitespace-tokenized scan of what's left, for
 ///    JWTs, basic-auth URLs, and a last-resort *sliding-window* entropy check per word
 ///    (see [`contains_high_entropy_window`] for why this — not a whole-word average —
@@ -710,7 +732,8 @@ fn redact_bearer(text: &str) -> String {
 }
 
 /// Stage 2 of [`redact_free_text`]: substring-anywhere scan for every named-prefix
-/// credential shape plus `Bearer`. See module docs.
+/// credential shape plus `Bearer` and this project's `RUNNER_TOKEN=` marker. See
+/// module docs.
 fn redact_prefixed_shapes(text: &str) -> String {
     let mut out = text.to_string();
     out = redact_by_marker(
@@ -736,6 +759,23 @@ fn redact_prefixed_shapes(text: &str) -> String {
         &["xoxb-", "xoxp-", "xoxa-", "xoxr-", "xoxs-"],
         |s| maximal_run_len(s, 20, 200, |c| c.is_ascii_alphanumeric() || c == '-'),
         UnsafeShape::SlackToken,
+    );
+    // This project's own env-var-style marker, folded into the general-purpose
+    // scanner rather than kept in a second, weaker, standalone blocklist (issue
+    // #132 third follow-up audit — see UnsafeShape::RunnerTokenEnv doc). No minimum
+    // length beyond "at least one char": unlike vendor token shapes, a runner token
+    // has no documented minimum length, and the marker literal itself is specific
+    // enough (an exact env-assignment spelling) that false positives on ordinary
+    // prose are not a realistic concern the way a short generic word would be.
+    out = redact_by_marker(
+        &out,
+        &["RUNNER_TOKEN="],
+        |s| {
+            maximal_run_len(s, 1, 200, |c| {
+                c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')
+            })
+        },
+        UnsafeShape::RunnerTokenEnv,
     );
     redact_bearer(&out)
 }
@@ -1450,5 +1490,35 @@ mod tests {
             "if this now fails, the vowel-density residual gap was closed — \
              update/remove this pinned gap test"
         );
+    }
+
+    // --- RUNNER_TOKEN= marker (issue #132 third follow-up audit) -------------------
+    //
+    // Folded in from the old lib::redact() blocklist, which had this project-specific
+    // marker but nothing else this module already covers (AWS keys, Slack tokens,
+    // JWTs, digit-free secrets, ...). Now redact_free_text is the ONE place that
+    // knows about it.
+
+    #[test]
+    fn runner_token_marker_is_redacted_even_when_short() {
+        // Deliberately short (16 chars) — shorter than the 20/36/82-char minimums
+        // the vendor-shaped patterns require, and shorter than the generic entropy
+        // fallback's MIN_LEN — so this only gets caught because RUNNER_TOKEN= is now
+        // its own named marker, not via any length-gated fallback.
+        let secret = "1234567890abcdef";
+        let reason = format!("RUNNER_TOKEN={secret}");
+        let out = redact_free_text(&reason);
+        assert!(!out.contains(secret), "runner token leaked: {out}");
+        assert!(out.contains("runner_token_env"), "got: {out}");
+    }
+
+    #[test]
+    fn runner_token_marker_mid_sentence_is_redacted_and_context_survives() {
+        let secret = "abcXYZ123secret";
+        let reason = format!("exec failed: env RUNNER_TOKEN={secret} rejected by registrar");
+        let out = redact_free_text(&reason);
+        assert!(!out.contains(secret), "runner token leaked: {out}");
+        assert!(out.contains("exec failed: env"));
+        assert!(out.contains("rejected by registrar"));
     }
 }
