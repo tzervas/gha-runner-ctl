@@ -12,7 +12,7 @@ The maintenance process ensures we never intentionally regress functionality, AP
 
 ### 1.1 Execution Performance & Resource Allocation
 - **Zero-Copy Token Redaction**: The credential `redact` utility computes byte offsets cleanly via `char_indices` to prevent multi-byte UTF-8 slicing panics. It runs in a single left-to-right pass, jumping over secret byte ranges without copying or allocating them, minimizing heap modifications. It utilizes an ASCII fast-path to bypass iterator construction for safe strings, reducing execution latency.
-- **Micro-Optimized Character Safety Checks**: The safety checkers `is_safe_image` and `is_safe_labels` are highly optimized to minimize allocations and redundant iterations.
+- **Micro-Optimized Character Safety Checks**: Core safety checkers (such as `is_safe_image`, `is_safe_ident`, `is_safe_runner_user`, and `is_safe_runner_version`) are highly optimized to check ASCII bytes directly via `.bytes().all(...)` iterator operations. This completely bypasses UTF-8 character decoding overhead and minimizes allocations and redundant iterations.
   - `is_safe_image` performs a single pass verifying that every character matches allowed registry symbols to reject whitespace and shell metacharacters.
   - `is_safe_labels` splits and validates labels inline without heap-allocating intermediate vectors.
 - **Cargo Job & Parallelism Scaling**: Sizing configurations dynamically limit parallelism via `CARGO_BUILD_JOBS` aligned with container CPU quotas, mitigating heavy crate OOM (exit code 137) failures on multi-core hosts.
