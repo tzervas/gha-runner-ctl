@@ -306,7 +306,11 @@ pub struct Cli {
     /// leave it polling every owned repo, exhausting its API budget mid-scan and reporting zero
     /// demand — a failure this fleet has already seen. If `GHA_ALLOWLIST_REPOS_FILE` is also set,
     /// the new name wins and this one is ignored with a warning.
-    #[arg(long = "prefer-repos-file", env = "GHA_PREFER_REPOS_FILE", global = true)]
+    #[arg(
+        long = "prefer-repos-file",
+        env = "GHA_PREFER_REPOS_FILE",
+        global = true
+    )]
     prefer_repos_file: Option<String>,
 
     /// Comma-separated `owner/repo` polled **every tick before** round-robin allowlist.
