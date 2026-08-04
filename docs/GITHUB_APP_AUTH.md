@@ -259,7 +259,7 @@ Choose repository access:
 - **All repositories** — simplest; matches `--scope user` batch polling of "whichever
   owned repo has demand," and needs no maintenance when repos are added.
 - **Only select repositories** — if you want to scope tightly, the selected list **must**
-  cover everything in `GHA_PRIORITY_REPOS` / `GHA_PREFER_REPOS_FILE` / `GHA_ALLOWLIST_REPOS`,
+  cover everything in `GHA_PRIORITY_REPOS` / `GHA_ALLOWLIST_REPOS_FILE` / `GHA_ALLOWLIST_REPOS`,
   or those repos will silently stop being pollable (a 404/403 from the App's own installation
   scope, not a rate-limit issue — `doctor`/the demand-poll error text now say so explicitly,
   don't confuse the two failure modes).

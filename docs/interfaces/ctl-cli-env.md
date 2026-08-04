@@ -121,7 +121,8 @@ All global options accept the same name as env var (clap `env =`); boolean env v
 | `--private-only` | `GHA_PRIVATE_ONLY` | bool | false | Org/user demand visibility |
 | `--all-repos` | `GHA_ALL_REPOS` | bool | false | Public+private for demand |
 | `--prefer-repos` | `GHA_PREFER_REPOS` | CSV `owner/repo` | — | User-batch allowlist; warm repo list |
-| `--prefer-repos-file` | `GHA_PREFER_REPOS_FILE` | path | — | Prefer allowlist file (lines and/or CSV); merged with `--prefer-repos` |
+| `--allowlist-repos-file` | `GHA_ALLOWLIST_REPOS_FILE` | path | — | Allowlist file (lines and/or CSV); merged with `--allowlist-repos`. **Preferred name** |
+| `--prefer-repos-file` | `GHA_PREFER_REPOS_FILE` | path | — | **DEPRECATED** alias of `--allowlist-repos-file`. Still honored; ignored (with a warning) when the new name is also set |
 | `--priority-repos` | `GHA_PRIORITY_REPOS` | CSV `owner/repo` | — | Polled **every tick before** RR (hot queues) |
 | `--listen-min-interval` | `GHA_LISTEN_MIN_INTERVAL` | u64 | `45` | Floor for `scope=user` listen poll interval |
 | `--pool-scan-per-tick` | `GHA_POOL_SCAN_PER_TICK` | u32 | `12` | Max non-priority repos scanned per tick in dynamic pool |

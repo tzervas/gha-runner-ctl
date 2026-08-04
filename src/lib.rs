@@ -40,6 +40,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -271,7 +272,7 @@ pub struct Cli {
     /// DEPRECATED (WP-09): this is a flat allowlist, not a preference ordering — the honest
     /// name is `GHA_ALLOWLIST_REPOS`. `GHA_PREFER_REPOS` still works during the deprecation
     /// window (a warning is printed) but is ignored if `GHA_ALLOWLIST_REPOS` is also set.
-    /// See `Cli::effective_prefer_repos`.
+    /// See `Cli::effective_allowlist_repos`.
     #[arg(long, env = "GHA_PREFER_REPOS", global = true)]
     prefer_repos: Option<String>,
 
@@ -281,11 +282,31 @@ pub struct Cli {
     #[arg(long = "allowlist-repos", env = "GHA_ALLOWLIST_REPOS", global = true)]
     allowlist_repos: Option<String>,
 
-    /// Path to prefer-repos file (one `owner/repo` per line and/or CSV). Merged with
+    /// Path to the allowlist file (one `owner/repo` per line and/or CSV). Merged with
     /// GHA_ALLOWLIST_REPOS / GHA_PREFER_REPOS (inline CSV wins over the file — see
-    /// `prefer_repos_list`; a fully-inline allowlist has silently shadowed this file before).
-    /// Survives large allowlists without overflowing env. Example: `$XDG_DATA_HOME/.../prefer.list`
-    #[arg(long, env = "GHA_PREFER_REPOS_FILE", global = true)]
+    /// `allowlist_repos_list`; a fully-inline allowlist has silently shadowed this file before).
+    /// Survives large allowlists without overflowing env.
+    /// Example: `$XDG_DATA_HOME/gha-runner-ctl/allowlists/active-demand.list`
+    ///
+    /// Preferred name — supersedes the deprecated `GHA_PREFER_REPOS_FILE`.
+    #[arg(
+        long = "allowlist-repos-file",
+        env = "GHA_ALLOWLIST_REPOS_FILE",
+        global = true
+    )]
+    allowlist_repos_file: Option<String>,
+
+    /// DEPRECATED (WP-09): same meaning as `--allowlist-repos-file`. This file has always been
+    /// an allowlist, never a preference ordering — the old name conflated it with
+    /// `GHA_PRIORITY_REPOS`, which genuinely IS an ordering and is a separate feature.
+    ///
+    /// Still honored, because fleets pin this in instance env files and cannot all move on the
+    /// same day. A production host currently sets
+    /// `GHA_PREFER_REPOS_FILE=.../allowlists/active-demand.list`; silently dropping support would
+    /// leave it polling every owned repo, exhausting its API budget mid-scan and reporting zero
+    /// demand — a failure this fleet has already seen. If `GHA_ALLOWLIST_REPOS_FILE` is also set,
+    /// the new name wins and this one is ignored with a warning.
+    #[arg(long = "prefer-repos-file", env = "GHA_PREFER_REPOS_FILE", global = true)]
     prefer_repos_file: Option<String>,
 
     /// Comma-separated `owner/repo` polled **every tick before** round-robin allowlist.
@@ -420,25 +441,47 @@ impl Cli {
     /// warning goes to stderr; the value is still honored — this is a warning window, not a
     /// breaking change. Do not delete `prefer_repos` parsing without a real deprecation period;
     /// fleets pin config and won't all move on the same day.
-    fn effective_prefer_repos(&self) -> Option<String> {
-        let v = self.effective_prefer_repos_quiet()?;
+    fn effective_allowlist_repos(&self) -> Option<String> {
+        let v = self.effective_allowlist_repos_quiet()?;
         if self.allowlist_repos.is_none() {
-            eprintln!(
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            warn_deprecated_once(
+                &WARNED,
                 "listen: warning: GHA_PREFER_REPOS is deprecated, rename to GHA_ALLOWLIST_REPOS \
                  (identical flat-allowlist behavior; GHA_PREFER_REPOS support will be removed in \
-                 a future release)"
+                 a future release)",
             );
         }
         Some(v)
     }
 
-    /// Same resolution as `effective_prefer_repos` but silent — for presence/shape checks
+    /// Same resolution as `effective_allowlist_repos` but silent — for presence/shape checks
     /// (e.g. `validate_cli`) that shouldn't print the deprecation warning a second time.
-    fn effective_prefer_repos_quiet(&self) -> Option<String> {
+    fn effective_allowlist_repos_quiet(&self) -> Option<String> {
         self.allowlist_repos
             .as_ref()
             .or(self.prefer_repos.as_ref())
             .cloned()
+    }
+
+    /// Resolves the allowlist FILE path, preferring `GHA_ALLOWLIST_REPOS_FILE` over the
+    /// deprecated `GHA_PREFER_REPOS_FILE`. Same precedence and same warning discipline as
+    /// the inline pair above: new name wins, old name still works, and when only the old
+    /// name is set the operator is told once.
+    fn effective_allowlist_repos_file(&self) -> Option<&String> {
+        if self.allowlist_repos_file.is_some() {
+            return self.allowlist_repos_file.as_ref();
+        }
+        if self.prefer_repos_file.is_some() {
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            warn_deprecated_once(
+                &WARNED,
+                "listen: warning: GHA_PREFER_REPOS_FILE is deprecated, rename to \
+                 GHA_ALLOWLIST_REPOS_FILE (identical allowlist-file behavior; the old name will \
+                 be removed in a future release)",
+            );
+        }
+        self.prefer_repos_file.as_ref()
     }
 
     /// Build a GitHub App auth config from the already-clap-resolved `--app-*` fields
@@ -1451,7 +1494,7 @@ fn validate_cli(cli: &Cli) -> Result<(), String> {
             if cli.repo.is_none() {
                 // `warm` uses the allowlist only (no single --repo).
                 if cli
-                    .effective_prefer_repos_quiet()
+                    .effective_allowlist_repos_quiet()
                     .is_some_and(|p| !p.trim().is_empty())
                 {
                     // ok
@@ -1486,7 +1529,7 @@ fn validate_cli(cli: &Cli) -> Result<(), String> {
             // or explicit --repo). Multi-repo user-batch still needs ephemeral re-target.
             if matches!(cli.mode, Mode::Retain) {
                 let multi = cli
-                    .effective_prefer_repos_quiet()
+                    .effective_allowlist_repos_quiet()
                     .map(|p| p.split(',').filter(|x| !x.trim().is_empty()).count() > 1)
                     .unwrap_or(true);
                 if multi && cli.repo.is_none() {
@@ -2856,7 +2899,7 @@ fn update_host_packages() -> Result<(), String> {
 /// Paced batch warm: one retain runner per allowlisted repo (or single --repo).
 /// After this, GitHub pushes jobs to online runners — no demand registration storm.
 fn warm(cli: &Cli, gap_secs: u64, start: bool) -> Result<(), String> {
-    let repos: Vec<String> = if let Some(pref) = cli.effective_prefer_repos() {
+    let repos: Vec<String> = if let Some(pref) = cli.effective_allowlist_repos() {
         pref.split(',')
             .map(|x| x.trim().to_string())
             .filter(|x| !x.is_empty())
@@ -3805,10 +3848,23 @@ fn parse_repo_csv(s: &str) -> Vec<String> {
     out
 }
 
-/// Prefer list: file (if set) then env CSV. Deduped, order preserved.
-fn prefer_repos_list(cli: &Cli) -> Vec<String> {
+/// Print a deprecation warning at most once per process.
+///
+/// The previous behaviour printed on EVERY resolve, and since the allowlist is resolved once
+/// per poll tick that meant the identical line every interval for as long as the manager ran
+/// — observed in a live fleet journal repeating every 3 minutes for hours. A warning that
+/// appears thousands of times trains operators to filter it out, which is strictly worse than
+/// warning once and being read.
+fn warn_deprecated_once(slot: &'static AtomicBool, msg: &str) {
+    if !slot.swap(true, AtomicOrdering::Relaxed) {
+        eprintln!("{msg}");
+    }
+}
+
+/// Allowlist: file (if set) then env CSV. Deduped, order preserved.
+fn allowlist_repos_list(cli: &Cli) -> Vec<String> {
     let mut out = Vec::new();
-    if let Some(path) = cli.prefer_repos_file.as_ref() {
+    if let Some(path) = cli.effective_allowlist_repos_file() {
         match fs::read_to_string(path) {
             Ok(s) => {
                 for p in parse_repo_csv(&s) {
@@ -3817,11 +3873,11 @@ fn prefer_repos_list(cli: &Cli) -> Vec<String> {
                     }
                 }
             }
-            Err(e) => eprintln!("listen: prefer-repos-file {path}: {e}"),
+            Err(e) => eprintln!("listen: allowlist-repos-file {path}: {e}"),
         }
     }
-    if let Some(pref) = cli.effective_prefer_repos() {
-        for p in parse_repo_csv(&pref) {
+    if let Some(allow) = cli.effective_allowlist_repos() {
+        for p in parse_repo_csv(&allow) {
             if !out.contains(&p) {
                 out.push(p);
             }
@@ -4161,7 +4217,7 @@ fn demand(cli: &Cli, api: &str, pacer: &mut ApiPacer) -> Result<(bool, Option<St
                 let repo = repo.clone();
                 return Ok((repo_needs_runner(cli, &repo, api, pacer)?, Some(repo)));
             }
-            let repos = prefer_repos_list(cli);
+            let repos = allowlist_repos_list(cli);
             if !repos.is_empty() {
                 return poll_allowlist_repos(cli, api, pacer, &repos);
             }
@@ -4199,7 +4255,7 @@ fn demand(cli: &Cli, api: &str, pacer: &mut ApiPacer) -> Result<(bool, Option<St
         Scope::User => {
             let user = cli.user.as_ref().expect("validated");
             // Allowlist mode: when prefer list is set, ONLY poll those repos.
-            let pref = prefer_repos_list(cli);
+            let pref = allowlist_repos_list(cli);
             if !pref.is_empty() {
                 let prefix = format!("{user}/");
                 let repos: Vec<String> = pref
@@ -4440,7 +4496,7 @@ fn list_demand_jobs(
     max_jobs: usize,
 ) -> Result<Vec<DemandJob>, String> {
     let mut out = Vec::new();
-    let mut repos = prefer_repos_list(cli);
+    let mut repos = allowlist_repos_list(cli);
     if repos.is_empty() {
         if let Some(r) = cli.repo.as_ref() {
             repos = vec![r.clone()];
@@ -5077,7 +5133,7 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
 
     let pool = ResourcePool::from_env();
     let dynamic = pool_mode_on(cli);
-    let prefer_n = prefer_repos_list(cli).len();
+    let prefer_n = allowlist_repos_list(cli).len();
     let prio_n = priority_repos_list(cli).len();
     let tick_path = tick_log_path(cli);
     eprintln!(
@@ -5554,6 +5610,7 @@ impl Cli {
             demand_require_labels: self.demand_require_labels.clone(),
             demand_exclude_labels: self.demand_exclude_labels.clone(),
             prefer_repos: self.prefer_repos.clone(),
+            allowlist_repos_file: self.allowlist_repos_file.clone(),
             allowlist_repos: self.allowlist_repos.clone(),
             prefer_repos_file: self.prefer_repos_file.clone(),
             priority_repos: self.priority_repos.clone(),
@@ -5617,6 +5674,7 @@ struct CliSnap {
     prefer_repos: Option<String>,
     allowlist_repos: Option<String>,
     prefer_repos_file: Option<String>,
+    allowlist_repos_file: Option<String>,
     priority_repos: Option<String>,
     listen_min_interval: u64,
     pool_scan_per_tick: u32,
@@ -5674,6 +5732,7 @@ fn cli_snapshot(cli: &Cli) -> CliSnap {
         demand_require_labels: cli.demand_require_labels.clone(),
         demand_exclude_labels: cli.demand_exclude_labels.clone(),
         prefer_repos: cli.prefer_repos.clone(),
+        allowlist_repos_file: cli.allowlist_repos_file.clone(),
         allowlist_repos: cli.allowlist_repos.clone(),
         prefer_repos_file: cli.prefer_repos_file.clone(),
         priority_repos: cli.priority_repos.clone(),
@@ -5735,6 +5794,7 @@ fn snap_to_cli(s: &CliSnap) -> Cli {
         demand_require_labels: s.demand_require_labels.clone(),
         demand_exclude_labels: s.demand_exclude_labels.clone(),
         prefer_repos: s.prefer_repos.clone(),
+        allowlist_repos_file: s.allowlist_repos_file.clone(),
         allowlist_repos: s.allowlist_repos.clone(),
         prefer_repos_file: s.prefer_repos_file.clone(),
         priority_repos: s.priority_repos.clone(),
@@ -5969,10 +6029,101 @@ mod robust_queue_tests {
         ])
         .unwrap();
         assert_eq!(
-            cli.effective_prefer_repos_quiet().as_deref(),
+            cli.effective_allowlist_repos_quiet().as_deref(),
             Some("owner/a,owner/b"),
             "GHA_ALLOWLIST_REPOS must win when both names are set"
         );
+    }
+
+    #[test]
+    fn allowlist_repos_file_supersedes_deprecated_prefer_repos_file() {
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from([
+            "gha-runner-ctl",
+            "--allowlist-repos-file",
+            "/etc/new.list",
+            "--prefer-repos-file",
+            "/etc/old.list",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.effective_allowlist_repos_file().map(String::as_str),
+            Some("/etc/new.list"),
+            "GHA_ALLOWLIST_REPOS_FILE must win when both file names are set"
+        );
+    }
+
+    /// The regression that actually matters. A live fleet host pins the OLD name:
+    ///   GHA_PREFER_REPOS_FILE=.../allowlists/active-demand.list
+    /// If this resolution ever returns None, that host silently loses its allowlist and
+    /// starts polling every owned repo, exhausting its API budget mid-scan and reporting
+    /// "no demand" — which is exactly the outage this rename must not cause.
+    #[test]
+    fn deprecated_prefer_repos_file_alone_is_still_honored() {
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from([
+            "gha-runner-ctl",
+            "--prefer-repos-file",
+            "/home/gha-agent/.local/share/gha-runner-ctl/allowlists/active-demand.list",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.effective_allowlist_repos_file().map(String::as_str),
+            Some("/home/gha-agent/.local/share/gha-runner-ctl/allowlists/active-demand.list"),
+            "the deprecated file name must keep working for pinned fleet configs"
+        );
+    }
+
+    #[test]
+    fn no_allowlist_file_set_resolves_to_none() {
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from(["gha-runner-ctl"]).unwrap();
+        assert_eq!(cli.effective_allowlist_repos_file(), None);
+    }
+
+    /// The allowlist rename must not have touched the PRIORITY feature, which is a genuinely
+    /// different thing: priority repos are scanned every tick in fixed order BEFORE the
+    /// round-robin over the allowlist. Conflating them is the bug this work exists to fix,
+    /// so pin that they stay independent.
+    #[test]
+    fn priority_repos_are_independent_of_the_allowlist() {
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from([
+            "gha-runner-ctl",
+            "--allowlist-repos",
+            "owner/a,owner/b",
+            "--priority-repos",
+            "owner/hot",
+        ])
+        .unwrap();
+        assert_eq!(
+            priority_repos_list(&cli),
+            vec!["owner/hot".to_string()],
+            "priority list must come only from --priority-repos"
+        );
+        assert_eq!(
+            cli.effective_allowlist_repos_quiet().as_deref(),
+            Some("owner/a,owner/b"),
+            "the allowlist must not absorb priority entries"
+        );
+    }
+
+    /// A deprecation warning that fires every poll tick trains operators to ignore it. This
+    /// pins the once-per-process contract at the helper level (the statics themselves are
+    /// per-call-site, so this asserts the mechanism, not each caller).
+    #[test]
+    fn warn_deprecated_once_fires_a_single_time() {
+        static SLOT: AtomicBool = AtomicBool::new(false);
+        assert!(!SLOT.load(AtomicOrdering::Relaxed));
+        warn_deprecated_once(&SLOT, "first");
+        assert!(
+            SLOT.load(AtomicOrdering::Relaxed),
+            "the slot must latch after the first warning"
+        );
+        // Second call must be a no-op; if the latch did not hold, the slot would still be
+        // observable as false here on a fresh swap.
+        warn_deprecated_once(&SLOT, "second");
+        assert!(SLOT.load(AtomicOrdering::Relaxed));
     }
 
     #[test]
@@ -5980,7 +6131,7 @@ mod robust_queue_tests {
         use clap::Parser as _;
         let cli = Cli::try_parse_from(["gha-runner-ctl", "--prefer-repos", "owner/old"]).unwrap();
         assert_eq!(
-            cli.effective_prefer_repos_quiet().as_deref(),
+            cli.effective_allowlist_repos_quiet().as_deref(),
             Some("owner/old"),
             "the deprecated name must still work during the deprecation window"
         );
@@ -5990,7 +6141,7 @@ mod robust_queue_tests {
     fn neither_allowlist_name_set_resolves_to_none() {
         use clap::Parser as _;
         let cli = Cli::try_parse_from(["gha-runner-ctl"]).unwrap();
-        assert_eq!(cli.effective_prefer_repos_quiet(), None);
+        assert_eq!(cli.effective_allowlist_repos_quiet(), None);
     }
 
     #[test]

@@ -43,7 +43,10 @@ Set hot queues so they are polled **every tick** (never wait full RR):
 ```bash
 # Example: showcase + ctl + myc umbrellas
 export GHA_PRIORITY_REPOS=tzervas/gha-runner-ctl,tzervas/mycelium-lang,tzervas/mycelium-lang-myc,tzervas/tg-agent-relay,tzervas/peft-rs,tzervas/tero-mcp,tzervas/memory-gate-rs,tzervas/cabal-devmelopner,tzervas/agent-harness
-export GHA_PREFER_REPOS_FILE=$HOME/.local/share/gha-runner-ctl/allowlists/all-active-mycelium-first.list
+# GHA_ALLOWLIST_REPOS_FILE is the current name. The older GHA_PREFER_REPOS_FILE means
+# exactly the same thing and is still honored (it warns once per process), so a host
+# already pinning the old name keeps working — do not "fix" a running fleet by deleting it.
+export GHA_ALLOWLIST_REPOS_FILE=$HOME/.local/share/gha-runner-ctl/allowlists/all-active-mycelium-first.list
 export GHA_POOL_SCAN_PER_TICK=16
 export GHA_REAP_STALE_SECS=3600
 export GHA_TICK_LOG=auto
