@@ -1225,8 +1225,8 @@ pub fn is_safe_ident(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 128
         && !s.contains("..")
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
 pub fn is_safe_repo(s: &str) -> bool {
@@ -1262,8 +1262,8 @@ pub fn is_safe_image(s: &str) -> bool {
     }) {
         return false;
     }
-    s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | '@'))
+    s.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'/' | b':' | b'@'))
 }
 
 /// Stock packaging default tag (only used by `ImageMode::Auto` convenience).
@@ -1280,19 +1280,19 @@ pub fn is_safe_runner_user(s: &str) -> bool {
         return false;
     }
     // name, uid, name:group, uid:gid
-    s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+    s.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
 }
 
 pub fn is_safe_sha256_hex(s: &str) -> bool {
-    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 pub fn is_safe_runner_version(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 32
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
 }
 
 pub fn is_safe_url(s: &str) -> bool {
@@ -1306,6 +1306,166 @@ pub fn is_safe_url(s: &str) -> bool {
                     '-' | '_' | '.' | '/' | ':' | '?' | '=' | '&' | '%' | '+' | '~'
                 )
         })
+}
+
+#[cfg(test)]
+mod is_safe_byte_scan_tests {
+    //! Dedicated coverage for `is_safe_ident`, `is_safe_image`, `is_safe_runner_user`,
+    //! `is_safe_sha256_hex`, and `is_safe_runner_version` after their char-scan ->
+    //! byte-scan rewrite. The whole point of scanning `.bytes()` instead of `.chars()`
+    //! is to skip UTF-8 decoding, so multibyte/non-ASCII input is exactly where a
+    //! byte-scan could diverge from a char-scan if the predicate ever matched a
+    //! continuation byte by accident. Every ASCII-alphanumeric byte and every allowed
+    //! punctuation byte in these validators is < 0x80, and every byte of a multibyte
+    //! UTF-8 sequence (leading or continuation) is >= 0x80, so a correct byte-scan must
+    //! reject such input exactly where the char-scan would have — these tests pin that.
+
+    use super::*;
+
+    // --- is_safe_ident -------------------------------------------------------
+
+    #[test]
+    fn is_safe_ident_accepts_plain_ascii() {
+        assert!(is_safe_ident("runner-01"));
+        assert!(is_safe_ident("a"));
+        assert!(is_safe_ident("A_b.C-9"));
+    }
+
+    #[test]
+    fn is_safe_ident_rejects_empty_and_traversal() {
+        assert!(!is_safe_ident(""));
+        assert!(!is_safe_ident(".."));
+        assert!(!is_safe_ident("foo..bar"));
+    }
+
+    #[test]
+    fn is_safe_ident_rejects_over_length() {
+        let too_long = "a".repeat(129);
+        assert!(!is_safe_ident(&too_long));
+        let exactly_max = "a".repeat(128);
+        assert!(is_safe_ident(&exactly_max));
+    }
+
+    #[test]
+    fn is_safe_ident_rejects_non_ascii_multibyte() {
+        // 2-byte (é), 3-byte (漢), and 4-byte (🚀) UTF-8 sequences.
+        assert!(!is_safe_ident("café"));
+        assert!(!is_safe_ident("漢字"));
+        assert!(!is_safe_ident("runner🚀"));
+        // A lone multibyte char is neither ascii-alphanumeric nor '-'/'_'/'.'.
+        assert!(!is_safe_ident("é"));
+    }
+
+    #[test]
+    fn is_safe_ident_rejects_shell_metacharacters() {
+        assert!(!is_safe_ident("foo;bar"));
+        assert!(!is_safe_ident("foo bar"));
+        assert!(!is_safe_ident("foo/bar"));
+    }
+
+    // --- is_safe_image ---------------------------------------------------------
+
+    #[test]
+    fn is_safe_image_accepts_oci_refs() {
+        assert!(is_safe_image("ghcr.io/org/ci-tools:1.2.3"));
+        assert!(is_safe_image("docker.io/library/ubuntu:24.04"));
+    }
+
+    #[test]
+    fn is_safe_image_rejects_non_ascii_multibyte() {
+        assert!(!is_safe_image("ghcr.io/org/café:latest"));
+        assert!(!is_safe_image("registry.example.com/图片:v1"));
+        assert!(!is_safe_image("img🚀:latest"));
+    }
+
+    #[test]
+    fn is_safe_image_rejects_traversal_and_shell_metacharacters() {
+        assert!(!is_safe_image("../evil"));
+        assert!(!is_safe_image("img;rm -rf /"));
+        assert!(!is_safe_image("img$(reboot)"));
+        assert!(!is_safe_image("img with space"));
+    }
+
+    #[test]
+    fn is_safe_image_rejects_over_length_and_empty() {
+        assert!(!is_safe_image(""));
+        let too_long = "a".repeat(385);
+        assert!(!is_safe_image(&too_long));
+    }
+
+    // --- is_safe_runner_user ----------------------------------------------------
+
+    #[test]
+    fn is_safe_runner_user_accepts_name_and_uid_forms() {
+        assert!(is_safe_runner_user("runner"));
+        assert!(is_safe_runner_user("1001:1001"));
+        assert!(is_safe_runner_user("0:0"));
+    }
+
+    #[test]
+    fn is_safe_runner_user_rejects_non_ascii_multibyte() {
+        assert!(!is_safe_runner_user("rünner"));
+        assert!(!is_safe_runner_user("実行者"));
+    }
+
+    #[test]
+    fn is_safe_runner_user_rejects_empty_and_over_length() {
+        assert!(!is_safe_runner_user(""));
+        let too_long = "a".repeat(65);
+        assert!(!is_safe_runner_user(&too_long));
+    }
+
+    #[test]
+    fn is_safe_runner_user_rejects_shell_metacharacters() {
+        assert!(!is_safe_runner_user("1001;root"));
+    }
+
+    // --- is_safe_sha256_hex ------------------------------------------------------
+
+    #[test]
+    fn is_safe_sha256_hex_accepts_valid_digest() {
+        assert!(is_safe_sha256_hex(
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        ));
+    }
+
+    #[test]
+    fn is_safe_sha256_hex_rejects_wrong_length() {
+        assert!(!is_safe_sha256_hex("abcd"));
+        assert!(!is_safe_sha256_hex(""));
+    }
+
+    #[test]
+    fn is_safe_sha256_hex_rejects_non_ascii_multibyte_same_byte_length() {
+        // A string can be crafted so `.len()` (byte length) is 64 while it is not
+        // 64 hex characters — this is exactly the case a byte-scan must still catch.
+        // 62 ASCII hex chars + 1 two-byte UTF-8 char = 64 bytes, 63 "chars".
+        let hex62 = "a".repeat(62);
+        let crafted = format!("{hex62}é");
+        assert_eq!(crafted.len(), 64, "fixture must be exactly 64 bytes");
+        assert!(!is_safe_sha256_hex(&crafted));
+    }
+
+    // --- is_safe_runner_version ---------------------------------------------------
+
+    #[test]
+    fn is_safe_runner_version_accepts_semver_like() {
+        assert!(is_safe_runner_version("2.335.1"));
+        assert!(is_safe_runner_version("v1.0.0-rc1"));
+    }
+
+    #[test]
+    fn is_safe_runner_version_rejects_non_ascii_multibyte() {
+        assert!(!is_safe_runner_version("2.335.1é"));
+        assert!(!is_safe_runner_version("版本1.0"));
+    }
+
+    #[test]
+    fn is_safe_runner_version_rejects_empty_and_over_length() {
+        assert!(!is_safe_runner_version(""));
+        let too_long = "1".repeat(33);
+        assert!(!is_safe_runner_version(&too_long));
+    }
 }
 
 /// Resolve auto → build|external without locking users to a single image name.
