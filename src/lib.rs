@@ -2773,6 +2773,29 @@ fn volume_exists(name: &str) -> bool {
     podman_ok(&["volume", "exists", name])
 }
 
+/// A worker volume that *exists* is not necessarily *seeded*.
+///
+/// An empty volume left behind by a failed spawn (or created by an older build)
+/// satisfies [`volume_exists`] forever, so a bare existence check makes
+/// [`ensure_worker_volume`] return early and never populate it. The worker then
+/// starts against an empty `/opt/actions-runner`, and `entrypoint.sh` exits 1 with
+/// "runner binaries missing" on every single spawn — permanently, with no self-heal.
+/// Observed on the WSL GPU host: `gha-runner-gpu-{a,b}-w0-data` both existed with
+/// zero files while the base volumes held the full 16-entry runner payload.
+///
+/// Probe for the actual payload instead. `run.sh` is the exact marker
+/// `entrypoint.sh` gates on, so this asks the same question the consumer asks.
+fn volume_is_seeded(name: &str) -> bool {
+    let Ok(out) = podman(&["volume", "inspect", name, "--format", "{{.Mountpoint}}"]) else {
+        return false;
+    };
+    let mount = out.trim();
+    if mount.is_empty() {
+        return false;
+    }
+    std::path::Path::new(mount).join("run.sh").exists()
+}
+
 fn resolve_build_dir(cli: &Cli) -> Result<PathBuf, String> {
     if let Some(p) = &cli.build_dir {
         let p = p.canonicalize().map_err(|e| format!("build-dir: {e}"))?;
@@ -4588,7 +4611,8 @@ fn pool_mode_on(cli: &Cli) -> bool {
 }
 
 fn ensure_worker_volume(cli: &Cli, worker_volume: &str) -> Result<(), String> {
-    if volume_exists(worker_volume) {
+    let already_present = volume_exists(worker_volume);
+    if already_present && volume_is_seeded(worker_volume) {
         return Ok(());
     }
     let base_volume = cli.volume.as_str();
@@ -4608,7 +4632,9 @@ fn ensure_worker_volume(cli: &Cli, worker_volume: &str) -> Result<(), String> {
         r#"set -euo pipefail; cp -a /from/. /to/; chown -R {chown} /to 2>/dev/null || true; rm -f /to/.runner /to/.credentials /to/.credentials_rsaparams 2>/dev/null; true"#
     );
     eprintln!("pool: seeding worker volume {worker_volume} from {base_volume} via {copy_image}");
-    podman(&["volume", "create", worker_volume])?;
+    if !already_present {
+        podman(&["volume", "create", worker_volume])?;
+    }
     podman(&[
         "run",
         "--rm",
