@@ -145,7 +145,27 @@ See [SECURITY](SECURITY.md).
 Personal accounts cannot register one user-wide runner for all repos.
 
 * **Preferred:** `warm` fleet — one retain work endpoint per allowlisted repo; agent stays one process (or one agent unit) managing many containers.
-* **Legacy / ad-hoc:** `scope=user` listen re-targets registration (ephemeral) when demand moves — higher registration cost; always set `GHA_PREFER_REPOS`.
+* **Legacy / ad-hoc:** `scope=user` listen re-targets registration (ephemeral) when demand moves — higher registration cost; always set `GHA_ALLOWLIST_REPOS`.
+
+### Allowlist vs priority — two different things with one confusing old name
+
+These are distinct mechanisms and conflating them has cost real debugging time:
+
+| | what it does | knob |
+|---|---|---|
+| **allowlist** | When set, **only** these repos are polled for demand. A flat set, no ordering. Exists so a poll does not burn the GitHub API budget across hundreds of owned repos. | `GHA_ALLOWLIST_REPOS` (CSV) and `GHA_ALLOWLIST_REPOS_FILE` (durable file) |
+| **priority** | Repos polled **every tick, in fixed order, before** the round-robin over the allowlist. For hot queues, so they never wait a full RR cycle. | `GHA_PRIORITY_REPOS` |
+
+The old names `GHA_PREFER_REPOS` / `GHA_PREFER_REPOS_FILE` read as *priority ordering* but
+have always meant *allowlist*. Both still work and are honored; each warns **once per
+process** (not per tick — the old code re-warned on every poll, which on a live fleet meant
+the same line every interval for hours). When a new and an old name are both set, the new
+name wins and the ignored one is named in the warning.
+
+An empty allowlist is not "poll nothing" — it means no filter, so every owned repo is in
+scope. That is the failure mode to watch for: a host whose allowlist silently went missing
+scans everything, exhausts its per-poll API budget mid-scan, and reports `no demand` while
+queued jobs sit untouched.
 
 ---
 

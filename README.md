@@ -248,7 +248,7 @@ Large prefer-lists + ephemeral multi-job CI can starve hot repos under pure roun
 
 | Knob | Env | Purpose |
 |------|-----|---------|
-| `--prefer-repos-file` | `GHA_PREFER_REPOS_FILE` | Durable allowlist file (one `owner/repo` per line) |
+| `--allowlist-repos-file` | `GHA_ALLOWLIST_REPOS_FILE` | Durable allowlist file (one `owner/repo` per line). Supersedes the deprecated `--prefer-repos-file` / `GHA_PREFER_REPOS_FILE`, which still works but warns |
 | `--priority-repos` | `GHA_PRIORITY_REPOS` | Polled **every tick** before RR (umbrellas / hot queues) |
 | `--pool-scan-per-tick` | `GHA_POOL_SCAN_PER_TICK` | Non-priority scan width (default 12) |
 | `--listen-min-interval` | `GHA_LISTEN_MIN_INTERVAL` | User-batch poll floor (default 45s) |
