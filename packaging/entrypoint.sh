@@ -6,6 +6,19 @@ set -euo pipefail
 SEED="${RUNNER_SEED:-/opt/actions-runner-seed}"
 HOME_DIR="${RUNNER_HOME:-/opt/actions-runner}"
 
+# WSL2 GPU: the host toolchain is bind-mounted at /usr/lib/wsl (see the --gpus/
+# /dev/dxg block in `up`), but that directory is NOT on PATH, so `command -v
+# nvidia-smi` fails even though the GPU is fully attached and
+# /usr/lib/wsl/lib/nvidia-smi works by absolute path. Probes that gate on
+# `command -v nvidia-smi` therefore report a missing GPU on a working host.
+# Append (never replace) so image-provided PATH entries keep priority.
+if [ -d /usr/lib/wsl/lib ]; then
+    case ":${PATH}:" in
+        *:/usr/lib/wsl/lib:*) : ;;
+        *) PATH="${PATH}:/usr/lib/wsl/lib"; export PATH ;;
+    esac
+fi
+
 # cargo/rustc for fleet-ci (image ENV may already set this; export for non-login job shells)
 export CARGO_HOME="${CARGO_HOME:-/home/runner/.cargo}"
 export RUSTUP_HOME="${RUSTUP_HOME:-/home/runner/.rustup}"
