@@ -121,7 +121,7 @@ API pacing: `GHA_API_MIN_GAP_MS`, `GHA_API_MAX_PER_POLL`, backoff on 403/429.
 
 * **Image:** Ubuntu-based snapshot with official runner + common CI tools ([packaging/Containerfile](../packaging/Containerfile)): `uv`, pinned **gitleaks**, and **Rust 1.96** (`cargo`/`rustc` via rustup for UID 1001). Rebuild after packaging changes with `gha-runner-ctl prepare`.
 * **Ephemeral mode:** register with `--ephemeral`, die after one job, wipe credentials on down.
-* **Retain mode:** stay registered; container can restart with `RUNNER_TOKEN=REUSE` if `.runner` is on the volume for the same `REPO_URL`.
+* **Retain mode:** stay registered; container can restart with `RUNNER_TOKEN=REUSE` if `.runner` is on the volume for the same `REPO_URL`. In the dynamic pool, `listen` also leaves an idle retained worker running instead of reclaiming it, so one registration serves multiple jobs. Reuse is bounded by wall-clock age and job count (`GHA_RETAIN_MAX_AGE_SECS`, `GHA_RETAIN_MAX_JOBS`) for workspace hygiene — the runner's own credentials do not expire on that schedule; only the one-time registration token did, and it was already consumed.
 * **GPU soft-slices:** labels + demand filters; idle down returns GPU to the host (no MIG on consumer GeForce/WSL).
 
 The agent allocates these containers; they are not the long-lived control plane.
