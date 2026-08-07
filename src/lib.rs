@@ -902,6 +902,11 @@ fn print_detect(cli: &Cli) {
 
 // --- Validation / redaction --------------------------------------------------
 
+/// Checks if the identifier is safe to be used in commands or filenames.
+///
+/// Bypasses UTF-8 decoding overhead by validating raw ASCII bytes directly since
+/// the allowed character set is entirely ASCII. Any non-ASCII Unicode bytes
+/// naturally fail the check.
 pub fn is_safe_ident(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 128
@@ -915,8 +920,11 @@ pub fn is_safe_repo(s: &str) -> bool {
     parts.len() == 2 && parts.iter().all(|p| is_safe_ident(p))
 }
 
-/// OCI image reference safety: registry/path:tag or @sha256:hex, optional host:port.
-/// Rejects shell metacharacters and path traversal; allows common registry punctuation.
+/// Validates OCI image reference safety (registry/path:tag or @sha256:hex, optional host:port).
+///
+/// Bypasses UTF-8 decoding overhead by validating raw ASCII bytes directly since
+/// the allowed character set is entirely ASCII. Rejects shell metacharacters,
+/// path traversal, and ensures common registry punctuation is safe.
 pub fn is_safe_image(s: &str) -> bool {
     if s.is_empty() || s.len() > 384 || s.contains("..") {
         return false;
@@ -933,6 +941,10 @@ pub fn is_default_stock_image(image: &str) -> bool {
         || img.starts_with("localhost/gha-runner-ctl:")
 }
 
+/// Checks if the runner user (e.g. uid:gid or name) is safe to be passed to container configurations.
+///
+/// Bypasses UTF-8 decoding overhead by validating raw ASCII bytes directly since
+/// the allowed character set is entirely ASCII.
 pub fn is_safe_runner_user(s: &str) -> bool {
     let s = s.trim();
     if s.is_empty() || s.len() > 64 {
@@ -943,10 +955,18 @@ pub fn is_safe_runner_user(s: &str) -> bool {
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
 }
 
+/// Validates if the string is a safe SHA256 hex digest.
+///
+/// Bypasses UTF-8 decoding overhead by validating raw ASCII bytes directly since
+/// the allowed character set is entirely ASCII hex digits.
 pub fn is_safe_sha256_hex(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// Checks if the runner version string is safe.
+///
+/// Bypasses UTF-8 decoding overhead by validating raw ASCII bytes directly since
+/// the allowed character set is entirely ASCII.
 pub fn is_safe_runner_version(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 32
@@ -954,6 +974,10 @@ pub fn is_safe_runner_version(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
 }
 
+/// Validates if the URL string is safe.
+///
+/// Bypasses UTF-8 decoding overhead by validating raw ASCII bytes directly since
+/// the allowed character set is entirely ASCII.
 pub fn is_safe_url(s: &str) -> bool {
     (s.starts_with("https://") || s.starts_with("http://"))
         && s.len() <= 512
