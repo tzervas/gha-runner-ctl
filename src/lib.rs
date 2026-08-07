@@ -74,6 +74,15 @@ const DEFAULT_API_MAX_PER_POLL: u32 = 12;
 /// Initial backoff when rate-limited (seconds).
 const DEFAULT_API_BACKOFF_SECS: u64 = 90;
 const MAX_API_BACKOFF_SECS: u64 = 900;
+/// Page size for the per-repo queued/in_progress runs listing in
+/// `list_demand_jobs`. Was `5`; GitHub's per_page max is 100. The real bound
+/// on API usage is `max_jobs` + the `ApiPacer` per-poll budget (both already
+/// enforced in the scan loop) — this just needs to be large enough that a
+/// realistic backlog fits on page 1 without relying on `RUN_LIST_MAX_PAGES`.
+const RUN_LIST_PER_PAGE: u32 = 30;
+/// Pagination cap (courtesy bound, not the primary guard — see
+/// [`fetch_runs_paginated`]) for the same runs listing.
+const RUN_LIST_MAX_PAGES: u32 = 3;
 /// Default listen interval for scale-up demand polling (seconds). 2–5 min band.
 const DEFAULT_LISTEN_INTERVAL_SECS: u64 = 180;
 /// Floor for user-batch demand interval (seconds). Overridable via GHA_LISTEN_MIN_INTERVAL.
@@ -4098,6 +4107,11 @@ struct JobsResp {
 
 #[derive(Debug, Deserialize)]
 struct Job {
+    /// GitHub's own job id — globally unique. Load-bearing for demand dedupe:
+    /// `job_name` alone recurs across every run of the same workflow (a
+    /// scheduled/matrix job keeps its display name run after run), so it must
+    /// never be used as the sole identity for a *queued instance* of a job.
+    id: u64,
     status: String,
     labels: Vec<String>,
     /// GitHub job display name (used for automatic size heuristics).
@@ -4109,6 +4123,10 @@ struct Job {
 #[derive(Debug, Clone)]
 struct DemandJob {
     repo: String,
+    /// GitHub's job id. Unique per queued/running job instance across all of
+    /// GitHub — unlike `job_name`, which is shared by every run of a
+    /// recurring workflow and must not be used to dedupe distinct demand.
+    job_id: u64,
     job_name: String,
     labels: Vec<String>,
 }
@@ -4750,6 +4768,12 @@ fn collect_jobs_for_run(
     api: &str,
     pacer: &mut ApiPacer,
 ) -> Result<Vec<DemandJob>, String> {
+    // NOTE: this per-run jobs listing is not paginated (single call, GitHub's
+    // default per_page=30) — a latent truncation risk for a run with >30
+    // incomplete jobs, but *not* a confirmed contributor to the queue
+    // undercount this change fixes (max observed on any live run here was
+    // 10), so left untouched rather than bundled in speculatively. Tracked
+    // as a follow-up, not fixed here.
     let url = pacer.api_url(&format!("repos/{repo}/actions/runs/{run_id}/jobs"));
     let resp = pacer
         .get(&url, api)
@@ -4763,10 +4787,83 @@ fn collect_jobs_for_run(
         if labels_match_demand(cli, &j.labels) {
             out.push(DemandJob {
                 repo: repo.to_string(),
+                job_id: j.id,
                 job_name: j.name.unwrap_or_else(|| format!("job-{run_id}")),
                 labels: j.labels,
             });
         }
+    }
+    Ok(out)
+}
+
+/// Fetch one page of the runs list, also returning the response's `Link`
+/// header so the caller can follow `rel="next"` (mirrors [`list_repos_paginated`]).
+fn fetch_runs_page(
+    url: &str,
+    api: &str,
+    pacer: &mut ApiPacer,
+) -> Result<(Vec<WorkflowRun>, Option<String>), String> {
+    let resp = pacer
+        .get(url, api)
+        .map_err(|e| format!("list runs: {url}: {}", redact(&e)))?;
+    let link = resp.header("link").map(|s| s.to_string());
+    let body: WorkflowRuns = resp.into_json().map_err(|e| format!("parse runs: {e}"))?;
+    Ok((body.workflow_runs, link))
+}
+
+/// Fetch queued/in-progress runs for a repo, following `rel="next"` pagination
+/// up to `max_pages`.
+///
+/// Root-cause fix (queue undercount, 2026-08-07): this used to be a single
+/// `per_page=5` call whose result was then hard-capped to `.take(2)` (queued)
+/// / `.take(1)` (in_progress) in the caller — so a repo with more than 2
+/// concurrently-queued runs had its 3rd+ run's jobs permanently invisible to
+/// demand, regardless of free capacity (confirmed live: a run pushed to
+/// queued-position 3 by newer runs sat un-enumerated for 59+ minutes while
+/// the fleet reported idle capacity the whole time). Removing that cap
+/// without also fixing the `per_page=5` truncation here would just move the
+/// same bug from the `.take()` call to this one, so both are fixed together.
+/// The real backstop against unbounded API usage is the caller's `max_jobs`
+/// check and the `ApiPacer` per-poll GET budget (both pre-existing) — a
+/// `page > max_pages` cap here is only a courtesy bound on top of those, not
+/// the primary guard, so raising per-repo demand coverage costs at most a
+/// few extra paced GETs per tick, never a runaway scan.
+///
+/// A soft error (budget exhausted / transient) on page 2+ stops pagination
+/// and returns what was already collected rather than discarding it — the
+/// caller's own budget-exhaustion handling still fires on the very next API
+/// call (`collect_jobs_for_run` for one of these runs, or the next
+/// status/repo's own page-1 fetch), so nothing is silently swallowed.
+fn fetch_runs_paginated(
+    first_url: &str,
+    api: &str,
+    pacer: &mut ApiPacer,
+    max_pages: u32,
+) -> Result<Vec<WorkflowRun>, String> {
+    let mut out = Vec::new();
+    let mut url = Some(first_url.to_string());
+    let mut pages = 0u32;
+    while let Some(u) = url {
+        pages += 1;
+        if pages > max_pages {
+            break;
+        }
+        let (batch, link) = if pages == 1 {
+            fetch_runs_page(&u, api, pacer)?
+        } else {
+            match fetch_runs_page(&u, api, pacer) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!(
+                        "listen: run-list pagination stopped early (page {pages}): {}",
+                        redact(&e)
+                    );
+                    break;
+                }
+            }
+        };
+        out.extend(batch);
+        url = link.and_then(|l| parse_next_link(&l));
     }
     Ok(out)
 }
@@ -4844,14 +4941,22 @@ fn list_demand_jobs(
             if out.len() >= max_jobs {
                 break;
             }
-            for (status, run_take) in [("queued", 2usize), ("in_progress", 1usize)] {
+            for status in ["queued", "in_progress"] {
                 if out.len() >= max_jobs {
                     break;
                 }
                 let url = pacer.api_url(&format!(
-                    "repos/{name}/actions/runs?status={status}&per_page=5"
+                    "repos/{name}/actions/runs?status={status}&per_page={RUN_LIST_PER_PAGE}"
                 ));
-                let runs = match fetch_runs(&url, api, pacer) {
+                // Root-cause fix (2026-08-07): this used to be `fetch_runs` (one
+                // page) immediately truncated to `.take(2)` (queued) / `.take(1)`
+                // (in_progress) below — so any run beyond the 2nd/1st-newest was
+                // permanently invisible to demand, independent of free capacity.
+                // Now walk every run this status listing returns (paginated,
+                // bounded by RUN_LIST_MAX_PAGES); `max_jobs` and the pacer's
+                // per-poll budget (checked in this loop and inside
+                // `collect_jobs_for_run`) remain the real bound on API usage.
+                let runs = match fetch_runs_paginated(&url, api, pacer, RUN_LIST_MAX_PAGES) {
                     Ok(r) => r,
                     Err(e) if is_soft_api_err(&e) => {
                         if e.contains("budget exhausted") {
@@ -4868,7 +4973,7 @@ fn list_demand_jobs(
                     }
                     Err(e) => return Err(e),
                 };
-                for run in runs.into_iter().take(run_take) {
+                for run in runs {
                     if out.len() >= max_jobs {
                         break;
                     }
@@ -4907,9 +5012,22 @@ fn list_demand_jobs(
         );
     }
 
-    // Dedupe by repo+job_name
+    // Dedupe by GitHub job id (globally unique per queued/running job
+    // instance).
+    //
+    // Root-cause fix (2026-08-07): this used to dedupe on `repo+job_name`,
+    // which collapsed genuinely distinct, concurrently-queued jobs into one
+    // whenever they shared a display name — the normal case for a recurring
+    // scheduled/matrix job (e.g. "scope" or "gates-docs" queued in several
+    // runs at once), since `job_name` alone recurs run after run. Workers
+    // are generic (GitHub does the actual job<->runner assignment by label,
+    // not this tool by name — see `DemandSignal`), so the only thing this
+    // dedupe needs to guard against is the same job instance being counted
+    // twice (e.g. if it were listed under both the "queued" and
+    // "in_progress" scans in one tick); `job_id` is the correct identity for
+    // that, `job_name` was never sufficient.
     let mut seen = std::collections::HashSet::new();
-    out.retain(|j| seen.insert(format!("{}::{}", j.repo, j.job_name)));
+    out.retain(|j| seen.insert(j.job_id));
     Ok(out)
 }
 
@@ -5706,6 +5824,10 @@ fn listen(cli: &Cli, interval: u64, idle_secs: u64, wake_port: Option<u16>) -> R
             for req in &plan.spawns {
                 let job = DemandJob {
                     repo: req.repo.clone(),
+                    // Synthetic: this DemandJob is rebuilt from an already-planned
+                    // spawn request (sizing/labels only, no dedupe involved), so
+                    // there's no real GitHub job id to carry here.
+                    job_id: 0,
                     job_name: req.job_name.clone(),
                     labels: req.labels.clone(),
                 };
@@ -7020,7 +7142,7 @@ mod http_seam_tests {
             Route::get(
                 "/repos/owner/repo/actions/runs/42/jobs",
                 200,
-                "{\"jobs\":[{\"name\":\"build\",\"status\":\"queued\",\
+                "{\"jobs\":[{\"id\":4242,\"name\":\"build\",\"status\":\"queued\",\
                   \"labels\":[\"self-hosted\",\"linux\",\"podman\"]}]}",
             ),
         ]);
@@ -7078,7 +7200,7 @@ mod http_seam_tests {
             Route::get(
                 "/repos/owner/repo/actions/runs/7/jobs",
                 200,
-                "{\"jobs\":[{\"name\":\"lint\",\"status\":\"queued\",\
+                "{\"jobs\":[{\"id\":77,\"name\":\"lint\",\"status\":\"queued\",\
                   \"labels\":[\"ubuntu-latest\"]}]}",
             ),
             Route::get(
@@ -7116,6 +7238,90 @@ mod http_seam_tests {
                 "/repos/owner/repo/actions/runs/7/jobs",
                 "/repos/owner/repo/actions/runs?status=in_progress&per_page=5",
             ]
+        );
+    }
+
+    /// Regression for the 2026-08-07 queue-undercount fix: `list_demand_jobs` must
+    /// enumerate *every* queued run's jobs, not just the two newest, and must not
+    /// collapse distinct concurrently-queued jobs that happen to share a name.
+    ///
+    /// Sets up 4 queued runs for one repo. Each run has one incomplete,
+    /// label-matching job; two of those jobs (in different runs) share the name
+    /// "scope" — exactly the recurring-workflow shape observed live. Before the
+    /// fix: the run-list fetch was truncated to the 2 newest runs
+    /// (`.take(2)`), and the survivors were then deduped by `repo+job_name`,
+    /// so this scenario would have yielded 1 job. After the fix it must yield
+    /// all 4, distinct by GitHub job id.
+    #[test]
+    fn list_demand_jobs_enumerates_all_queued_runs_and_does_not_collapse_same_named_jobs() {
+        isolate_runtime_dir();
+        let server = TestServer::start(vec![
+            Route::get(
+                "/repos/owner/repo/actions/runs?status=queued&per_page=30",
+                200,
+                "{\"workflow_runs\":[{\"id\":1},{\"id\":2},{\"id\":3},{\"id\":4}]}",
+            ),
+            Route::get(
+                "/repos/owner/repo/actions/runs/1/jobs",
+                200,
+                "{\"jobs\":[{\"id\":101,\"name\":\"scope\",\"status\":\"queued\",\
+                  \"labels\":[\"self-hosted\",\"linux\",\"podman\"]}]}",
+            ),
+            Route::get(
+                "/repos/owner/repo/actions/runs/2/jobs",
+                200,
+                "{\"jobs\":[{\"id\":102,\"name\":\"gates-docs\",\"status\":\"queued\",\
+                  \"labels\":[\"self-hosted\",\"linux\",\"podman\"]}]}",
+            ),
+            Route::get(
+                "/repos/owner/repo/actions/runs/3/jobs",
+                200,
+                "{\"jobs\":[{\"id\":103,\"name\":\"scope\",\"status\":\"queued\",\
+                  \"labels\":[\"self-hosted\",\"linux\",\"podman\"]}]}",
+            ),
+            Route::get(
+                "/repos/owner/repo/actions/runs/4/jobs",
+                200,
+                "{\"jobs\":[{\"id\":104,\"name\":\"gates-code\",\"status\":\"queued\",\
+                  \"labels\":[\"self-hosted\",\"linux\",\"podman\"]}]}",
+            ),
+            Route::get(
+                "/repos/owner/repo/actions/runs?status=in_progress&per_page=30",
+                200,
+                "{\"workflow_runs\":[]}",
+            ),
+        ]);
+
+        let cli = cli_for(&[
+            "--scope",
+            "repo",
+            "--repo",
+            "owner/repo",
+            "--api-min-gap-ms",
+            "1",
+            "--api-max-per-poll",
+            "50",
+        ]);
+        let mut pacer = ApiPacer::from_cli(&cli, test_http(&server));
+        pacer.begin_poll();
+
+        let jobs = list_demand_jobs(&cli, "pat-demand", &mut pacer, 50)
+            .expect("demand enumeration succeeds");
+
+        let mut ids: Vec<u64> = jobs.iter().map(|j| j.job_id).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![101, 102, 103, 104],
+            "all 4 queued runs' jobs must be enumerated, including the two \
+             same-named \"scope\" jobs from different runs (got: {jobs:?})"
+        );
+
+        let scope_count = jobs.iter().filter(|j| j.job_name == "scope").count();
+        assert_eq!(
+            scope_count, 2,
+            "two distinct \"scope\" jobs (different runs) must both survive dedupe, \
+             not collapse to one by name"
         );
     }
 
