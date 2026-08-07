@@ -906,8 +906,8 @@ pub fn is_safe_ident(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 128
         && !s.contains("..")
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
 pub fn is_safe_repo(s: &str) -> bool {
@@ -921,8 +921,8 @@ pub fn is_safe_image(s: &str) -> bool {
     if s.is_empty() || s.len() > 384 || s.contains("..") {
         return false;
     }
-    s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | '@'))
+    s.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'/' | b':' | b'@'))
 }
 
 /// Stock packaging default tag (only used by `ImageMode::Auto` convenience).
@@ -939,30 +939,30 @@ pub fn is_safe_runner_user(s: &str) -> bool {
         return false;
     }
     // name, uid, name:group, uid:gid
-    s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+    s.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
 }
 
 pub fn is_safe_sha256_hex(s: &str) -> bool {
-    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 pub fn is_safe_runner_version(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 32
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
 }
 
 pub fn is_safe_url(s: &str) -> bool {
     (s.starts_with("https://") || s.starts_with("http://"))
         && s.len() <= 512
         && !s.contains("..")
-        && s.chars().all(|c| {
-            c.is_ascii_alphanumeric()
+        && s.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
                 || matches!(
-                    c,
-                    '-' | '_' | '.' | '/' | ':' | '?' | '=' | '&' | '%' | '+' | '~'
+                    b,
+                    b'-' | b'_' | b'.' | b'/' | b':' | b'?' | b'=' | b'&' | b'%' | b'+' | b'~'
                 )
         })
 }
